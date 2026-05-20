@@ -1,4 +1,5 @@
 import Foundation
+import StorageKit
 
 // MARK: - SharingService
 
@@ -36,12 +37,33 @@ public struct SharingService: Sendable {
         }
     }
 
-    /// Upload audio + (optional) video + (optional) summary + (optional) transcript
-    /// for a session, then build presigned GET URLs for each.
-    /// - Parameter sessionDir: filesystem dir containing audio.m4a, screen.mp4, summary.md, transcript.txt
-    /// - Parameter sessionId: stable identifier; used as the S3 key suffix
+    /// Upload every artifact present on disk for the session — convenience for
+    /// "share everything" callers. Delegates to the artifact-selecting overload
+    /// after filtering `SharedArtifactKind.allCases` by file existence.
     public func shareSession(sessionDir: URL, sessionId: String) async throws -> ShareResult {
+        let available = SharedArtifactKind.allCases.filter { kind in
+            FileManager.default.fileExists(atPath: sessionDir.appendingPathComponent(kind.fileName).path)
+        }
+        return try await shareSession(sessionDir: sessionDir, sessionId: sessionId, artifacts: available)
+    }
+
+    /// Upload only the requested artifacts, then build presigned GET URLs for
+    /// each successful upload. Files missing from disk are silently skipped —
+    /// caller is expected to pre-filter via `availableShareArtifacts(for:)` if
+    /// they want to enforce "all selected must exist".
+    ///
+    /// - Parameter sessionDir: filesystem dir containing the session sidecars.
+    /// - Parameter sessionId: stable identifier; used as the S3 key suffix.
+    /// - Parameter artifacts: which kinds to upload. Empty selection produces
+    ///   an empty `ShareResult` — UI callers should validate non-empty before
+    ///   invoking.
+    public func shareSession(
+        sessionDir: URL,
+        sessionId: String,
+        artifacts: [SharedArtifactKind]
+    ) async throws -> ShareResult {
         let now = Date()
+        let selected = Set(artifacts)
 
         let audioFile = sessionDir.appendingPathComponent("audio.m4a")
         let videoFile = sessionDir.appendingPathComponent("screen.mp4")
@@ -53,28 +75,28 @@ public struct SharingService: Sendable {
         var summaryURL: URL?
         var transcriptURL: URL?
 
-        if FileManager.default.fileExists(atPath: audioFile.path) {
+        if selected.contains(.audio), FileManager.default.fileExists(atPath: audioFile.path) {
             let key = "\(keyPrefix)\(sessionId)/audio.m4a"
             let data = try Data(contentsOf: audioFile)
             try await s3.putObject(key: key, data: data, contentType: "audio/mp4", now: now)
             audioURL = try s3.presignedGetURL(key: key, expirySeconds: presignTTLSeconds, now: now)
         }
 
-        if FileManager.default.fileExists(atPath: videoFile.path) {
+        if selected.contains(.video), FileManager.default.fileExists(atPath: videoFile.path) {
             let key = "\(keyPrefix)\(sessionId)/screen.mp4"
             let data = try Data(contentsOf: videoFile)
             try await s3.putObject(key: key, data: data, contentType: "video/mp4", now: now)
             videoURL = try s3.presignedGetURL(key: key, expirySeconds: presignTTLSeconds, now: now)
         }
 
-        if FileManager.default.fileExists(atPath: summaryFile.path) {
+        if selected.contains(.summary), FileManager.default.fileExists(atPath: summaryFile.path) {
             let key = "\(keyPrefix)\(sessionId)/summary.md"
             let data = try Data(contentsOf: summaryFile)
             try await s3.putObject(key: key, data: data, contentType: "text/markdown; charset=utf-8", now: now)
             summaryURL = try s3.presignedGetURL(key: key, expirySeconds: presignTTLSeconds, now: now)
         }
 
-        if FileManager.default.fileExists(atPath: transcriptFile.path) {
+        if selected.contains(.transcript), FileManager.default.fileExists(atPath: transcriptFile.path) {
             let key = "\(keyPrefix)\(sessionId)/transcript.txt"
             let data = try Data(contentsOf: transcriptFile)
             try await s3.putObject(key: key, data: data, contentType: "text/plain; charset=utf-8", now: now)
