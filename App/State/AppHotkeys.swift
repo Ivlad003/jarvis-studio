@@ -14,4 +14,11 @@ extension KeyboardShortcuts.Name {
     /// Open the Library window. Default ⌘L (chord-only when an app window is foreground;
     /// global registration via KeyboardShortcuts works regardless).
     static let openLibrary = Self("openLibrary", default: .init(.l, modifiers: [.command, .shift]))
+
+    /// Toggle the on-screen drawing overlay. Default ⌘⇧K. Sit on top of every
+    /// other window with a transparent canvas and a small floating toolbar so
+    /// you can ink arrows / circles / notes over whatever the screen currently
+    /// shows. Because the overlay is a real on-screen NSWindow, ScreenCaptureKit
+    /// captures it automatically as part of `screen.mp4` — same trick Loom uses.
+    static let toggleAnnotation = Self("toggleAnnotation", default: .init(.k, modifiers: [.command, .shift]))
 }

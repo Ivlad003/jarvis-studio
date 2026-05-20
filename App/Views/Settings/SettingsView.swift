@@ -867,6 +867,7 @@ private struct HotkeysTab: View {
                 KeyboardShortcuts.Recorder("Dictation (push-to-talk)", name: .dictation)
                 KeyboardShortcuts.Recorder("Push-to-Markdown (hold + speak → save .md)", name: .pushToMarkdown)
                 KeyboardShortcuts.Recorder("Agent (hold + speak → autonomous agent)", name: .agentTrigger)
+                KeyboardShortcuts.Recorder("Drawing overlay (toggle)", name: .toggleAnnotation)
             }
 
             Section("Library double-tap (optional)") {

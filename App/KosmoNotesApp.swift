@@ -42,6 +42,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Library window controller. Stored as AnyObject to avoid @available on
     // a stored property (Swift disallows that). Cast at use-site with #available.
     private var libraryControllerHolder: AnyObject?
+    /// On-screen drawing overlay controller (ScreenCaptureKit picks the
+    /// overlay window up as part of `screen.mp4`). Stored as AnyObject for
+    /// the same reason as the other macOS-14-gated holders.
+    private var annotationControllerHolder: AnyObject?
 
     /// Active KeyTriggerEngine subscription for the optional Library
     /// double-tap shortcut. Stored as `Any?` (rather than the strongly-typed
@@ -120,6 +124,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         KeyboardShortcuts.onKeyDown(for: .openLibrary) { [weak self] in
             Task { @MainActor in self?.openLibraryAction() }
+        }
+        KeyboardShortcuts.onKeyDown(for: .toggleAnnotation) { [weak self] in
+            Task { @MainActor in self?.toggleAnnotationAction() }
         }
 
         // Optional one-shot double-tap shortcut for the Library window. Off by
@@ -574,6 +581,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settings: appSettings,
             windowDelegate: self
         )
+    }
+
+    /// Toggle the on-screen drawing overlay (default ⌘⇧K). Lazy-creates the
+    /// controller on first use so unused launches don't pay any cost. The
+    /// drawn strokes live inside an NSWindow above all app content, so
+    /// ScreenCaptureKit picks them up automatically as part of `screen.mp4`.
+    @objc private func toggleAnnotationAction() {
+        guard #available(macOS 14.0, *) else { return }
+        let controller: AnnotationController
+        if let existing = annotationControllerHolder as? AnnotationController {
+            controller = existing
+        } else {
+            let new = AnnotationController()
+            annotationControllerHolder = new
+            controller = new
+        }
+        controller.toggle()
     }
 
     @MainActor
