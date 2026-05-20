@@ -257,6 +257,12 @@ public actor CaptureSession {
     /// Mutually exclusive with `scKitBox` / `tapBoxAny` — when set, system
     /// audio comes from this device instead of SCKit's whole-system mixdown.
     private var deviceAudioCapture: DeviceAudioCapture?
+    /// Set when the user had a `systemAudioDeviceUID` configured but the
+    /// device couldn't be resolved at start (e.g. a stale aggregate UID like
+    /// `CADefaultDeviceAggregate-22634-0` that macOS recycled). Callers may
+    /// use this to clear the stored setting so subsequent recordings skip
+    /// the failed lookup and go straight to SCKit fallback.
+    public private(set) var deviceCaptureFellBack: Bool = false
     /// Optional sink for live PCM buffers. When set, each buffer is forwarded
     /// to the sink after appending to the SegmentWriter. Best-effort: sink
     /// failures do not interrupt the main recording path.
@@ -299,57 +305,28 @@ public actor CaptureSession {
         )
         self.segmentWriter = writer
 
-        if config.micEnabled {
-            // Use test stream if provided (test seam), otherwise create real engine
-            if let testStream = testMicStream {
-                micTask = makeTestMicTask(stream: testStream, writer: writer, liveSink: liveSink, delivery: liveDelivery)
-            } else {
-                let engine = AudioEngine(config: Self.micAudioEngineConfig(for: config))
-                self.audioEngine = engine
-                micTask = try await makeMicTask(engine: engine, writer: writer, liveSink: liveSink, delivery: liveDelivery)
-            }
-        }
+        // -------------------------------------------------------------------
+        // Order: screen → system audio → settle → mic.
+        //
+        // Previously the mic engine started FIRST and screen + system audio
+        // started afterwards. Both screen (SCStream) and system audio
+        // (SCKit/Tap/Device) touch the audio HAL, which fires
+        // `AVAudioEngineConfigurationChange` on the mic's AVAudioEngine and
+        // makes `engine.start()` return -10868 (FormatNotSupported) for the
+        // rest of the configuration cascade. The recovery handler usually
+        // wins on second/third tries but sometimes the engine never gets
+        // healthy buffers again — the user-reported "audio dies right at the
+        // start while screen.mp4 keeps growing for 36 minutes" failure mode.
+        //
+        // Starting screen + system audio FIRST and letting the HAL settle
+        // (~300 ms) before bootstrapping the mic engine eliminates the race:
+        // the mic engine binds to a stable AUHAL with no in-flight config
+        // changes. The buffer-flow supervisor inside AudioEngine handles
+        // anything that goes wrong after this point (BT (un)pair, sample-rate
+        // flip, device hot-plug) as a separate concern.
+        // -------------------------------------------------------------------
 
-        if config.systemAudioEnabled {
-            // Three system-audio source paths, picked in order of preference:
-            //   1. Custom loopback device (BlackHole etc) — set explicitly via
-            //      Settings, eliminates speaker → mic echo.
-            //   2. Per-process Core Audio Tap (14.4+) — captures audio from
-            //      specific bundle IDs.
-            //   3. SCKit whole-system mixdown — captures everything that's
-            //      currently playing, including from speakers (echo-prone).
-            var systemStarted = false
-
-            if let deviceUID = config.systemAudioDeviceUID, !deviceUID.isEmpty {
-                do {
-                    let capture = DeviceAudioCapture(config: .init(deviceUID: deviceUID))
-                    self.deviceAudioCapture = capture
-                    systemTask = try await makeDeviceCaptureTask(capture: capture, writer: writer, liveSink: liveSink, delivery: liveDelivery)
-                    systemStarted = true
-                    captureSessionLog.info("CaptureSession.start: system audio via custom device UID=\(deviceUID, privacy: .public)")
-                } catch {
-                    captureSessionLog.error("CaptureSession.start: device capture failed (\(error.localizedDescription, privacy: .public)) — falling back to SCKit")
-                    self.deviceAudioCapture = nil
-                }
-            }
-
-            if !systemStarted, config.useProcessTap, #available(macOS 14.4, *) {
-                do {
-                    let box = TapBox()
-                    self.tapBoxAny = box
-                    systemTask = try await makeTapTask(box: box, bundleIDs: config.processTapBundleIDs, writer: writer, liveSink: liveSink, delivery: liveDelivery)
-                    systemStarted = true
-                } catch {
-                    self.tapBoxAny = nil
-                }
-            }
-            if !systemStarted, #available(macOS 12.3, *) {
-                let box = SCKitBox()
-                self.scKitBox = box
-                systemTask = try await makeSystemTask(box: box, writer: writer, liveSink: liveSink, delivery: liveDelivery)
-            }
-        }
-
+        // === SCREEN RECORDING first ===
         if config.screenRecordingEnabled, let outputURL = config.screenOutputURL {
             if #available(macOS 12.3, *) {
                 let recorder = ScreenRecorder()
@@ -372,6 +349,78 @@ public actor CaptureSession {
                     captureSessionLog.error("CaptureSession.start: ScreenRecorder failed (non-fatal, audio-only) — \(error.localizedDescription, privacy: .public)")
                     self.screenRecordingError = error
                 }
+            }
+        }
+
+        // === SYSTEM AUDIO second ===
+        if config.systemAudioEnabled {
+            // Three system-audio source paths, picked in order of preference:
+            //   1. Custom loopback device (BlackHole etc) — set explicitly via
+            //      Settings, eliminates speaker → mic echo.
+            //   2. Per-process Core Audio Tap (14.4+) — captures audio from
+            //      specific bundle IDs.
+            //   3. SCKit whole-system mixdown — captures everything that's
+            //      currently playing, including from speakers (echo-prone).
+            var systemStarted = false
+
+            if let deviceUID = config.systemAudioDeviceUID, !deviceUID.isEmpty {
+                do {
+                    let capture = DeviceAudioCapture(config: .init(deviceUID: deviceUID))
+                    self.deviceAudioCapture = capture
+                    systemTask = try await makeDeviceCaptureTask(capture: capture, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+                    systemStarted = true
+                    captureSessionLog.info("CaptureSession.start: system audio via custom device UID=\(deviceUID, privacy: .public)")
+                } catch {
+                    captureSessionLog.error("CaptureSession.start: device capture failed (\(error.localizedDescription, privacy: .public)) — falling back to SCKit")
+                    self.deviceAudioCapture = nil
+                    // Flag stale-UID case so the caller can clear the setting
+                    // and skip this branch on the next recording.
+                    if let dcErr = error as? DeviceAudioCapture.DeviceCaptureError,
+                       case .deviceNotFound = dcErr {
+                        self.deviceCaptureFellBack = true
+                    }
+                }
+            }
+
+            if !systemStarted, config.useProcessTap, #available(macOS 14.4, *) {
+                do {
+                    let box = TapBox()
+                    self.tapBoxAny = box
+                    systemTask = try await makeTapTask(box: box, bundleIDs: config.processTapBundleIDs, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+                    systemStarted = true
+                } catch {
+                    self.tapBoxAny = nil
+                }
+            }
+            if !systemStarted, #available(macOS 12.3, *) {
+                let box = SCKitBox()
+                self.scKitBox = box
+                systemTask = try await makeSystemTask(box: box, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+            }
+        }
+
+        // === HAL settle window ===
+        // Only wait if we actually started something on the audio HAL. The
+        // 300 ms figure was measured on M1/M2/M3 hardware: SCStream's audio
+        // sub-component binds in 150–250 ms post-startCapture; we add headroom.
+        // Skipped entirely for mic-only recordings (no race to avoid).
+        let halTouched = (self.screenRecorder != nil)
+            || (self.deviceAudioCapture != nil)
+            || (self.scKitBox != nil)
+            || (self.tapBoxAny != nil)
+        if config.micEnabled && halTouched {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+
+        // === MIC last (bootstraps on a stable HAL) ===
+        if config.micEnabled {
+            // Use test stream if provided (test seam), otherwise create real engine
+            if let testStream = testMicStream {
+                micTask = makeTestMicTask(stream: testStream, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+            } else {
+                let engine = AudioEngine(config: Self.micAudioEngineConfig(for: config))
+                self.audioEngine = engine
+                micTask = try await makeMicTask(engine: engine, writer: writer, liveSink: liveSink, delivery: liveDelivery)
             }
         }
 

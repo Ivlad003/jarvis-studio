@@ -130,4 +130,67 @@ struct TranscriptStoreTests {
         let content = try String(contentsOf: txt, encoding: .utf8)
         #expect(content == "hello world")
     }
+
+    @Test("formatTimestamp uses MM:SS under 1 h and HH:MM:SS above")
+    func formatTimestampFormatsCorrectly() {
+        #expect(TranscriptStore.formatTimestamp(seconds: 0) == "00:00")
+        #expect(TranscriptStore.formatTimestamp(seconds: 7) == "00:07")
+        #expect(TranscriptStore.formatTimestamp(seconds: 65) == "01:05")
+        #expect(TranscriptStore.formatTimestamp(seconds: 59 * 60 + 59) == "59:59")
+        #expect(TranscriptStore.formatTimestamp(seconds: 3600) == "1:00:00")
+        #expect(TranscriptStore.formatTimestamp(seconds: 3725) == "1:02:05")
+        // Fractional seconds floor toward whole second.
+        #expect(TranscriptStore.formatTimestamp(seconds: 12.9) == "00:12")
+        // Negative inputs (shouldn't happen, but defensively).
+        #expect(TranscriptStore.formatTimestamp(seconds: -1) == "00:00")
+    }
+
+    @Test("writeTimestamped emits one [MM:SS] line per final segment")
+    func writeTimestampedEmitsOneLinePerSegment() async throws {
+        let dir = try makeTempSessionDir()
+        defer { cleanup(dir) }
+
+        let store = try TranscriptStore(sessionDir: dir)
+        try await store.append(TranscriptSegment(start: 0, end: 5, text: "Hello everyone", confidence: 0.9, isFinal: true))
+        try await store.append(TranscriptSegment(start: 12, end: 18, text: "Let's start", confidence: 0.92, isFinal: true))
+        try await store.append(TranscriptSegment(start: 3725, end: 3730, text: "Long meeting", confidence: 0.88, isFinal: true))
+        try await store.writeTimestamped()
+
+        let url = dir.appendingPathComponent("transcript.timestamped.txt")
+        let content = try String(contentsOf: url, encoding: .utf8)
+        let expected = """
+        [00:00] Hello everyone
+        [00:12] Let's start
+        [1:02:05] Long meeting
+
+        """
+        #expect(content == expected)
+    }
+
+    @Test("writeTimestamped skips empty / whitespace-only segments")
+    func writeTimestampedSkipsBlankSegments() async throws {
+        let dir = try makeTempSessionDir()
+        defer { cleanup(dir) }
+
+        let store = try TranscriptStore(sessionDir: dir)
+        try await store.append(TranscriptSegment(start: 0, end: 1, text: "  ", confidence: 0.9, isFinal: true))
+        try await store.append(TranscriptSegment(start: 2, end: 3, text: "real text", confidence: 0.9, isFinal: true))
+        try await store.writeTimestamped()
+
+        let url = dir.appendingPathComponent("transcript.timestamped.txt")
+        let content = try String(contentsOf: url, encoding: .utf8)
+        #expect(content == "[00:02] real text\n")
+    }
+
+    @Test("writeTimestamped is a no-op when no segments accumulated")
+    func writeTimestampedNoOpOnEmpty() async throws {
+        let dir = try makeTempSessionDir()
+        defer { cleanup(dir) }
+
+        let store = try TranscriptStore(sessionDir: dir)
+        try await store.writeTimestamped()
+
+        let url = dir.appendingPathComponent("transcript.timestamped.txt")
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+    }
 }

@@ -232,6 +232,24 @@ public actor AudioEngine {
     /// can restore it. nil when no swap was performed.
     private var savedDefaultInputDevice: AudioDeviceID?
 
+    /// Buffer-flow supervisor. Watches `bufferCounter` on a 1 s cadence after
+    /// the first buffer has arrived; if no new buffers land for ~3 ticks
+    /// while the engine is supposed to be live and not muted, proactively
+    /// triggers `recreateEngineAfterRouteChange()`. This is the safety net
+    /// for HAL drift scenarios that don't fire `AVAudioEngineConfigurationChange`
+    /// at all — e.g. SCStream coming online while the mic is already armed,
+    /// AirPods silently dropping their SCO link, an aggregate device being
+    /// dissolved by the OS mid-recording. Without this, the engine could
+    /// stay dead silently for the rest of the session (the 37-minute "audio
+    /// disappeared from the start" failure mode reported by users).
+    private var supervisorTask: Task<Void, Never>?
+    private var supervisorLastCount: Int = 0
+    private var supervisorStalledTicks: Int = 0
+    /// How many consecutive 1 s ticks of zero buffer growth count as a stall.
+    /// 3 s is well above the 100 ms tap callback cadence (we'd expect ~10
+    /// buffers/sec), but short enough to recover before the user notices.
+    private let supervisorStallThreshold: Int = 3
+
     // MARK: Init
 
     public init(config: Config = Config()) {
@@ -470,6 +488,10 @@ public actor AudioEngine {
         }
         audioEngineLog.info("AudioEngine.start: first buffers received — count=\(snap.count, privacy: .public) totalFrames=\(snap.totalFrames, privacy: .public)")
 
+        // Arm the buffer-flow supervisor now that we've observed at least one
+        // buffer. Any subsequent stall (3 s of no growth) triggers recreate.
+        startSupervisor()
+
         return stream
     }
 
@@ -490,6 +512,10 @@ public actor AudioEngine {
 
     /// Stop mic capture, remove tap, finish the stream.
     public func stop() async {
+        // Cancel the supervisor FIRST so its next tick can't race with the
+        // teardown sequence below (e.g. invoke recreate while engine is being
+        // torn down, leaving a dangling AVAudioEngine after stop returns).
+        stopSupervisor()
         if let token = configChangeObserver {
             NotificationCenter.default.removeObserver(token)
             configChangeObserver = nil
@@ -653,6 +679,31 @@ public actor AudioEngine {
         // Reset counter so the no-buffer watchdog (if any caller adds one) sees
         // a clean slate after the swap.
         bufferCounter = TapBufferCounter()
+        // Keep the buffer-flow supervisor's baseline in sync with the freshly
+        // reset counter; otherwise its next tick sees `current < lastCount`
+        // and treats the natural reset as "no progress".
+        resetSupervisorBaseline()
+
+        // CRITICAL: poll AUHAL for the new input format BEFORE engine.start().
+        // After a route swap (SCStream startup for screen-record, headphones
+        // (dis)connect, sample-rate change) the AUHAL goes transient — bus 0
+        // briefly reports channels=0 / sampleRate=0 while it rebinds to the
+        // new device. Calling engine.start() in that window returns
+        // `-10868 kAudioUnitErr_FormatNotSupported`, and after a single
+        // failure AVAudioEngine refuses to restart for the rest of the
+        // recording. Logs show this dying silently for 36 minutes at a time
+        // (mic watchdog: level near zero for 2176s) — that's the
+        // "Audio + Screen mode records system audio but mic stays empty"
+        // user bug. Waiting up to 1 s for the AUHAL to settle, then retrying
+        // start() on backoff, restores the mic without a full engine rebuild.
+        var inputFormat = inputNode.auAudioUnit.outputBusses[0].format
+        var preStartAttempts = 0
+        while (inputFormat.channelCount == 0 || inputFormat.sampleRate == 0) && preStartAttempts < 100 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            inputFormat = inputNode.auAudioUnit.outputBusses[0].format
+            preStartAttempts += 1
+        }
+        audioEngineLog.info("AudioEngine.handleConfigurationChange: pre-start AUHAL settle — sampleRate=\(inputFormat.sampleRate, privacy: .public) channels=\(inputFormat.channelCount, privacy: .public) polls=\(preStartAttempts, privacy: .public)")
 
         // We don't re-swap the system default here — we already did that in
         // start() before the engine was created, and savedDefaultInputDevice
@@ -662,22 +713,45 @@ public actor AudioEngine {
         // duration of this recording.
 
         engine.prepare()
-        do {
-            try engine.start()
-        } catch {
-            audioEngineLog.error("AudioEngine.handleConfigurationChange: engine.start() failed — \(error.localizedDescription, privacy: .public). Recording will continue silently until the user stops/restarts.")
+        var lastStartError: Error?
+        for attempt in 1...3 {
+            do {
+                try engine.start()
+                lastStartError = nil
+                break
+            } catch {
+                lastStartError = error
+                audioEngineLog.error("AudioEngine.handleConfigurationChange: engine.start attempt \(attempt, privacy: .public)/3 failed — \(error.localizedDescription, privacy: .public)")
+                // -10868 typically clears within 200–500 ms once the AUHAL
+                // finishes binding to the new device. Back off then re-poll
+                // the bus format so the next start sees a stable hardware
+                // descriptor.
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                inputFormat = inputNode.auAudioUnit.outputBusses[0].format
+            }
+        }
+
+        if lastStartError != nil {
+            audioEngineLog.error("AudioEngine.handleConfigurationChange: engine.start failed 3× — recreating AVAudioEngine from scratch")
+            let recreated = await recreateEngineAfterRouteChange()
+            if recreated {
+                audioEngineLog.info("AudioEngine.handleConfigurationChange: engine recreated successfully — mic resumed on new instance")
+            } else {
+                audioEngineLog.error("AudioEngine.handleConfigurationChange: recreate failed — mic will stay silent until user stops/restarts the recording")
+            }
             return
         }
 
-        // Wait for the new input format to bind. Same 1 s ceiling as the
-        // initial start path. Query AUHAL directly to avoid the stale-format
-        // cache bug that crashes installTap (see start() for details).
-        var inputFormat = inputNode.auAudioUnit.outputBusses[0].format
-        var attempts = 0
-        while (inputFormat.channelCount == 0 || inputFormat.sampleRate == 0) && attempts < 100 {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-            inputFormat = inputNode.auAudioUnit.outputBusses[0].format
-            attempts += 1
+        // Engine restarted on the original instance. Final format check —
+        // route swaps can flutter, so re-poll after start to make sure the
+        // bus didn't go transient again on us.
+        if inputFormat.channelCount == 0 || inputFormat.sampleRate == 0 {
+            var postAttempts = 0
+            while (inputFormat.channelCount == 0 || inputFormat.sampleRate == 0) && postAttempts < 100 {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+                inputFormat = inputNode.auAudioUnit.outputBusses[0].format
+                postAttempts += 1
+            }
         }
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
             audioEngineLog.error("AudioEngine.handleConfigurationChange: input format never bound after restart (channels=0 or sampleRate=0)")
@@ -686,6 +760,153 @@ public actor AudioEngine {
         audioEngineLog.info("AudioEngine.handleConfigurationChange: new input bound — sampleRate=\(inputFormat.sampleRate, privacy: .public) channels=\(inputFormat.channelCount, privacy: .public). Reinstalling tap.")
 
         installTap(on: inputNode, inputFormat: inputFormat)
+    }
+
+    // MARK: - Engine recreate (private)
+
+    /// Tear down and rebuild AVAudioEngine after a route change that the
+    /// original instance can't recover from. Preserves `continuation`,
+    /// `targetFormat`, `converterCache`, and `bufferCounter` so downstream
+    /// AsyncStream consumers stay connected; only the AVAudioEngine and the
+    /// notification observer are recreated. Returns true when the new engine
+    /// is running and the tap is reinstalled on its inputNode.
+    ///
+    /// Why this exists: empirically, once `engine.start()` returns
+    /// `-10868 kAudioUnitErr_FormatNotSupported` after a configuration
+    /// change, the same engine instance will keep failing with the same
+    /// error — the AUHAL caches the pre-swap format expectation and won't
+    /// renegotiate. A fresh AVAudioEngine bootstraps on top of the current
+    /// HAL state and binds cleanly.
+    private func recreateEngineAfterRouteChange() async -> Bool {
+        if let token = configChangeObserver {
+            NotificationCenter.default.removeObserver(token)
+            configChangeObserver = nil
+        }
+        engine?.stop()
+        engine = nil
+
+        let newEngine = AVAudioEngine()
+        let newInputNode = newEngine.inputNode  // force AUHAL instantiation
+
+        var inputFormat = newInputNode.auAudioUnit.outputBusses[0].format
+        var attempts = 0
+        while (inputFormat.channelCount == 0 || inputFormat.sampleRate == 0) && attempts < 100 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            inputFormat = newInputNode.auAudioUnit.outputBusses[0].format
+            attempts += 1
+        }
+        guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+            audioEngineLog.error("AudioEngine.recreate: new AUHAL never bound a usable input format (channels=0 or sampleRate=0)")
+            return false
+        }
+
+        newEngine.prepare()
+        do {
+            try newEngine.start()
+        } catch {
+            audioEngineLog.error("AudioEngine.recreate: new engine.start failed — \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+        self.engine = newEngine
+
+        installTap(on: newInputNode, inputFormat: inputFormat)
+
+        // Re-subscribe — the previous observer was bound (via `object:`) to
+        // the dead engine and will never fire for the new instance.
+        let observer = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: newEngine,
+            queue: nil
+        ) { [weak self] _ in
+            Task { [weak self] in
+                await self?.handleConfigurationChange()
+            }
+        }
+        self.configChangeObserver = observer
+        resetSupervisorBaseline()
+        return true
+    }
+
+    // MARK: - Buffer-flow supervisor (private)
+
+    /// Spin up the 1 s-cadence supervisor loop. Idempotent — cancels any
+    /// existing task first. Called from `start()` after the first PCM buffer
+    /// has been observed (so we don't fight the initial-startup ceiling).
+    private func startSupervisor() {
+        supervisorTask?.cancel()
+        supervisorLastCount = bufferCounter?.snapshot.count ?? 0
+        supervisorStalledTicks = 0
+        supervisorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { break }
+                await self?.supervisorTick()
+            }
+        }
+        audioEngineLog.info("AudioEngine.supervisor: started (1 s tick, \(self.supervisorStallThreshold, privacy: .public) s stall threshold)")
+    }
+
+    /// Cancel and drop the supervisor. Safe to call multiple times.
+    private func stopSupervisor() {
+        supervisorTask?.cancel()
+        supervisorTask = nil
+        supervisorLastCount = 0
+        supervisorStalledTicks = 0
+    }
+
+    /// Re-baseline the supervisor whenever `bufferCounter` is replaced or
+    /// reset (e.g. by `handleConfigurationChange`). Without this, the next
+    /// tick reads `current < lastCount` and misinterprets the reset as a
+    /// stall, doubling-up recovery attempts and churning the engine.
+    private func resetSupervisorBaseline() {
+        supervisorLastCount = bufferCounter?.snapshot.count ?? 0
+        supervisorStalledTicks = 0
+    }
+
+    /// One supervisor tick. Reads the current buffer count, compares against
+    /// the previous tick, and triggers `recreateEngineAfterRouteChange()` if
+    /// the counter has been frozen for `supervisorStallThreshold` consecutive
+    /// ticks. No-op when the engine is torn down, muted, or being recovered.
+    private func supervisorTick() async {
+        guard engine != nil, let counter = bufferCounter else {
+            // Engine not running (between recordings, mid-teardown) — just
+            // reset the stall counter so a future start() begins fresh.
+            supervisorStalledTicks = 0
+            return
+        }
+        if muteFlag.isMuted {
+            // Live-mute makes the tap drop every buffer, so the counter still
+            // advances (the tap closure increments BEFORE the mute check).
+            // But to be defensive against future tap-closure rewrites that
+            // gate the increment on `!muted`, skip stall accounting here.
+            supervisorStalledTicks = 0
+            supervisorLastCount = counter.snapshot.count
+            return
+        }
+        let current = counter.snapshot.count
+        if current != supervisorLastCount {
+            supervisorLastCount = current
+            supervisorStalledTicks = 0
+            return
+        }
+        supervisorStalledTicks += 1
+        if supervisorStalledTicks < supervisorStallThreshold {
+            return
+        }
+        audioEngineLog.error("AudioEngine.supervisor: no new buffers for ~\(self.supervisorStalledTicks, privacy: .public) s while engine is supposedly live — rebuilding from scratch to recover from silent HAL stall (route change, SCStream startup, BT SCO drop, etc.)")
+        supervisorStalledTicks = 0
+        let recreated = await recreateEngineAfterRouteChange()
+        if recreated {
+            audioEngineLog.info("AudioEngine.supervisor: recreate succeeded — mic should resume")
+        } else {
+            audioEngineLog.error("AudioEngine.supervisor: recreate failed — will retry on next stall window")
+        }
+        // After recreate, bufferCounter is preserved (recreate doesn't reset
+        // it). Re-baseline so the next tick measures from the post-recreate
+        // count, not the stale pre-recreate count.
+        if let c = bufferCounter {
+            supervisorLastCount = c.snapshot.count
+        }
     }
 }
 

@@ -238,7 +238,14 @@ final class RecorderState {
         }
 
         let screenEnabled = settings.recordingMode == .audioAndScreen
-        let systemAudioEnabled = settings.systemAudioEnabled
+        // Audio + Screen mode implies the user wants the whole call captured
+        // — including the other participants' voices coming from speakers,
+        // Zoom/Meet/browser. The explicit `systemAudioEnabled` toggle was
+        // confusing in practice (people enabled screen recording, expected
+        // app audio in the transcript, got mic-only). Auto-enable system
+        // audio whenever screen recording is on; users can still uncheck
+        // `systemAudioEnabled` and stay in audio-only mode to opt out.
+        let systemAudioEnabled = settings.systemAudioEnabled || screenEnabled
 
         // Diagnostic: snapshot config + active audio devices before the
         // recording graph is built. Lets the Logs tab show exactly which mic /
@@ -334,6 +341,18 @@ final class RecorderState {
             let capture = CaptureSession(config: config, liveSink: liveTee)
             try await capture.start()
             self.captureSession = capture
+
+            // If the user's saved `systemAudioDeviceUID` resolved to a stale
+            // aggregate device (`CADefaultDeviceAggregate-XXXXX-0` — macOS
+            // recycles these IDs whenever it (re)builds the aggregate), the
+            // capture session fell back to SCKit. Clear the stored UID so
+            // the next recording goes straight to SCKit without paying the
+            // 200 ms lookup cost again — and, more importantly, without
+            // logging an error every single time.
+            if await capture.deviceCaptureFellBack && !settings.systemAudioDeviceUID.isEmpty {
+                Self.recorderLog.info("RecorderState.start: clearing stale systemAudioDeviceUID=\(self.settings.systemAudioDeviceUID, privacy: .public); will use SCKit going forward")
+                settings.systemAudioDeviceUID = ""
+            }
 
             // Screen recording is non-fatal: if it failed, surface a soft warning
             // so the user knows audio-only mode is active and how to fix it.
@@ -532,6 +551,11 @@ final class RecorderState {
                 try await store.append(segment)
             }
             try await store.close(overrideText: cleanedText)
+            // Always emit a timestamped sidecar alongside the cleaned text.
+            // `transcript.txt` may be LLM-rewritten and lose segment timing;
+            // `transcript.timestamped.txt` preserves [HH:MM:SS] anchors per
+            // raw segment so the Library player / chat can scrub by moment.
+            try? await store.writeTimestamped()
             // Track whether any opt-in enhancement step degraded silently.
             // Audit §4.2 flagged that the user had no visible cue when an
             // opted-in feature didn't run — `partial` surfaces that in the

@@ -79,6 +79,40 @@ public actor TranscriptStore {
         allFinals
     }
 
+    /// Write `<sessionDir>/transcript.timestamped.txt` — one line per final
+    /// segment prefixed with `[HH:MM:SS]` (or `[MM:SS]` for sub-hour
+    /// recordings). Independent of `transcript.txt`, which may be overridden
+    /// by the LLM-cleanup pass and loses segment timing. Lets the user (or
+    /// Library player) scrub to specific moments by reading the timestamp
+    /// next to the line they care about.
+    ///
+    /// Safe to call repeatedly — last write wins. No-op when no final
+    /// segments have been appended (avoids leaving an empty file behind).
+    public func writeTimestamped() throws {
+        let lines = allFinals.compactMap { segment -> String? in
+            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            return "[\(Self.formatTimestamp(seconds: segment.start))] \(text)"
+        }
+        guard !lines.isEmpty else { return }
+        let url = sessionDir.appendingPathComponent("transcript.timestamped.txt")
+        let body = lines.joined(separator: "\n") + "\n"
+        try AtomicWriter.write(Data(body.utf8), to: url)
+    }
+
+    /// Format `seconds` as `HH:MM:SS` for >= 1 h durations, `MM:SS` otherwise.
+    /// Visible-for-tests: callers should prefer `writeTimestamped()`.
+    static func formatTimestamp(seconds: Double) -> String {
+        let total = max(0, Int(seconds.rounded(.down)))
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, s)
+        }
+        return String(format: "%02d:%02d", m, s)
+    }
+
     // MARK: Private
 
     private func writeJSONL(_ segment: TranscriptSegment) throws {
