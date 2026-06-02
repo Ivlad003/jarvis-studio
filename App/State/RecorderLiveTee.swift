@@ -15,17 +15,59 @@ private let recorderLiveTeeLog = Logger(subsystem: "dev.kosmonotes.studio", cate
 /// continue to come from the existing post-stop batch path — this tee only
 /// provides the surface the popover / menu-bar live transcript displays.
 @available(macOS 14.0, *)
+struct RecorderLiveTeeEngine: Sendable {
+    let attach: @Sendable (URL) async -> Void
+    let ingest: @Sendable (TimeInterval, Data) async -> Void
+    let tick: @Sendable (TimeInterval, TranscriptionConfig) async throws -> Void
+    let finish: @Sendable (TimeInterval, TranscriptionConfig) async throws -> Void
+    let snapshot: @Sendable () async -> LiveTranscriptState
+
+    init(
+        attach: @escaping @Sendable (URL) async -> Void,
+        ingest: @escaping @Sendable (TimeInterval, Data) async -> Void,
+        tick: @escaping @Sendable (TimeInterval, TranscriptionConfig) async throws -> Void,
+        finish: @escaping @Sendable (TimeInterval, TranscriptionConfig) async throws -> Void,
+        snapshot: @escaping @Sendable () async -> LiveTranscriptState
+    ) {
+        self.attach = attach
+        self.ingest = ingest
+        self.tick = tick
+        self.finish = finish
+        self.snapshot = snapshot
+    }
+
+    init(_ engine: LiveTranscriptEngine) {
+        self.init(
+            attach: { file in await engine.attach(audioFile: file) },
+            ingest: { sampleTime, pcmData in await engine.ingest(sampleTime: sampleTime, pcmData: pcmData) },
+            tick: { now, config in try await engine.tick(now: now, config: config) },
+            finish: { now, config in try await engine.finish(now: now, config: config) },
+            snapshot: { await engine.snapshot() }
+        )
+    }
+}
+
+@available(macOS 14.0, *)
 public actor RecorderLiveTee: LivePCMSink {
     public nonisolated let audioFileURL: URL
-    private let engine: LiveTranscriptEngine
+    private let engine: RecorderLiveTeeEngine
     private let cadence: TimeInterval
     private let config: TranscriptionConfig
     private var audioFile: AVAudioFile?
     private var tickTask: Task<Void, Never>?
     private var startTime: TimeInterval = 0
+    private var writtenFrames: AVAudioFramePosition = 0
 
     public init(
         engine: LiveTranscriptEngine,
+        cadence: TimeInterval = 3,
+        config: TranscriptionConfig = TranscriptionConfig(language: nil, sampleRate: 16_000)
+    ) {
+        self.init(engine: RecorderLiveTeeEngine(engine), cadence: cadence, config: config)
+    }
+
+    init(
+        engine: RecorderLiveTeeEngine,
         cadence: TimeInterval = 3,
         config: TranscriptionConfig = TranscriptionConfig(language: nil, sampleRate: 16_000)
     ) {
@@ -41,7 +83,8 @@ public actor RecorderLiveTee: LivePCMSink {
     /// periodic tick scheduler.
     public func start() async {
         startTime = ProcessInfo.processInfo.systemUptime
-        await engine.attach(audioFile: audioFileURL)
+        writtenFrames = 0
+        await engine.attach(audioFileURL)
         let cadenceNs = UInt64(cadence * 1_000_000_000)
         let engineRef = engine
         let cfg = config
@@ -51,7 +94,7 @@ public actor RecorderLiveTee: LivePCMSink {
                 try? await Task.sleep(nanoseconds: cadenceNs)
                 if Task.isCancelled { return }
                 let now = ProcessInfo.processInfo.systemUptime - baseTime
-                try? await engineRef.tick(now: now, config: cfg)
+                try? await engineRef.tick(now, cfg)
             }
         }
         recorderLiveTeeLog.info("RecorderLiveTee.start: cadence=\(self.cadence, privacy: .public)s file=\(self.audioFileURL.lastPathComponent, privacy: .public)")
@@ -68,6 +111,11 @@ public actor RecorderLiveTee: LivePCMSink {
         }
         do {
             try audioFile?.write(from: buffer)
+            let sampleRate = buffer.format.sampleRate
+            guard sampleRate > 0 else { return }
+            writtenFrames += AVAudioFramePosition(buffer.frameLength)
+            let sampleTime = Double(writtenFrames) / sampleRate
+            await engine.ingest(sampleTime, Data())
         } catch {
             recorderLiveTeeLog.error("RecorderLiveTee.receive: write failed — \(error.localizedDescription, privacy: .public)")
         }
@@ -83,7 +131,7 @@ public actor RecorderLiveTee: LivePCMSink {
         tickTask?.cancel()
         tickTask = nil
         let now = ProcessInfo.processInfo.systemUptime - startTime
-        try? await engine.finish(now: now, config: config)
+        try? await engine.finish(now, config)
         audioFile = nil
         try? FileManager.default.removeItem(at: audioFileURL)
         recorderLiveTeeLog.info("RecorderLiveTee.stop: tick task cancelled, temp file removed")

@@ -150,7 +150,7 @@ private final class TapBufferCounter: @unchecked Sendable {
 }
 
 /// Real-time-safe mute flag. Read inside the tap closure (runs on the audio
-/// render thread) to decide whether to drop incoming PCM buffers; written
+/// render thread) to decide whether to silence incoming PCM buffers; written
 /// from the actor (or any thread, really) when the user toggles mute.
 /// `NSLock` here is sub-microsecond and the tap callback runs at ~10 Hz, so
 /// contention is non-existent.
@@ -193,6 +193,11 @@ public actor AudioEngine {
         case installAfterEngineStart
     }
 
+    enum TapInstallFormatStrategy: Equatable {
+        case keepProposedFormat
+        case refreshFromLiveAUHALFormat
+    }
+
     nonisolated static func tapBootstrapStrategy(
         preStartSampleRate: Double,
         preStartChannelCount: AVAudioChannelCount
@@ -203,15 +208,38 @@ public actor AudioEngine {
         return .installAfterEngineStart
     }
 
+    nonisolated static func tapInstallFormatStrategy(
+        proposedSampleRate: Double,
+        proposedChannelCount: AVAudioChannelCount,
+        liveSampleRate: Double,
+        liveChannelCount: AVAudioChannelCount
+    ) -> TapInstallFormatStrategy {
+        guard liveSampleRate > 0, liveChannelCount > 0 else {
+            return .keepProposedFormat
+        }
+        if proposedSampleRate != liveSampleRate || proposedChannelCount != liveChannelCount {
+            return .refreshFromLiveAUHALFormat
+        }
+        return .keepProposedFormat
+    }
+
+    nonisolated static func overwriteWithSilence(_ buffer: AVAudioPCMBuffer) {
+        let audioBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        for audioBuffer in audioBuffers {
+            guard let data = audioBuffer.mData else { continue }
+            memset(data, 0, Int(audioBuffer.mDataByteSize))
+        }
+    }
+
     // MARK: Private state
 
     private let config: Config
     private var engine: AVAudioEngine?
     private var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
-    /// Shared with the tap closure. Flip this to drop mic samples mid-recording
+    /// Shared with the tap closure. Flip this to silence mic samples mid-recording
     /// (live mute) without tearing down the engine — the tap closure reads it
-    /// every callback and silently skips yielding when true. The audio file
-    /// keeps growing during a mute (silent samples), so timestamps stay aligned.
+    /// every callback and overwrites PCM with silence when true. The audio file
+    /// keeps growing during mute, so timestamps stay aligned.
     private let muteFlag = TapMuteFlag()
     /// Target output format the rest of the pipeline expects (e.g. 48 kHz
     /// mono Float32). Stored so a route-change-triggered tap reinstall can
@@ -419,7 +447,7 @@ public actor AudioEngine {
 
         if bootstrapStrategy == .installAfterEngineStart {
             // Install the tap with the validated input format. See `installTap`
-            // for the closure body (real-time-safe, drops on mute, converts to
+            // for the closure body (real-time-safe, silences on mute, converts to
             // targetFormat when the bound device's native format differs).
             installTap(on: inputNode, inputFormat: inputFormat)
             audioEngineLog.info("AudioEngine.start: tap installed after engine.start, awaiting first buffer")
@@ -495,9 +523,9 @@ public actor AudioEngine {
         return stream
     }
 
-    /// Live-toggle mic mute. When true, the tap callback drops every PCM
-    /// buffer it receives, so the segment writer keeps growing with whatever
-    /// the system is feeding (silence) but the user's voice goes nowhere.
+    /// Live-toggle mic mute. When true, the tap callback overwrites each PCM
+    /// buffer with silence before yielding it, so the segment writer timeline
+    /// keeps growing but the user's voice goes nowhere.
     /// The engine itself stays running — toggling back to false resumes
     /// capture instantly without re-arming permissions / re-binding AUHAL.
     public func setMuted(_ muted: Bool) {
@@ -617,13 +645,28 @@ public actor AudioEngine {
 
         let bufferSize: AVAudioFrameCount = 4800
         let mute = muteFlag
+        let liveInputFormat = inputNode.auAudioUnit.outputBusses[0].format
+        let tapInputFormat: AVAudioFormat
+        switch Self.tapInstallFormatStrategy(
+            proposedSampleRate: inputFormat.sampleRate,
+            proposedChannelCount: inputFormat.channelCount,
+            liveSampleRate: liveInputFormat.sampleRate,
+            liveChannelCount: liveInputFormat.channelCount
+        ) {
+        case .keepProposedFormat:
+            tapInputFormat = inputFormat
+        case .refreshFromLiveAUHALFormat:
+            tapInputFormat = liveInputFormat
+            audioEngineLog.info("AudioEngine.installTap: refreshing stale tap format from proposed sampleRate=\(inputFormat.sampleRate, privacy: .public) channels=\(inputFormat.channelCount, privacy: .public) to live AUHAL sampleRate=\(liveInputFormat.sampleRate, privacy: .public) channels=\(liveInputFormat.channelCount, privacy: .public)")
+        }
 
-        inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { buffer, _ in
-            // Live mic-mute: drop the buffer entirely so the AsyncStream stays
-            // silent without tearing down the engine. counter still increments
-            // so the "buffers received" diagnostic doesn't lie.
+        inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: tapInputFormat) { buffer, _ in
+            // Live mic-mute: keep yielding the same frame count as silence so
+            // downstream audio timestamps stay aligned with screen/video.
             counter.increment(frames: Int(buffer.frameLength))
-            if mute.isMuted { return }
+            if mute.isMuted {
+                AudioEngine.overwriteWithSilence(buffer)
+            }
             let bufferFormat = buffer.format
             if bufferFormat.sampleRate == targetFormat.sampleRate
                 && bufferFormat.channelCount == targetFormat.channelCount
@@ -745,6 +788,13 @@ public actor AudioEngine {
         // Engine restarted on the original instance. Final format check —
         // route swaps can flutter, so re-poll after start to make sure the
         // bus didn't go transient again on us.
+        let postStartFormat = inputNode.auAudioUnit.outputBusses[0].format
+        if postStartFormat.channelCount > 0, postStartFormat.sampleRate > 0 {
+            if postStartFormat.sampleRate != inputFormat.sampleRate || postStartFormat.channelCount != inputFormat.channelCount {
+                audioEngineLog.info("AudioEngine.handleConfigurationChange: input format changed across engine.start from sampleRate=\(inputFormat.sampleRate, privacy: .public) channels=\(inputFormat.channelCount, privacy: .public) to sampleRate=\(postStartFormat.sampleRate, privacy: .public) channels=\(postStartFormat.channelCount, privacy: .public)")
+            }
+            inputFormat = postStartFormat
+        }
         if inputFormat.channelCount == 0 || inputFormat.sampleRate == 0 {
             var postAttempts = 0
             while (inputFormat.channelCount == 0 || inputFormat.sampleRate == 0) && postAttempts < 100 {
@@ -875,10 +925,8 @@ public actor AudioEngine {
             return
         }
         if muteFlag.isMuted {
-            // Live-mute makes the tap drop every buffer, so the counter still
-            // advances (the tap closure increments BEFORE the mute check).
-            // But to be defensive against future tap-closure rewrites that
-            // gate the increment on `!muted`, skip stall accounting here.
+            // Live-mute still yields silence, but skip stall accounting because
+            // user intent is "do not capture audible mic content".
             supervisorStalledTicks = 0
             supervisorLastCount = counter.snapshot.count
             return

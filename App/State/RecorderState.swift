@@ -72,6 +72,14 @@ final class RecorderState {
         }
     }
 
+    enum ScreenAudioMixResult: Equatable, Sendable {
+        case skipped
+        case mixed
+        case failed(String)
+    }
+
+    typealias ScreenAudioMixerFunction = @Sendable (_ screenURL: URL, _ audioFile: URL) async throws -> Void
+
     // MARK: - Observable state
 
     var status: Status = .idle
@@ -465,28 +473,17 @@ final class RecorderState {
             let audioFile = try await recoveryService.finalize(orphan)
 
             // Fold the mic track from audio.m4a into screen.mp4 so playback gives
-            // you BOTH your voice and the system audio in the video file. Runs
-            // concurrently with transcription — the mix is non-essential and
-            // we don't want to block the transcript path on it. On failure the
-            // existing screen.mp4 (system audio only) stays in place.
+            // you BOTH your voice and the system audio in the video file. Run it
+            // concurrently with transcription, then join before marking the
+            // session complete so Library/Share never sees a stale screen.mp4.
             let screenURL = dir.appendingPathComponent("screen.mp4")
-            let mixTask: Task<Void, Never>?
-            if FileManager.default.fileExists(atPath: screenURL.path) {
-                mixTask = Task.detached {
-                    do {
-                        try await ScreenAudioMixer.mixMicInto(screenMP4: screenURL, audioM4A: audioFile)
-                    } catch {
-                        // Logged inside the mixer via os.Logger; nothing else to do.
-                    }
-                }
-            } else {
-                mixTask = nil
+            let mixTask: Task<ScreenAudioMixResult, Never> = Task.detached {
+                await Self.mixScreenAudioIfPresent(screenURL: screenURL, audioFile: audioFile)
             }
 
             let asset = AVURLAsset(url: audioFile)
             let cmDuration = try await asset.load(.duration)
             let duration = CMTimeGetSeconds(cmDuration)
-            _ = mixTask  // silence "unused" — task lifetime is tied to the recording cleanup path
 
             // Pick the configured transcription provider. Whisper uses OpenAI's
             // batch endpoint; Deepgram uses its REST batch (`/v1/listen`) since
@@ -616,6 +613,16 @@ final class RecorderState {
                 recordedAt: Date()
             )
 
+            switch await mixTask.value {
+            case .mixed:
+                Self.recorderLog.info("RecorderState.stop: screen.mp4 mic mix completed")
+            case .failed(let message):
+                enhancement = .partial
+                Self.recorderLog.error("RecorderState.stop: screen.mp4 mic mix failed: \(message, privacy: .public)")
+            case .skipped:
+                break
+            }
+
             try await sessionStore.finalize(
                 id: sessionId,
                 status: .complete,
@@ -673,6 +680,25 @@ final class RecorderState {
             return true
         }
         return false
+    }
+
+    nonisolated static func mixScreenAudioIfPresent(
+        screenURL: URL,
+        audioFile: URL,
+        mixer: @escaping ScreenAudioMixerFunction = { screenURL, audioFile in
+            try await ScreenAudioMixer.mixMicInto(screenMP4: screenURL, audioM4A: audioFile)
+        }
+    ) async -> ScreenAudioMixResult {
+        guard FileManager.default.fileExists(atPath: screenURL.path) else {
+            return .skipped
+        }
+
+        do {
+            try await mixer(screenURL, audioFile)
+            return .mixed
+        } catch {
+            return .failed(error.localizedDescription)
+        }
     }
 
     // MARK: - Helpers

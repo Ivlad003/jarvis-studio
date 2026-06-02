@@ -100,6 +100,30 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput, @unchecked Send
     }
 }
 
+// MARK: - AudioBufferList storage
+
+final class AudioBufferListStorage {
+    let byteCount: Int
+    private let rawPointer: UnsafeMutableRawPointer
+    let pointer: UnsafeMutablePointer<AudioBufferList>
+
+    init?(byteCount: Int) {
+        guard byteCount >= MemoryLayout<AudioBufferList>.size else { return nil }
+
+        self.byteCount = byteCount
+        self.rawPointer = UnsafeMutableRawPointer.allocate(
+            byteCount: byteCount,
+            alignment: max(16, MemoryLayout<AudioBufferList>.alignment)
+        )
+        self.rawPointer.initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
+        self.pointer = rawPointer.bindMemory(to: AudioBufferList.self, capacity: 1)
+    }
+
+    deinit {
+        rawPointer.deallocate()
+    }
+}
+
 // MARK: - CMSampleBuffer → AVAudioPCMBuffer
 
 extension CMSampleBuffer {
@@ -128,8 +152,10 @@ extension CMSampleBuffer {
 
         guard bufferListSize > 0 else { return nil }
 
-        let audioBufferListPtr = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
-        defer { audioBufferListPtr.deallocate() }
+        guard let audioBufferListStorage = AudioBufferListStorage(byteCount: bufferListSize) else {
+            return nil
+        }
+        let audioBufferListPtr = audioBufferListStorage.pointer
 
         var retainedBlock: CMBlockBuffer?
         let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
@@ -145,7 +171,7 @@ extension CMSampleBuffer {
 
         guard status == noErr else { return nil }
         // Keep retainedBlock alive for the duration of the copy
-        withExtendedLifetime(retainedBlock) {
+        withExtendedLifetime((retainedBlock, audioBufferListStorage)) {
             let ablPtr = UnsafeMutableAudioBufferListPointer(audioBufferListPtr)
             if let floatChannelData = pcmBuffer.floatChannelData {
                 for channelIndex in 0..<ablPtr.count {

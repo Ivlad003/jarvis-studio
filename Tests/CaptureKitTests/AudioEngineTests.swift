@@ -114,4 +114,41 @@ struct AudioEngineTests {
             ) == .installAfterEngineStart
         )
     }
+
+    @Test("Tap install refreshes stale proposed format from live AUHAL format")
+    func tapInstallRefreshesStaleProposedFormatFromLiveAUHALFormat() {
+        #expect(
+            AudioEngine.tapInstallFormatStrategy(
+                proposedSampleRate: 44_100,
+                proposedChannelCount: 2,
+                liveSampleRate: 24_000,
+                liveChannelCount: 1
+            ) == .refreshFromLiveAUHALFormat
+        )
+    }
+
+    @Test("Tap install keeps proposed format when live AUHAL format is degenerate")
+    func tapInstallKeepsProposedFormatWhenLiveAUHALFormatIsDegenerate() {
+        #expect(
+            AudioEngine.tapInstallFormatStrategy(
+                proposedSampleRate: 48_000,
+                proposedChannelCount: 1,
+                liveSampleRate: 0,
+                liveChannelCount: 0
+            ) == .keepProposedFormat
+        )
+    }
+
+    @Test("Muted tap buffer preserves frame count as silence")
+    func mutedTapBufferPreservesFrameCountAsSilence() throws {
+        let frameCount: AVAudioFrameCount = 4800
+        let buffer = try #require(AVAudioPCMBuffer.sineWave(frameCount: frameCount))
+
+        AudioEngine.overwriteWithSilence(buffer)
+
+        #expect(buffer.frameLength == frameCount)
+        let data = try #require(buffer.floatChannelData?[0])
+        let allZero = (0..<Int(buffer.frameLength)).allSatisfy { data[$0] == 0.0 }
+        #expect(allZero)
+    }
 }

@@ -32,6 +32,18 @@ public struct SharingService: Sendable {
         public let summaryURL: URL?
         public let transcriptURL: URL?
 
+        public init(
+            audioURL: URL?,
+            videoURL: URL?,
+            summaryURL: URL?,
+            transcriptURL: URL?
+        ) {
+            self.audioURL = audioURL
+            self.videoURL = videoURL
+            self.summaryURL = summaryURL
+            self.transcriptURL = transcriptURL
+        }
+
         public var allLinks: [URL] {
             [audioURL, videoURL, summaryURL, transcriptURL].compactMap { $0 }
         }

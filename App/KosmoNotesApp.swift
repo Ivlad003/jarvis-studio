@@ -38,6 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var agentSessionHolder: AnyObject?   // AgentSessionState (macOS 14+)
     private var agentHotkeyHolder: AnyObject?    // AgentHotkeyState (macOS 14+)
     private var agentConsoleHolder: AnyObject?   // AgentConsoleWindowController (macOS 14+)
+    private var startupScreenRecordingWarning: String?
 
     // Library window controller. Stored as AnyObject to avoid @available on
     // a stored property (Swift disallows that). Cast at use-site with #available.
@@ -91,13 +92,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Checks and requests system permissions on every launch.
     /// - Mic / Accessibility: request only when not yet determined (system shows dialog).
-    /// - Screen recording: NO preflight here. `CGPreflightScreenCaptureAccess()` and
-    ///   `SCShareableContent` both return false-negatives on macOS 15+/26 with
-    ///   Apple Development signing even when TCC is granted, producing a popup loop
-    ///   on every launch. The actual recording path in `CaptureSession.start` is
-    ///   non-fatal: if SCStream throws, audio capture continues and the warning
-    ///   surfaces inline via `RecorderState.screenRecordingWarning`.
+    /// - Screen recording: uses `CGPreflightScreenCaptureAccess()` on every launch;
+    ///   the recording path still handles runtime SCKit failures as audio-only.
     private func checkPermissionsOnStartup() {
+        startupScreenRecordingWarning = StartupPermissionPolicy.screenRecordingWarning()
+        if #available(macOS 14.0, *),
+           let warning = startupScreenRecordingWarning,
+           let recorder = recorderState {
+            recorder.screenRecordingWarning = warning
+            statusItem?.menu?.update()
+        }
+
         // Microphone — request if not yet determined; silent otherwise.
         if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
             AVCaptureDevice.requestAccess(for: .audio) { _ in }
@@ -264,6 +269,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         liveTranscriptItem.isHidden = true
         menu.addItem(liveTranscriptItem)
 
+        let screenWarningItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        screenWarningItem.identifier = NSUserInterfaceItemIdentifier("screenRecordingWarning")
+        screenWarningItem.isEnabled = false
+        screenWarningItem.isHidden = true
+        menu.addItem(screenWarningItem)
+
         menu.addItem(.separator())
 
         let openLastSessionItem = NSMenuItem(title: "Open last session in Finder",
@@ -391,6 +402,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 sessionStore: sessionStore,
                 settings: settings
             )
+            if let startupScreenRecordingWarning {
+                recorder.screenRecordingWarning = startupScreenRecordingWarning
+            }
             self.recorderHolder = recorder
 
             // Dictation: register the global hotkey monitor. The pipeline itself
@@ -742,6 +756,7 @@ extension AppDelegate: NSMenuDelegate {
         let voiceNoteItem = menu.items.first(where: { $0.identifier?.rawValue == "voiceNoteToggle" })
         let muteItem = menu.items.first(where: { $0.identifier?.rawValue == "toggleMicMute" })
         let liveTranscriptItem = menu.items.first(where: { $0.identifier?.rawValue == "liveTranscriptStatus" })
+        let screenWarningItem = menu.items.first(where: { $0.identifier?.rawValue == "screenRecordingWarning" })
         guard let openLastItem = menu.items.first(where: { $0.identifier?.rawValue == "openLastSession" }) else { return }
 
         // Mute item: only meaningful while a recording is in flight.
@@ -755,6 +770,7 @@ extension AppDelegate: NSMenuDelegate {
 
         if #available(macOS 14.0, *), let recorder = recorderState {
             updateLiveTranscriptItem(liveTranscriptItem, recorder: recorder)
+            updateScreenRecordingWarningItem(screenWarningItem, recorder: recorder)
             switch recorder.status {
             case .idle:
                 recordItem.title = "Start Recording"
@@ -793,7 +809,21 @@ extension AppDelegate: NSMenuDelegate {
             voiceNoteItem?.isEnabled = false
             openLastItem.isEnabled = false
             liveTranscriptItem?.isHidden = true
+            screenWarningItem?.isHidden = true
         }
+    }
+
+    @available(macOS 14.0, *)
+    private func updateScreenRecordingWarningItem(_ item: NSMenuItem?, recorder: RecorderState) {
+        guard let item else { return }
+        guard let title = RecorderMenuPresenter.screenRecordingWarningTitle(for: recorder.screenRecordingWarning) else {
+            item.isHidden = true
+            item.title = ""
+            return
+        }
+
+        item.isHidden = false
+        item.title = title
     }
 
     @available(macOS 14.0, *)

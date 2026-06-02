@@ -86,6 +86,7 @@ public actor ScreenRecorder: NSObject {
 
     public func start(config: Config) async throws {
         self.config = config
+        pendingSampleTasks.open()
         screenRecorderLog.info("ScreenRecorder.start: outputURL=\(config.outputURL.path, privacy: .public) hevc=\(config.useHEVC, privacy: .public) videoBitrate=\(config.videoBitrate, privacy: .public) audio=\(config.captureSystemAudio, privacy: .public) fps=\(config.frameRate, privacy: .public)")
 
         let content: SCShareableContent
@@ -261,10 +262,9 @@ public actor ScreenRecorder: NSObject {
         // call, so the cross-actor hop is safe in practice.
         let box = SBBox(buffer: sampleBuffer, type: type)
         let bag = pendingSampleTasks
-        let task = Task<Void, Never> { [weak self] in
+        bag.add { [weak self] in
             await self?._handleSampleBuffer(box.buffer, ofType: box.type)
         }
-        bag.add(task)
     }
 
     private var screenFrameCount: Int = 0
@@ -374,16 +374,72 @@ private final class SBBox: @unchecked Sendable {
 /// `screen.mp4`.
 @available(macOS 12.3, *)
 final class SCSampleTaskBag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var tasks: [Task<Void, Never>] = []
+    private final class Entry {
+        var task: Task<Void, Never>?
+    }
 
-    func add(_ task: Task<Void, Never>) {
-        lock.lock(); tasks.append(task); lock.unlock()
+    private let lock = NSLock()
+    private var tasks: [UInt64: Entry] = [:]
+    private var nextID: UInt64 = 0
+    private var closed = false
+
+    var activeTaskCount: Int {
+        lock.lock()
+        let count = tasks.count
+        lock.unlock()
+        return count
+    }
+
+    func open() {
+        lock.lock()
+        tasks.removeAll()
+        closed = false
+        lock.unlock()
+    }
+
+    @discardableResult
+    func add(_ operation: @escaping @Sendable () async -> Void) -> Task<Void, Never>? {
+        lock.lock()
+        guard !closed else {
+            lock.unlock()
+            return nil
+        }
+
+        let id = nextID
+        nextID &+= 1
+        let entry = Entry()
+        tasks[id] = entry
+        lock.unlock()
+
+        let task = Task<Void, Never> { [weak self] in
+            defer { self?.remove(id: id) }
+            await operation()
+        }
+
+        lock.lock()
+        guard !closed, tasks[id] === entry else {
+            lock.unlock()
+            task.cancel()
+            return nil
+        }
+        entry.task = task
+        lock.unlock()
+        return task
     }
 
     func drain() -> [Task<Void, Never>] {
-        lock.lock(); let out = tasks; tasks.removeAll(); lock.unlock()
+        lock.lock()
+        closed = true
+        let out = tasks.values.compactMap(\.task)
+        tasks.removeAll()
+        lock.unlock()
         return out
+    }
+
+    private func remove(id: UInt64) {
+        lock.lock()
+        tasks[id] = nil
+        lock.unlock()
     }
 }
 
