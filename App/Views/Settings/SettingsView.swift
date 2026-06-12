@@ -5,6 +5,7 @@ import AIKit
 import CaptureKit
 import DictationKit
 import KeyboardShortcuts
+import StorageKit
 import TranscriptionKit
 
 // MARK: - SettingsView
@@ -15,6 +16,12 @@ import TranscriptionKit
 struct SettingsView: View {
 
     @Bindable var settings: AppSettings
+    let knowledgeBaseStore: KnowledgeBaseStore?
+
+    init(settings: AppSettings, knowledgeBaseStore: KnowledgeBaseStore? = nil) {
+        self.settings = settings
+        self.knowledgeBaseStore = knowledgeBaseStore
+    }
 
     var body: some View {
         TabView {
@@ -42,6 +49,9 @@ struct SettingsView: View {
             AgentTab(settings: settings)
                 .tabItem { Label("Agent", systemImage: "wand.and.rays") }
 
+            KnowledgeBaseTab(store: knowledgeBaseStore)
+                .tabItem { Label("Knowledge", systemImage: "books.vertical") }
+
             PrivacyTab()
                 .tabItem { Label("Privacy", systemImage: "lock.shield") }
 
@@ -54,6 +64,116 @@ struct SettingsView: View {
         // Dictation / Voice Note / Hotkeys / Sharing / Markdown / Agent /
         // Privacy). Bumped both ideal and min so labels render in full.
         .frame(minWidth: 760, idealWidth: 820, minHeight: 380, idealHeight: 560)
+    }
+}
+
+// MARK: - KnowledgeBaseTab
+
+@available(macOS 14.0, *)
+private struct KnowledgeBaseTab: View {
+    @State private var state: KnowledgeBaseSettingsState
+
+    init(store: KnowledgeBaseStore?) {
+        _state = State(initialValue: KnowledgeBaseSettingsState(store: store))
+    }
+
+    var body: some View {
+        Form {
+            Section("Sources") {
+                if state.sources.isEmpty {
+                    Text("No knowledge sources configured.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(state.sources) { source in
+                        HStack(alignment: .firstTextBaseline) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(source.path)
+                                    .font(.system(.callout, design: .monospaced))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Text(Self.detailText(for: source))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Remove", role: .destructive) {
+                                Task { await state.removeSource(id: source.id) }
+                            }
+                            .disabled(state.isBusy)
+                        }
+                    }
+                }
+
+                HStack {
+                    Button("Add documents…") { pickDocuments() }
+                        .disabled(state.isBusy)
+                    Button("Add code folder…") { pickCodeFolder() }
+                        .disabled(state.isBusy)
+                    Spacer()
+                    Button("Reindex all") {
+                        Task { await state.reindexAll() }
+                    }
+                    .disabled(state.isBusy || state.sources.isEmpty)
+                }
+
+                if state.isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                if let status = state.statusMessage {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let error = state.lastError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+
+            Section("Indexing") {
+                Text("Documents can be Markdown, text, or PDF files. Code folders are indexed with identifier-safe full-text search and are also available to the agent's code search tool.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .task { await state.refresh() }
+    }
+
+    private static func detailText(for source: KnowledgeBaseSource) -> String {
+        "\(KnowledgeBaseSettingsState.displayName(for: source.kind)) source"
+    }
+
+    private func pickDocuments() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.allowedFileTypes = ["md", "markdown", "txt", "text", "pdf"]
+        panel.prompt = "Add"
+        panel.title = "Add documents to the knowledge base"
+        if panel.runModal() == .OK {
+            let urls = panel.urls
+            Task {
+                for url in urls {
+                    await state.addSource(kind: .document, path: url)
+                }
+            }
+        }
+    }
+
+    private func pickCodeFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add"
+        panel.title = "Add a code folder to the knowledge base"
+        if panel.runModal() == .OK, let url = panel.url {
+            Task { await state.addSource(kind: .codeFolder, path: url) }
+        }
     }
 }
 

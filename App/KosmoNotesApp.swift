@@ -822,7 +822,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let view = SettingsView(settings: settings)
+        let view = SettingsView(
+            settings: settings,
+            knowledgeBaseStore: knowledgeBaseStoreHolder as? KnowledgeBaseStore
+        )
         let hosting = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hosting)
         window.title = "KosmoNotes Settings"

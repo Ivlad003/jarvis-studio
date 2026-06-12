@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Testing
 @testable import StorageKit
 
@@ -19,6 +20,28 @@ struct KnowledgeBaseStoreTests {
 
     private func cleanup(_ dir: URL) {
         try? FileManager.default.removeItem(at: dir)
+    }
+
+    private func writePDF(text: String, to url: URL) throws {
+        let data = NSMutableData()
+        var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
+        guard let consumer = CGDataConsumer(data: data),
+              let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        context.beginPDFPage(nil)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        (text as NSString).draw(
+            at: CGPoint(x: 72, y: 700),
+            withAttributes: [.font: NSFont.systemFont(ofSize: 14)]
+        )
+        NSGraphicsContext.restoreGraphicsState()
+        context.endPDFPage()
+        context.closePDF()
+
+        try data.write(to: url, options: .atomic)
     }
 
     @Test("addSource persists code folder sources")
@@ -71,6 +94,23 @@ struct KnowledgeBaseStoreTests {
 
         let documentHits = try await store.search(query: "budget Friday", limit: 10)
         #expect(documentHits.contains { $0.relPath == "docs/meeting.md" })
+    }
+
+    @Test("reindexAll indexes PDF document text")
+    func reindexAllIndexesPDFDocumentText() async throws {
+        let (store, _, tmpDir) = try await makeStore()
+        defer { cleanup(tmpDir) }
+
+        let sourceDir = tmpDir.appendingPathComponent("knowledge")
+        try FileManager.default.createDirectory(at: sourceDir, withIntermediateDirectories: true)
+        let pdfURL = sourceDir.appendingPathComponent("brief.pdf")
+        try writePDF(text: "Quarterly launch budget includes live chat transcription.", to: pdfURL)
+
+        _ = try await store.addSource(kind: .document, path: sourceDir)
+        try await store.reindexAll()
+
+        let hits = try await store.search(query: "live chat transcription", limit: 10)
+        #expect(hits.contains { $0.relPath == "brief.pdf" })
     }
 
     @Test("reindexAll removes stale chunks for changed files")

@@ -1,4 +1,5 @@
 import Foundation
+import PDFKit
 
 public actor KnowledgeBaseStore {
     private let database: AppDatabase
@@ -59,7 +60,7 @@ public actor KnowledgeBaseStore {
         }
 
         return try urls.sorted { $0.path < $1.path }.compactMap { url in
-            guard let text = try readTextFile(url), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            guard let text = try readIndexableText(url), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return nil
             }
             let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
@@ -70,6 +71,13 @@ public actor KnowledgeBaseStore {
                 chunks: Self.chunks(from: text)
             )
         }
+    }
+
+    private func readIndexableText(_ url: URL) throws -> String? {
+        if url.pathExtension.lowercased() == "pdf" {
+            return Self.truncated(PDFDocument(url: url)?.string)
+        }
+        return try readTextFile(url)
     }
 
     private func readTextFile(_ url: URL) throws -> String? {
@@ -114,8 +122,15 @@ public actor KnowledgeBaseStore {
         return chunks
     }
 
+    private static func truncated(_ text: String?, maxCharacters: Int = 64 * 1024) -> String? {
+        guard let text else { return nil }
+        guard text.count > maxCharacters else { return text }
+        let end = text.index(text.startIndex, offsetBy: maxCharacters)
+        return String(text[..<end])
+    }
+
     private static let documentExtensions: Set<String> = [
-        "md", "markdown", "txt", "text",
+        "md", "markdown", "pdf", "txt", "text",
     ]
 
     private static let codeExtensions: Set<String> = [
