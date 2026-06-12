@@ -21,6 +21,7 @@ final class MockWebSocketTransport: WebSocketTransport, @unchecked Sendable {
     private var sends: [WebSocketMessage] = []
     private var continuations: [CheckedContinuation<WebSocketMessage, Error>] = []
     private var pendingErrors: [Error] = []
+    private var pendingSendErrors: [Error] = []
     private var isClosed: Bool = false
     private var lastCloseCode: WebSocketCloseCode?
 
@@ -73,15 +74,34 @@ final class MockWebSocketTransport: WebSocketTransport, @unchecked Sendable {
         waiter?.resume(throwing: error)
     }
 
+    /// Inject a send error — the next `send(_:)` call throws without recording
+    /// the message as delivered.
+    func injectSendError(_ error: Error) {
+        lock.withLock {
+            pendingSendErrors.append(error)
+        }
+    }
+
     // MARK: WebSocketTransport
 
     func send(_ message: WebSocketMessage) async throws {
-        let closed: Bool = lock.withLock {
-            if isClosed { return true }
-            sends.append(message)
-            return false
+        enum SendDecision {
+            case sent
+            case error(Error)
+            case closed
         }
-        if closed {
+        let decision: SendDecision = lock.withLock {
+            if isClosed { return .closed }
+            if !pendingSendErrors.isEmpty { return .error(pendingSendErrors.removeFirst()) }
+            sends.append(message)
+            return .sent
+        }
+        switch decision {
+        case .sent:
+            return
+        case .error(let error):
+            throw error
+        case .closed:
             throw TranscriptionError.sendFailed(message: "transport closed")
         }
     }

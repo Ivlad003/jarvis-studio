@@ -65,7 +65,7 @@ final class ShareCoordinator {
         let service = SharingService(
             s3: client,
             keyPrefix: "jarvis-note/",
-            presignTTLSeconds: max(1, settings.s3PresignTTLHours) * 3600
+            presignTTLSeconds: Self.clampedPresignTTLHours(settings.s3PresignTTLHours) * 3600
         )
 
         let dir = await sessionStore.sessionDir(for: sessionId)
@@ -102,7 +102,7 @@ final class ShareCoordinator {
     private func promptArtifactSelection(from available: [SharedArtifactKind]) -> [SharedArtifactKind]? {
         let alert = NSAlert()
         alert.messageText = "Share to S3"
-        alert.informativeText = "Pick which artifacts to upload. Presigned links are valid for \(settings.s3PresignTTLHours) h."
+        alert.informativeText = "Pick which artifacts to upload. Presigned links are valid for \(Self.clampedPresignTTLHours(settings.s3PresignTTLHours)) h."
         alert.alertStyle = .informational
 
         let stack = NSStackView()
@@ -137,6 +137,10 @@ final class ShareCoordinator {
         let response = alert.runModal()
         guard response == .alertFirstButtonReturn else { return nil }
         return checkboxes.compactMap { kind, box in box.state == .on ? kind : nil }
+    }
+
+    static func clampedPresignTTLHours(_ hours: Int) -> Int {
+        max(1, min(hours, 168))
     }
 
     private func presentResult(_ result: SharingService.ShareResult) {

@@ -95,6 +95,21 @@ struct AudioEngineTests {
         }
     }
 
+    @Test(
+        "AudioEngine.start with voice processing throws or succeeds without crashing (CI-safe)",
+        .disabled(if: ProcessInfo.processInfo.environment["CI"] == "true",
+                  "AVAudioEngine.start() crashes with signal 11 on headless macos-15 GH Actions runners — uncatchable in Swift; verified locally on M-series.")
+    )
+    func audioEngineStartWithVoiceProcessingIsSafe() async {
+        let engine = AudioEngine(config: .init(voiceProcessing: true))
+        do {
+            _ = try await engine.start()
+            await engine.stop()
+        } catch {
+            // Expected without a usable microphone/HAL. Pass.
+        }
+    }
+
     @Test("Tap bootstrap uses pre-start install when input format is already valid")
     func tapBootstrapUsesPreStartInstallForUsableFormat() {
         #expect(

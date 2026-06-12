@@ -181,10 +181,16 @@ public actor AudioEngine {
     public struct Config: Sendable {
         public let sampleRate: Double
         public let channels: AVAudioChannelCount
+        public let voiceProcessing: Bool
 
-        public init(sampleRate: Double = 48_000, channels: AVAudioChannelCount = 1) {
+        public init(
+            sampleRate: Double = 48_000,
+            channels: AVAudioChannelCount = 1,
+            voiceProcessing: Bool = false
+        ) {
             self.sampleRate = sampleRate
             self.channels = channels
+            self.voiceProcessing = voiceProcessing
         }
     }
 
@@ -325,7 +331,7 @@ public actor AudioEngine {
             throw AudioEngineError.formatCreationFailed
         }
 
-        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (stream, continuation) = AudioPCMBufferStream.makeStream()
         self.continuation = continuation
 
         // Touch inputNode BEFORE prepare/start so AVAudioEngine instantiates
@@ -334,13 +340,10 @@ public actor AudioEngine {
         // no nodes are in use yet. Just reading the property is enough.
         let inputNode = engine.inputNode
 
-        // NOTE: setVoiceProcessingEnabled(true) (Apple's AEC + AGC + NS) was
-        // tried here as a fix for the speaker → mic echo loop you get when
-        // recording mic + system audio without headphones. It works, but it
-        // forces VoiceProcessingIO into mono 16 kHz with aggressive AGC that
-        // dropped mic gain to inaudible levels and broke our 48 kHz capture
-        // pipeline. Rolled back; the recommended workaround for echo is
-        // headphones (zero code, perfect cancellation).
+        // VoiceProcessingIO is useful for speaker echo cancellation only when
+        // AGC is disabled and ducking is minimized; the tap converts its mono
+        // source format back into the pipeline's configured format.
+        applyVoiceProcessingIfNeeded(on: inputNode, context: "start")
 
         // (BT swap already happened above, before AVAudioEngine() — no need
         // to re-swap here; the engine has been created on top of the new
@@ -440,7 +443,7 @@ public actor AudioEngine {
         // through them. Apple's audio HAL takes noticeably longer to fully
         // wire up an SCO mic — first PCM buffer can arrive 4–6 s after the
         // tap is installed. Bump the no-buffer deadline to compensate.
-        let isLikelyBluetoothMic = inputFormat.sampleRate <= 24_000.0 && inputFormat.channelCount == 1
+        let isLikelyBluetoothMic = !config.voiceProcessing && inputFormat.sampleRate <= 24_000.0 && inputFormat.channelCount == 1
         if isLikelyBluetoothMic {
             audioEngineLog.info("AudioEngine.start: input rate \(inputFormat.sampleRate, privacy: .public) Hz mono looks like Bluetooth HFP/SCO (e.g. AirPods Max). Extending no-buffer deadline; this also degrades playback quality system-wide while active.")
         }
@@ -536,6 +539,13 @@ public actor AudioEngine {
     /// pause/resume that may have lost client-side state.
     public var isMuted: Bool {
         muteFlag.isMuted
+    }
+
+    /// Snapshot of mic delivery for diagnostics + the CaptureSession-level
+    /// mic-health supervisor. (count, totalFrames) — both monotonically
+    /// increasing while the engine is alive and feeding the tap.
+    public var micFlowSnapshot: (count: Int, totalFrames: Int) {
+        bufferCounter?.snapshot ?? (0, 0)
     }
 
     /// Stop mic capture, remove tap, finish the stream.
@@ -838,6 +848,8 @@ public actor AudioEngine {
         let newEngine = AVAudioEngine()
         let newInputNode = newEngine.inputNode  // force AUHAL instantiation
 
+        applyVoiceProcessingIfNeeded(on: newInputNode, context: "recreate")
+
         var inputFormat = newInputNode.auAudioUnit.outputBusses[0].format
         var attempts = 0
         while (inputFormat.channelCount == 0 || inputFormat.sampleRate == 0) && attempts < 100 {
@@ -875,6 +887,21 @@ public actor AudioEngine {
         self.configChangeObserver = observer
         resetSupervisorBaseline()
         return true
+    }
+
+    private func applyVoiceProcessingIfNeeded(on inputNode: AVAudioInputNode, context: String) {
+        guard config.voiceProcessing else { return }
+        do {
+            try inputNode.setVoiceProcessingEnabled(true)
+            inputNode.isVoiceProcessingAGCEnabled = false
+            inputNode.voiceProcessingOtherAudioDuckingConfiguration = .init(
+                enableAdvancedDucking: false,
+                duckingLevel: .min
+            )
+            audioEngineLog.info("AudioEngine.\(context, privacy: .public): voice processing enabled with AGC off and minimum ducking.")
+        } catch {
+            audioEngineLog.error("AudioEngine.\(context, privacy: .public): voice processing unavailable — \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     // MARK: - Buffer-flow supervisor (private)

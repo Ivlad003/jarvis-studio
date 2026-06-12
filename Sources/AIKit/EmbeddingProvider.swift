@@ -114,8 +114,13 @@ public enum EmbeddingMath {
     public static func unpack(_ data: Data) -> [Float] {
         let count = data.count / MemoryLayout<Float>.size
         return data.withUnsafeBytes { raw -> [Float] in
-            let buf = raw.bindMemory(to: Float.self)
-            return Array(UnsafeBufferPointer(start: buf.baseAddress, count: count))
+            guard count > 0 else { return [] }
+            return (0..<count).map { index in
+                raw.loadUnaligned(
+                    fromByteOffset: index * MemoryLayout<Float>.size,
+                    as: Float.self
+                )
+            }
         }
     }
 }

@@ -132,6 +132,19 @@ struct SigV4CanonicalTests {
         #expect(cr.signedHeaders == "content-type;host;x-amz-date")
     }
 
+    @Test("Header values trim and compress sequential whitespace")
+    func headerWhitespaceCompression() {
+        let cr = SigV4.canonicalize(
+            method: "PUT",
+            path: "/key",
+            query: [],
+            headers: ["X-Test": "  alpha  beta\tgamma \n delta  "],
+            payloadHash: SigV4.emptyPayloadHash
+        )
+
+        #expect(cr.canonicalHeaders == "x-test:alpha beta gamma delta\n")
+    }
+
     @Test("Query params sorted alphabetically by encoded key")
     func querySorting() {
         let cr = SigV4.canonicalize(
@@ -177,6 +190,28 @@ struct S3ClientPresignTests {
         #expect(s.contains("X-Amz-Expires=3600"))
         #expect(s.contains("X-Amz-SignedHeaders=host"))
         #expect(s.contains("X-Amz-Signature="))
+    }
+
+    @Test("Object URL percent-encodes path with the same AWS rules used for signing")
+    func objectURLUsesAWSPathEncoding() {
+        let client = makeClient()
+        let url = client.objectURL(key: "folder/a+b(1);=.txt")
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+
+        #expect(components.percentEncodedPath == "/examplebucket/folder/a%2Bb%281%29%3B%3D.txt")
+    }
+
+    @Test("Presigned URL wire path is AWS-encoded for sub-delimiter keys")
+    func presignedURLUsesAWSPathEncoding() throws {
+        let client = makeClient()
+        let url = try client.presignedGetURL(
+            key: "folder/a+b(1);=.txt",
+            expirySeconds: 3600,
+            now: Date(timeIntervalSince1970: 1_440_938_160)
+        )
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+
+        #expect(components.percentEncodedPath == "/examplebucket/folder/a%2Bb%281%29%3B%3D.txt")
     }
 
     @Test("Expiry clamped to 7 days max")

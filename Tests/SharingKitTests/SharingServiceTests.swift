@@ -10,7 +10,14 @@ struct SharingServiceTests {
         private(set) var paths: [String] = []
 
         func handle(_ request: URLRequest, _ body: Data?) async throws -> (Data, URLResponse) {
+            Issue.record("SharingService should upload artifacts through fileHTTPClient, not load Data into memory")
+            let response = HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: [:])!
+            return (body ?? Data(), response)
+        }
+
+        func handleFile(_ request: URLRequest, _ fileURL: URL) async throws -> (Data, URLResponse) {
             paths.append(request.url?.path ?? "")
+            #expect(FileManager.default.fileExists(atPath: fileURL.path))
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: [:])!
             return (Data(), response)
         }
@@ -34,6 +41,9 @@ struct SharingServiceTests {
             credentials: .init(accessKeyId: "key", secretAccessKey: "secret"),
             httpClient: { request, body in
                 try await recorder.handle(request, body)
+            },
+            fileHTTPClient: { request, fileURL in
+                try await recorder.handleFile(request, fileURL)
             }
         )
         let service = SharingService(s3: client, keyPrefix: "kosmonotes/", presignTTLSeconds: 3600)

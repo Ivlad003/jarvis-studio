@@ -27,7 +27,7 @@ sign:
 
 install: build sign
 	rm -rf $(INSTALL_PATH)
-	cp -r $(APP_PATH) $(INSTALL_PATH)
+	ditto $(APP_PATH) $(INSTALL_PATH)
 	@echo "✅ Installed to $(INSTALL_PATH)"
 	@echo "   System permissions (mic, camera, screen) will persist across updates."
 

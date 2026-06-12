@@ -52,11 +52,18 @@ public actor RecoveryService {
     ///   - `<sid>/segments/` exists and contains at least one `.m4a` file, AND
     ///   - `<sid>/audio.m4a` does NOT exist.
     ///
+    /// `activeSessionIDs` lets callers reuse the scanner outside launch-time
+    /// recovery without racing a currently-recording session whose segments
+    /// directory is intentionally present before `audio.m4a` exists.
+    ///
     /// Segments are returned sorted by their numeric filename (`0.m4a`, `1.m4a`, ...).
     ///
     /// Pure filesystem traversal — `nonisolated` so callers don't pay actor-hop cost
     /// for what is effectively a stateless query.
-    public nonisolated func scanForOrphans(rootDir: URL) throws -> [OrphanSession] {
+    public nonisolated func scanForOrphans(
+        rootDir: URL,
+        activeSessionIDs: Set<String> = []
+    ) throws -> [OrphanSession] {
         let fm = FileManager.default
         guard fm.fileExists(atPath: rootDir.path) else { return [] }
 
@@ -75,6 +82,8 @@ public actor RecoveryService {
         for entry in entries {
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: entry.path, isDirectory: &isDir), isDir.boolValue else { continue }
+            let sessionID = entry.lastPathComponent
+            guard !activeSessionIDs.contains(sessionID) else { continue }
 
             let audioFile = entry.appendingPathComponent("audio.m4a")
             if fm.fileExists(atPath: audioFile.path) { continue }
@@ -98,7 +107,7 @@ public actor RecoveryService {
             guard !m4aSegments.isEmpty else { continue }
 
             orphans.append(OrphanSession(
-                id: entry.lastPathComponent,
+                id: sessionID,
                 sessionDir: entry,
                 segmentURLs: m4aSegments
             ))
@@ -155,6 +164,7 @@ public actor RecoveryService {
             guard duration.isValid, duration > .zero else { continue }
 
             let timeRange = CMTimeRange(start: .zero, duration: duration)
+            var insertedSegmentTrack = false
 
             for (trackIdx, sourceTrack) in audioTracks.enumerated() {
                 let compositionTrack = trackForIndex(trackIdx, in: composition)
@@ -164,6 +174,7 @@ public actor RecoveryService {
                 do {
                     try compositionTrack.insertTimeRange(timeRange, of: sourceTrack, at: insertTime)
                     insertedAnything = true
+                    insertedSegmentTrack = true
                 } catch {
                     // Per-track insert failure shouldn't tank the whole recovery —
                     // the user still gets the audio they can salvage.
@@ -171,7 +182,9 @@ public actor RecoveryService {
                 }
             }
 
-            insertTime = CMTimeAdd(insertTime, duration)
+            if insertedSegmentTrack {
+                insertTime = CMTimeAdd(insertTime, duration)
+            }
         }
 
         guard insertedAnything else {
@@ -203,15 +216,16 @@ public actor RecoveryService {
     /// Run an `AVAssetExportSession` to completion via the legacy callback API,
     /// wrapped in a Swift continuation.
     private nonisolated func runExport(_ exporter: AVAssetExportSession, outputURL: URL) async throws -> URL {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
-            exporter.exportAsynchronously {
-                switch exporter.status {
+        let box = AVAssetExportSessionBox(exporter: exporter, outputURL: outputURL)
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
+            box.exporter.exportAsynchronously {
+                switch box.exporter.status {
                 case .completed:
-                    cont.resume(returning: outputURL)
+                    cont.resume(returning: box.outputURL)
                 default:
                     cont.resume(throwing: RecoveryError.exportFailed(
-                        status: exporter.status.rawValue,
-                        underlying: exporter.error?.localizedDescription
+                        status: box.exporter.status.rawValue,
+                        underlying: box.exporter.error?.localizedDescription
                     ))
                 }
             }
@@ -235,5 +249,15 @@ public actor RecoveryService {
             )
         }
         return lastAdded
+    }
+}
+
+private final class AVAssetExportSessionBox: @unchecked Sendable {
+    let exporter: AVAssetExportSession
+    let outputURL: URL
+
+    init(exporter: AVAssetExportSession, outputURL: URL) {
+        self.exporter = exporter
+        self.outputURL = outputURL
     }
 }

@@ -38,9 +38,14 @@ final class AtomicCounter: @unchecked Sendable {
 // MARK: - Helpers
 
 /// A minimal Deepgram Results JSON frame.
-private func resultsJSON(text: String, isFinal: Bool = true) -> String {
+private func resultsJSON(
+    text: String,
+    start: Double = 0,
+    duration: Double = 1.0,
+    isFinal: Bool = true
+) -> String {
     """
-    {"type":"Results","start":0,"duration":1.0,"is_final":\(isFinal ? "true" : "false"),"channel":{"alternatives":[{"transcript":"\(text)","confidence":0.9}]}}
+    {"type":"Results","start":\(start),"duration":\(duration),"is_final":\(isFinal ? "true" : "false"),"channel":{"alternatives":[{"transcript":"\(text)","confidence":0.9}]}}
     """
 }
 
@@ -83,7 +88,7 @@ struct ReconnectDisconnectTests {
 
         // First transport yields one segment, then fails.
         transport1.enqueueText(resultsJSON(text: "from first"))
-        let seg1 = await iterator.next()
+        let seg1 = try await iterator.next()
         #expect(seg1?.text == "from first")
 
         // Inject an error to simulate mid-session disconnect.
@@ -94,7 +99,7 @@ struct ReconnectDisconnectTests {
         try await Task.sleep(nanoseconds: 10_000_000)  // 10 ms
         transport2.enqueueText(resultsJSON(text: "from second"))
 
-        let seg2 = await iterator.next()
+        let seg2 = try await iterator.next()
         #expect(seg2?.text == "from second")
 
         await session.cancel()
@@ -144,6 +149,36 @@ struct RingBufferReplayTests {
 
         await session.cancel()
     }
+
+    @Test("Failed live sends are retained for reconnect replay")
+    func failedLiveSendIsRetainedForReconnectReplay() async throws {
+        let transport1 = MockWebSocketTransport()
+        let transport2 = MockWebSocketTransport()
+        let counter = AtomicCounter()
+        let clock = MockClock()
+
+        let session = await makeSession(
+            factory: {
+                let n = counter.increment()
+                return n == 1 ? transport1 : transport2
+            },
+            clock: clock
+        )
+
+        let outageChunk = Data([0x44])
+        transport1.injectSendError(TranscriptionError.sendFailed(message: "network write failed"))
+
+        try await session.send(outageChunk)
+        #expect(!transport1.recordedSends.contains(.data(outageChunk)))
+
+        transport1.injectReceiveError(TranscriptionError.receiveFailed(message: "disconnect after failed send"))
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let sends2 = transport2.recordedSends
+        #expect(sends2.contains(.data(outageChunk)))
+
+        await session.cancel()
+    }
 }
 
 @Suite("ReconnectingSession — max retries", .serialized)
@@ -170,11 +205,17 @@ struct MaxRetriesTests {
             var iterator = session.events.makeAsyncIterator()
             // The stream must terminate — keep calling next() until nil.
             var count = 0
-            while await iterator.next() != nil {
-                count += 1
-                if count > 100 { break }  // safety valve
+            do {
+                while try await iterator.next() != nil {
+                    count += 1
+                    if count > 100 { break }  // safety valve
+                }
+                return false
+            } catch TranscriptionError.receiveFailed(let message) where message == "max retries exceeded" {
+                return true
+            } catch {
+                return false
             }
-            return true  // reached nil == stream finished
         }
 
         let timeoutTask = Task {
@@ -186,6 +227,40 @@ struct MaxRetriesTests {
         let finished = await finishedTask.value
         timeoutTask.cancel()
         #expect(finished == true)
+    }
+
+    /// A successful receive after reconnect resets the consecutive-failure
+    /// budget. Long sessions with isolated network drops should not die after
+    /// five total drops spread across otherwise healthy transports.
+    @Test("Successful reconnect receive resets the max-retry budget")
+    func successfulReceiveResetsMaxRetryBudget() async throws {
+        let clock = MockClock()
+        let transports = (0..<7).map { _ in MockWebSocketTransport() }
+        let counter = AtomicCounter()
+        let session = await makeSession(
+            factory: {
+                let index = min(counter.increment() - 1, transports.count - 1)
+                return transports[index]
+            },
+            clock: clock
+        )
+
+        var iterator = session.events.makeAsyncIterator()
+
+        for i in 0..<6 {
+            transports[i].enqueueText(resultsJSON(text: "healthy-\(i)"))
+            let segment = try await iterator.next()
+            #expect(segment?.text == "healthy-\(i)")
+
+            transports[i].injectReceiveError(TranscriptionError.receiveFailed(message: "isolated drop \(i)"))
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        transports[6].enqueueText(resultsJSON(text: "still connected"))
+        let segmentAfterSixthIsolatedDrop = try await iterator.next()
+        #expect(segmentAfterSixthIsolatedDrop?.text == "still connected")
+
+        await session.cancel()
     }
 }
 
@@ -209,9 +284,16 @@ struct BackoffScheduleTests {
         let drainTask = Task {
             var iterator = session.events.makeAsyncIterator()
             var count = 0
-            while await iterator.next() != nil {
-                count += 1
-                if count > 100 { break }
+            do {
+                while try await iterator.next() != nil {
+                    count += 1
+                    if count > 100 { break }
+                }
+            } catch TranscriptionError.receiveFailed(let message) where message == "max retries exceeded" {
+                return
+            } catch {
+                Issue.record("Unexpected stream error: \(error)")
+                return
             }
         }
 
@@ -303,6 +385,49 @@ struct RingBufferAgingTests {
         // The stale chunk should NOT appear in transport2's sends.
         let sends2 = transport2.recordedSends
         #expect(!sends2.contains(.data(staleChunk)))
+
+        await session.cancel()
+    }
+}
+
+@Suite("ReconnectingSession — timestamp offsets", .serialized)
+struct ReconnectTimestampOffsetTests {
+    @Test("Reconnect offsets provider-local timestamps onto the original session timeline")
+    func reconnectOffsetsProviderLocalTimestamps() async throws {
+        let transport1 = MockWebSocketTransport()
+        let transport2 = MockWebSocketTransport()
+        let counter = AtomicCounter()
+        let clock = MockClock()
+
+        let session = ReconnectingSession(
+            transportFactory: {
+                let n = counter.increment()
+                return n == 1 ? transport1 : transport2
+            },
+            parserFactory: { offset in
+                DeepgramEventParser.makeParser(timestampOffset: offset)
+            },
+            clock: clock,
+            audioBytesPerSecond: 1
+        )
+        await session.start()
+
+        await session.injectStaleRingBufferEntry(
+            data: Data(repeating: 0x01, count: 10),
+            age: 10.0,
+            duration: 10.0
+        )
+        try await session.send(Data(repeating: 0x02, count: 5))
+
+        var iterator = session.events.makeAsyncIterator()
+        transport1.injectReceiveError(TranscriptionError.receiveFailed(message: "disconnect"))
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        transport2.enqueueText(resultsJSON(text: "after reconnect", start: 0, duration: 1.0))
+        let segment = try await iterator.next()
+        #expect(segment?.text == "after reconnect")
+        #expect(segment?.start == 10.0)
+        #expect(segment?.end == 11.0)
 
         await session.cancel()
     }

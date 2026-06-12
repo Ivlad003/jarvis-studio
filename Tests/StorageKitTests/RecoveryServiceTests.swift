@@ -181,6 +181,24 @@ struct RecoveryServiceTests {
         #expect(orphans.first { $0.id == "session-a" }?.segmentURLs.count == 2)
     }
 
+    @Test("scanForOrphans skips caller-declared active sessions")
+    func scanSkipsActiveSessionIDs() throws {
+        let root = try makeRecordingsRoot()
+        defer { cleanup(root) }
+
+        for sid in ["active", "interrupted"] {
+            let segmentsDir = root
+                .appendingPathComponent(sid)
+                .appendingPathComponent("segments")
+            try FileManager.default.createDirectory(at: segmentsDir, withIntermediateDirectories: true)
+            try Data([0]).write(to: segmentsDir.appendingPathComponent("0.m4a"))
+        }
+
+        let svc = RecoveryService()
+        let orphans = try svc.scanForOrphans(rootDir: root, activeSessionIDs: ["active"])
+        #expect(orphans.map(\.id) == ["interrupted"])
+    }
+
     @Test("scanForOrphans sorts segment URLs numerically (10.m4a after 9.m4a)")
     func scanSortsSegmentsNumerically() async throws {
         let root = try makeRecordingsRoot()

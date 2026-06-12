@@ -89,29 +89,25 @@ public struct SharingService: Sendable {
 
         if selected.contains(.audio), FileManager.default.fileExists(atPath: audioFile.path) {
             let key = "\(keyPrefix)\(sessionId)/audio.m4a"
-            let data = try Data(contentsOf: audioFile)
-            try await s3.putObject(key: key, data: data, contentType: "audio/mp4", now: now)
+            try await s3.putObject(key: key, fileURL: audioFile, contentType: "audio/mp4", now: now)
             audioURL = try s3.presignedGetURL(key: key, expirySeconds: presignTTLSeconds, now: now)
         }
 
         if selected.contains(.video), FileManager.default.fileExists(atPath: videoFile.path) {
             let key = "\(keyPrefix)\(sessionId)/screen.mp4"
-            let data = try Data(contentsOf: videoFile)
-            try await s3.putObject(key: key, data: data, contentType: "video/mp4", now: now)
+            try await s3.putObject(key: key, fileURL: videoFile, contentType: "video/mp4", now: now)
             videoURL = try s3.presignedGetURL(key: key, expirySeconds: presignTTLSeconds, now: now)
         }
 
         if selected.contains(.summary), FileManager.default.fileExists(atPath: summaryFile.path) {
             let key = "\(keyPrefix)\(sessionId)/summary.md"
-            let data = try Data(contentsOf: summaryFile)
-            try await s3.putObject(key: key, data: data, contentType: "text/markdown; charset=utf-8", now: now)
+            try await s3.putObject(key: key, fileURL: summaryFile, contentType: "text/markdown; charset=utf-8", now: now)
             summaryURL = try s3.presignedGetURL(key: key, expirySeconds: presignTTLSeconds, now: now)
         }
 
         if selected.contains(.transcript), FileManager.default.fileExists(atPath: transcriptFile.path) {
             let key = "\(keyPrefix)\(sessionId)/transcript.txt"
-            let data = try Data(contentsOf: transcriptFile)
-            try await s3.putObject(key: key, data: data, contentType: "text/plain; charset=utf-8", now: now)
+            try await s3.putObject(key: key, fileURL: transcriptFile, contentType: "text/plain; charset=utf-8", now: now)
             transcriptURL = try s3.presignedGetURL(key: key, expirySeconds: presignTTLSeconds, now: now)
         }
 

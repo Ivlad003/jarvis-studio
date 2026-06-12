@@ -30,7 +30,15 @@ final class LibraryWindowController {
             return
         }
 
-        let libraryState = LibraryState(database: database, sessionStore: sessionStore, settings: settings)
+        let libraryState = LibraryState(
+            database: database,
+            sessionStore: sessionStore,
+            settings: settings,
+            canClearAllSessions: { [weak self] in
+                guard let delegate = self?.window?.delegate as? AppDelegate else { return true }
+                return delegate.canClearLibrarySessions
+            }
+        )
         let view = LibraryView(state: libraryState)
         let hosting = NSHostingController(rootView: view)
 

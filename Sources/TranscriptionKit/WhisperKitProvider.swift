@@ -38,6 +38,7 @@ public actor WhisperKitProvider: BatchTranscriptionProvider {
     /// `unload()`. Stored as `Any?` because `WhisperKit` itself is not
     /// `Sendable`-conforming and an actor can hold non-Sendable mutable state.
     private var engine: WhisperKit?
+    private var loadTask: Task<WhisperKit, Error>?
 
     public init(modelVariant: String, modelsRootDir: URL) {
         self.modelVariant = modelVariant
@@ -46,6 +47,8 @@ public actor WhisperKitProvider: BatchTranscriptionProvider {
 
     /// Drop the loaded engine to reclaim memory. Next transcribe reloads.
     public func unload() {
+        loadTask?.cancel()
+        loadTask = nil
         engine = nil
     }
 
@@ -153,7 +156,28 @@ public actor WhisperKitProvider: BatchTranscriptionProvider {
 
     private func ensureLoaded() async throws -> WhisperKit {
         if let engine { return engine }
+        if let loadTask {
+            return try await loadTask.value
+        }
 
+        let modelVariant = self.modelVariant
+        let modelsRootDir = self.modelsRootDir
+        let task = Task<WhisperKit, Error> {
+            try await Self.loadEngine(modelVariant: modelVariant, modelsRootDir: modelsRootDir)
+        }
+        loadTask = task
+        do {
+            let kit = try await task.value
+            engine = kit
+            loadTask = nil
+            return kit
+        } catch {
+            loadTask = nil
+            throw error
+        }
+    }
+
+    private static func loadEngine(modelVariant: String, modelsRootDir: URL) async throws -> WhisperKit {
         // The model folder produced by `WhisperKit.download` is
         // `<downloadBase>/argmaxinc/whisperkit-coreml/<variant>` (HuggingFace
         // snapshot layout). We let the user pass the **outer** root and resolve
@@ -178,11 +202,10 @@ public actor WhisperKitProvider: BatchTranscriptionProvider {
             download: false
         )
 
-        whisperKitLog.info("WhisperKitProvider.load: variant=\(self.modelVariant, privacy: .public) folder=\(chosen.path, privacy: .public)")
+        whisperKitLog.info("WhisperKitProvider.load: variant=\(modelVariant, privacy: .public) folder=\(chosen.path, privacy: .public)")
         let started = Date()
         do {
             let kit = try await WhisperKit(cfg)
-            engine = kit
             let elapsed = Date().timeIntervalSince(started)
             whisperKitLog.info("WhisperKitProvider.load: ready in \(String(format: "%.2f", elapsed), privacy: .public)s")
             return kit

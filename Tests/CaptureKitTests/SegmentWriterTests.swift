@@ -98,6 +98,31 @@ struct SegmentWriterTests {
         #expect(paths.isEmpty)
     }
 
+    @Test("append after close does not reopen a segment")
+    func appendAfterCloseIsIgnored() async throws {
+        let sessionDir = try makeTempDir()
+        defer { cleanup(sessionDir) }
+
+        let writer = try SegmentWriter(sessionDir: sessionDir, segmentDurationSeconds: 5.0, sampleRate: 48_000)
+        guard let buffer = AVAudioPCMBuffer.sineWave(frameCount: 4800) else {
+            Issue.record("Failed to build test audio buffer")
+            return
+        }
+
+        try await writer.append(buffer, source: .mic)
+        let paths = try await writer.close()
+        #expect(paths.count == 1)
+
+        try await writer.append(buffer, source: .mic)
+        let pathsAfterLateAppend = try await writer.close()
+        #expect(pathsAfterLateAppend == paths)
+
+        let segDir = sessionDir.appendingPathComponent("segments")
+        let m4aFiles = try FileManager.default.contentsOfDirectory(atPath: segDir.path)
+            .filter { $0.hasSuffix(".m4a") }
+        #expect(m4aFiles.count == paths.count)
+    }
+
     @Test("Segments directory contains expected number of .m4a files")
     func segmentsDirContainsM4AFiles() async throws {
         let sessionDir = try makeTempDir()

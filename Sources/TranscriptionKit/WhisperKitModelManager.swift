@@ -18,6 +18,8 @@ private let mgrLog = Logger(subsystem: "dev.kosmonotes.studio", category: "Whisp
 /// the root to a stable folder so model state survives app relaunch and the
 /// Settings UI can show "downloaded ✓" badges.
 public actor WhisperKitModelManager {
+    public static let downloadInProgressMarkerName = ".download-in-progress"
+    public static let downloadCompleteMarkerName = ".download-complete"
 
     /// Root folder under which all WhisperKit models live. The default points
     /// at `~/Library/Application Support/KosmoNotes/whisperkit/`. Subfolders
@@ -83,7 +85,23 @@ public actor WhisperKitModelManager {
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else {
             return false
         }
-        return entries.contains { $0.hasSuffix(".mlmodelc") }
+        let hasCompiledModel = entries.contains { $0.hasSuffix(".mlmodelc") }
+        guard hasCompiledModel else { return false }
+
+        let inProgress = folder.appendingPathComponent(Self.downloadInProgressMarkerName)
+        if FileManager.default.fileExists(atPath: inProgress.path) {
+            return false
+        }
+
+        let complete = folder.appendingPathComponent(Self.downloadCompleteMarkerName)
+        if FileManager.default.fileExists(atPath: complete.path) {
+            return true
+        }
+
+        // Backward compatibility for models downloaded before completion
+        // markers existed. New interrupted downloads keep the in-progress marker
+        // and are therefore not mistaken for usable models.
+        return true
     }
 
     /// On-disk size in bytes of the variant's folder. 0 when not downloaded.
@@ -105,7 +123,7 @@ public actor WhisperKitModelManager {
             .filter { url in
                 var isDir: ObjCBool = false
                 FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-                return isDir.boolValue
+                return isDir.boolValue && modelFolderLooksDownloaded(url)
             }
             .map(\.lastPathComponent)
             .sorted()
@@ -127,6 +145,12 @@ public actor WhisperKitModelManager {
         }
         mgrLog.info("WhisperKitModelManager.download: starting \(variant, privacy: .public) → \(self.rootDir.path, privacy: .public)")
         let started = Date()
+        let folder = variantFolder(variant)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let inProgressMarker = folder.appendingPathComponent(Self.downloadInProgressMarkerName)
+        let completeMarker = folder.appendingPathComponent(Self.downloadCompleteMarkerName)
+        try? FileManager.default.removeItem(at: completeMarker)
+        try Data().write(to: inProgressMarker)
         do {
             _ = try await WhisperKit.download(
                 variant: variant,
@@ -138,6 +162,8 @@ public actor WhisperKitModelManager {
                 }
             )
             let elapsed = Date().timeIntervalSince(started)
+            try? FileManager.default.removeItem(at: inProgressMarker)
+            try Data().write(to: completeMarker)
             mgrLog.info("WhisperKitModelManager.download: \(variant, privacy: .public) done in \(String(format: "%.1f", elapsed), privacy: .public)s")
             onProgress?(1.0)
         } catch {
@@ -179,5 +205,15 @@ public actor WhisperKitModelManager {
             }
         }
         return total
+    }
+
+    private nonisolated func modelFolderLooksDownloaded(_ folder: URL) -> Bool {
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else {
+            return false
+        }
+        guard entries.contains(where: { $0.hasSuffix(".mlmodelc") }) else { return false }
+        return !FileManager.default.fileExists(
+            atPath: folder.appendingPathComponent(Self.downloadInProgressMarkerName).path
+        )
     }
 }

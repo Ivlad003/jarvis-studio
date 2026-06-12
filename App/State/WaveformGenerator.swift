@@ -89,9 +89,11 @@ public actor WaveformGenerator {
         let duration = try await asset.load(.duration)
         let formatDescriptions = try await track.load(.formatDescriptions)
         var sampleRate: Double = 48_000  // sane default
+        var channelCount: Int = 1
         if let firstFormat = formatDescriptions.first,
            let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(firstFormat)?.pointee {
             sampleRate = asbd.mSampleRate
+            channelCount = max(1, Int(asbd.mChannelsPerFrame))
         }
         let totalSamples = max(1, Int(CMTimeGetSeconds(duration) * sampleRate))
         let samplesPerBucket = max(1, totalSamples / bucketCount)
@@ -117,8 +119,14 @@ public actor WaveformGenerator {
 
             let count = totalLength / MemoryLayout<Float>.size
             raw.withMemoryRebound(to: Float.self, capacity: count) { fp in
-                for i in 0..<count {
-                    let v = abs(fp[i])
+                let frameCount = count / channelCount
+                for frameIndex in 0..<frameCount {
+                    var frameSum: Float = 0
+                    let base = frameIndex * channelCount
+                    for channelIndex in 0..<channelCount {
+                        frameSum += abs(fp[base + channelIndex])
+                    }
+                    let v = frameSum / Float(channelCount)
                     bucketSum += v
                     bucketCountSamples += 1
                     if bucketCountSamples >= samplesPerBucket && bucketIndex < bucketCount {
@@ -146,6 +154,20 @@ public actor WaveformGenerator {
             for i in 0..<buckets.count { buckets[i] /= maxValue }
         }
         return buckets
+    }
+
+    nonisolated static func averageInterleavedFrameAmplitudes(_ samples: [Float], channelCount: Int) -> [Float] {
+        let channels = max(1, channelCount)
+        let frameCount = samples.count / channels
+        guard frameCount > 0 else { return [] }
+        return (0..<frameCount).map { frameIndex in
+            let base = frameIndex * channels
+            var sum: Float = 0
+            for channelIndex in 0..<channels {
+                sum += abs(samples[base + channelIndex])
+            }
+            return sum / Float(channels)
+        }
     }
 
     // MARK: - PNG renderer

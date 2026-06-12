@@ -95,6 +95,10 @@ private struct TranscriptionTab: View {
 
             Section("System audio source") {
                 SystemAudioSourcePicker(settings: settings)
+                Toggle("Echo cancellation (recommended with speakers)", isOn: $settings.echoCancellationEnabled)
+                Text("Removes meeting audio picked up by the microphone when playing through speakers. Uses Apple voice processing; slight mic-tone change is normal. Turn off for high-fidelity ambient recording.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Webcam bubble (Loom-style)") {
@@ -1342,6 +1346,8 @@ private struct ScreenDisplayPicker: View {
 ///
 /// Picking a virtual loopback device (BlackHole 2ch / Loopback) lets the user
 /// route system audio through a software cable that the mic doesn't hear.
+/// Echo cancellation is the first-line fix; loopback devices remain useful
+/// when users deliberately disable voice processing.
 /// Setup: install BlackHole (`brew install blackhole-2ch`), in Audio MIDI Setup
 /// create a Multi-Output Device (BlackHole + headphones), set system output
 /// to it, then pick BlackHole here. Echo gone.
@@ -1389,8 +1395,8 @@ private struct SystemAudioSourcePicker: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Default route is ScreenCaptureKit's whole-system mixdown — captures whatever your speakers play. Without headphones, the mic picks up that audio too, doubling voices in the recording.")
-                Text("Pick a virtual loopback device (BlackHole 2ch, Loopback) to route system audio through a software cable the mic doesn't hear. Setup:")
+                Text("Default route is ScreenCaptureKit's whole-system mixdown — captures whatever your speakers play. Echo cancellation is the first-line fix for speaker playback; without it or headphones, the mic picks up that audio too, doubling voices in the recording.")
+                Text("If you turn Echo cancellation off, pick a virtual loopback device (BlackHole 2ch, Loopback) to route system audio through a software cable the mic doesn't hear. Setup:")
                 Text("1. brew install blackhole-2ch")
                     .font(.system(.caption2, design: .monospaced))
                 Text("2. Audio MIDI Setup → Create Multi-Output Device with BlackHole + your real output (speakers/headphones)")

@@ -29,6 +29,12 @@ public actor SCKitAudioCapture: NSObject {
     private var stream: SCStream?
     private var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
     private var streamOutput: AudioStreamOutput?
+    private var streamDelegate: SCStreamStopDelegate?
+    private let sampleQueue = DispatchQueue(
+        label: "dev.kosmonotes.studio.sckit-audio-samples",
+        qos: .userInitiated
+    )
+    public private(set) var streamStopError: SCStreamStopFailure?
 
     // MARK: Init
 
@@ -40,6 +46,11 @@ public actor SCKitAudioCapture: NSObject {
     ///
     /// - Throws: `SCStreamError` if the stream cannot be started (e.g. TCC denied).
     public func start() async throws -> sending AsyncStream<AVAudioPCMBuffer> {
+        if stream != nil || continuation != nil {
+            await stop()
+        }
+        streamStopError = nil
+
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
             onScreenWindowsOnly: true
@@ -56,15 +67,30 @@ public actor SCKitAudioCapture: NSObject {
         }
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
 
-        let (asyncStream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (asyncStream, cont) = AudioPCMBufferStream.makeStream()
         self.continuation = cont
 
         let output = AudioStreamOutput(continuation: cont)
         self.streamOutput = output
 
-        let scStream = SCStream(filter: filter, configuration: config, delegate: nil)
-        try scStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: .global(qos: .userInitiated))
-        try await scStream.startCapture()
+        let stopDelegate = SCStreamStopDelegate { [weak self] failure in
+            Task {
+                await self?.recordExternalStreamStop(failure)
+            }
+        }
+        self.streamDelegate = stopDelegate
+
+        let scStream = SCStream(filter: filter, configuration: config, delegate: stopDelegate)
+        try scStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: sampleQueue)
+        do {
+            try await scStream.startCapture()
+        } catch {
+            continuation?.finish()
+            continuation = nil
+            streamOutput = nil
+            streamDelegate = nil
+            throw error
+        }
         self.stream = scStream
 
         return asyncStream
@@ -79,6 +105,16 @@ public actor SCKitAudioCapture: NSObject {
         continuation?.finish()
         continuation = nil
         streamOutput = nil
+        streamDelegate = nil
+    }
+
+    func recordExternalStreamStop(_ failure: SCStreamStopFailure) {
+        streamStopError = failure
+        stream = nil
+        continuation?.finish()
+        continuation = nil
+        streamOutput = nil
+        streamDelegate = nil
     }
 }
 
@@ -128,7 +164,9 @@ final class AudioBufferListStorage {
 
 extension CMSampleBuffer {
     /// Convert an audio `CMSampleBuffer` (as delivered by SCStream) to `AVAudioPCMBuffer`.
-    fileprivate func toAVAudioPCMBuffer() -> AVAudioPCMBuffer? {
+    /// Internal to CaptureKit: used by both `SCKitAudioCapture` (system audio) and
+    /// `ScreenRecorder` (SCStream microphone on macOS 15+).
+    func toAVAudioPCMBuffer() -> AVAudioPCMBuffer? {
         guard let formatDesc = CMSampleBufferGetFormatDescription(self) else { return nil }
         guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return nil }
         guard let avFormat = AVAudioFormat(streamDescription: asbd) else { return nil }

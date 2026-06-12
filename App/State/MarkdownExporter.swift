@@ -20,6 +20,8 @@ private let exporterLog = Logger(subsystem: "dev.kosmonotes.studio", category: "
 @MainActor
 enum MarkdownExporter {
 
+    static let maximumOutputTokens = 16_384
+
     /// Run the export. Returns the URL of the written `.md` on success,
     /// nil on any failure (disabled, missing prompt placeholder, missing
     /// API key, LLM failure, write failure).
@@ -70,7 +72,7 @@ enum MarkdownExporter {
 
         let inputTokens = CostEstimator.estimateTokens(text: systemPrompt)
             + CostEstimator.estimateTokens(text: userMessage)
-        let outputCap = max(2048, Int(Double(inputTokens) * 1.5))
+        let outputCap = outputTokenCap(forInputTokens: inputTokens)
         let estCost = CostEstimator.estimate(
             inputTokens: inputTokens,
             outputTokens: outputCap,
@@ -125,6 +127,10 @@ enum MarkdownExporter {
     }
 
     // MARK: - Private helpers
+
+    static func outputTokenCap(forInputTokens inputTokens: Int) -> Int {
+        min(maximumOutputTokens, max(2_048, Int(Double(inputTokens) * 1.5)))
+    }
 
     /// Resolve `settings.markdownExportFolder` to an absolute file URL.
     /// Empty → fall back to `~/Documents/KosmoNotes`. `~` is expanded.

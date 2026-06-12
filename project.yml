@@ -95,28 +95,34 @@ targets:
       - package: KosmoNotesCore
         product: SharingKit
     preBuildScripts:
-      # Stamp CFBundleVersion with a YYYYMMDD.HHMM timestamp every build so
-      # `KosmoNotes 0.0.2 (20260503.2154)` in the menu changes on every
-      # rebuild. We MUST do this as a preBuildScript (not post-) because
-      # on Xcode 26 / Swift 6 the `ProcessInfoPlistFile` phase runs AFTER
-      # any "Run Script" phase appended to the target's build phases,
+      # Stamp CFBundleVersion with a YYYYMMDD.HHMM timestamp so the
+      # `KosmoNotes 0.0.2 (20260503.2154)` line in the menu changes on every
+      # release rebuild. We MUST do this as a preBuildScript (not post-)
+      # because on Xcode 26 / Swift 6 the `ProcessInfoPlistFile` phase runs
+      # AFTER any "Run Script" phase appended to the target's build phases,
       # which means a postBuildScript that touches the bundled Info.plist
       # gets overwritten by the source App/Info.plist a moment later.
       # Stamping the source first lets ProcessInfoPlistFile pick it up.
       #
-      # Side effect: App/Info.plist appears modified in `git status` after
-      # every build. That's expected; commit the bumped value alongside
-      # any release tag, otherwise let the dirty diff sit.
+      # The stamp now ONLY runs for Release builds. Debug builds (the
+      # day-to-day local workflow) no longer dirty the working tree —
+      # the previous unconditional stamp put a noise diff in every
+      # `git status` after every test/rebuild, which masked meaningful
+      # release-metadata changes during review.
       #
       # `basedOnDependencyAnalysis: false` forces the phase to run every
       # build regardless of input/output up-to-date checks.
-      - name: "Stamp build number with timestamp"
+      - name: "Stamp build number with timestamp (Release only)"
         basedOnDependencyAnalysis: false
         script: |
           set -e
-          STAMP=$(date +%Y%m%d.%H%M)
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${STAMP}" "${PROJECT_DIR}/App/Info.plist"
-          echo "Stamped App/Info.plist CFBundleVersion = ${STAMP}"
+          if [ "${CONFIGURATION}" = "Release" ]; then
+            STAMP=$(date +%Y%m%d.%H%M)
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${STAMP}" "${PROJECT_DIR}/App/Info.plist"
+            echo "Stamped App/Info.plist CFBundleVersion = ${STAMP}"
+          else
+            echo "Skipped CFBundleVersion stamp (CONFIGURATION=${CONFIGURATION:-unset}); release-only stamp keeps debug builds clean."
+          fi
     scheme:
       testTargets:
         - KosmoNotesTests
@@ -163,25 +169,4 @@ targets:
     scheme:
       testTargets:
         - KosmoNotesUITests
-      gatherCoverageData: false
-
-  KosmoNotesTests:
-    type: bundle.unit-test
-    platform: macOS
-    deploymentTarget: "14.0"
-    sources:
-      - AppTests
-    dependencies:
-      - target: KosmoNotes
-      - package: KosmoNotesCore
-        product: TranscriptionKit
-    settings:
-      base:
-        SWIFT_VERSION: "5.10"
-        MACOSX_DEPLOYMENT_TARGET: "14.0"
-        GENERATE_INFOPLIST_FILE: "YES"
-        PRODUCT_BUNDLE_IDENTIFIER: dev.kosmonotes.studio.tests
-    scheme:
-      testTargets:
-        - KosmoNotesTests
       gatherCoverageData: false

@@ -93,7 +93,7 @@ public actor DeviceAudioCapture {
             throw DeviceCaptureError.setDeviceFailed(status: setStatus)
         }
 
-        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (stream, continuation) = AudioPCMBufferStream.makeStream()
         self.continuation = continuation
 
         engine.prepare()

@@ -100,7 +100,8 @@ public actor RecorderLiveTee: LivePCMSink {
         recorderLiveTeeLog.info("RecorderLiveTee.start: cadence=\(self.cadence, privacy: .public)s file=\(self.audioFileURL.lastPathComponent, privacy: .public)")
     }
 
-    public func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64) async {
+    public func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64, source: LivePCMSource) async {
+        guard source == .mic else { return }
         if audioFile == nil {
             do {
                 audioFile = try AVAudioFile(forWriting: audioFileURL, settings: buffer.format.settings)

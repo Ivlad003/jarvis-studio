@@ -113,7 +113,7 @@ private struct SidebarView: View {
                 Spacer()
             } else {
                 List(state.sessions, id: \.id, selection: $state.selectedSessionId) { session in
-                    SessionRowView(session: session)
+                    SessionRowView(session: session, sessionStore: state.sessionStore)
                 }
                 .listStyle(.sidebar)
             }
@@ -128,8 +128,14 @@ private struct SidebarView: View {
 private struct SessionRowView: View {
 
     let session: SessionRecord
+    let sessionStore: SessionStore
     @State private var hasScreenRecording: Bool = false
     @State private var thumbImage: NSImage?
+    /// Non-nil when `capture-warning.txt` was written to the session dir —
+    /// i.e. tier-2 fallback demoted screen recording mid-session. Drives a
+    /// capture-specific help string distinct from the post-process "partial
+    /// enhancement" message.
+    @State private var captureWarning: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -144,14 +150,16 @@ private struct SessionRowView: View {
                         .help("Screen recording available")
                 }
                 if session.enhancementStatus == .partial {
-                    // Audit §4.2: silent partial failures (cleanup didn't change
-                    // the transcript, summary returned nil while transcript was
-                    // non-empty, etc.) used to be invisible. The orange dot
-                    // makes degraded sessions findable in the list.
+                    // Silent partial failures used to be invisible. The orange
+                    // dot makes degraded sessions findable in the list. Two
+                    // flavours of partial:
+                    //   - capture-side (tier-2 demotion → screen.mp4 truncated)
+                    //   - enhancement-side (cleanup/summary/export skipped)
+                    // The help text reflects whichever signal is present.
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.caption2)
                         .foregroundStyle(.orange)
-                        .help("Some optional enhancements didn't complete (cleanup, summary, or export). The recording and transcript are intact.")
+                        .help(captureWarning ?? "Some optional enhancements didn't complete (cleanup, summary, or export). The recording and transcript are intact.")
                 }
             }
             // Waveform thumbnail (cached PNG; placeholder while loading).
@@ -184,15 +192,25 @@ private struct SessionRowView: View {
         }
         .padding(.vertical, 2)
         .task(id: session.id) {
-            // Check for screen.mp4 sidecar using the standard recordings path.
-            let root = FileManager.default
-                .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-                .first?
-                .appendingPathComponent("KosmoNotes/recordings")
-                .appendingPathComponent(session.id)
-            let screenURL = root?.appendingPathComponent("screen.mp4")
-            if let url = screenURL {
-                hasScreenRecording = FileManager.default.fileExists(atPath: url.path)
+            let root = await sessionStore.sessionDir(for: session.id)
+            let screenURL = root.appendingPathComponent("screen.mp4")
+            hasScreenRecording = FileManager.default.fileExists(atPath: screenURL.path)
+            // Read the capture-warning sidecar so the
+            // partial badge can show the right copy when tier-2 fallback
+            // demoted screen recording.
+            let captureURL = root.appendingPathComponent("capture-warning.txt")
+            if let data = try? Data(contentsOf: captureURL),
+               let raw = String(data: data, encoding: .utf8)?
+                   .trimmingCharacters(in: .whitespacesAndNewlines),
+               !raw.isEmpty {
+                // Sidecar format: "screen-demoted: <message>" — strip the tag
+                // prefix so the help text is just the human message.
+                if let colon = raw.firstIndex(of: ":") {
+                    captureWarning = String(raw[raw.index(after: colon)...])
+                        .trimmingCharacters(in: .whitespaces)
+                } else {
+                    captureWarning = raw
+                }
             }
             await loadThumbnail(sessionDir: root)
         }

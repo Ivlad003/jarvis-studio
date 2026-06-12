@@ -27,6 +27,20 @@ struct DeepgramProviderURLTests {
         #expect(dict["language"] == "en")
     }
 
+    @Test("Endpointing is sent as documented millisecond value")
+    func endpointingUsesMilliseconds() throws {
+        let config = TranscriptionConfig()
+        let url = try DeepgramProvider.buildURL(
+            endpoint: DeepgramProvider.defaultEndpoint,
+            config: config
+        )
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        let items = components.queryItems ?? []
+        let dict = Dictionary(uniqueKeysWithValues: items.map { ($0.name, $0.value ?? "") })
+
+        #expect(dict["endpointing"] == "300")
+    }
+
     @Test("URL omits language when nil (auto-detect)")
     func urlOmitsLanguageWhenNil() throws {
         let config = TranscriptionConfig(language: nil)
@@ -85,6 +99,30 @@ struct DeepgramEventParserTests {
         #expect(seg.end == 2.3)
         #expect(seg.isFinal == true)
         #expect(abs(seg.confidence - 0.97) < 0.0001)
+    }
+
+    @Test("Applies timestamp offset to Results events")
+    func appliesTimestampOffset() {
+        let json = """
+        {
+          "type": "Results",
+          "start": 1.5,
+          "duration": 0.8,
+          "is_final": true,
+          "channel": {
+            "alternatives": [
+              {
+                "transcript": "hello again",
+                "confidence": 0.97
+              }
+            ]
+          }
+        }
+        """
+        let segments = DeepgramEventParser.parse(.text(json), timestampOffset: 10.0)
+        #expect(segments.count == 1)
+        #expect(segments[0].start == 11.5)
+        #expect(segments[0].end == 12.3)
     }
 
     @Test("Parses interim Results event with isFinal=false")
@@ -153,7 +191,8 @@ struct DeepgramProviderSessionTests {
         let mock = MockWebSocketTransport()
         let provider = DeepgramProvider(
             apiKey: "test-key",
-            transportFactory: { _, _ in mock }
+            transportFactory: { _, _ in mock },
+            sessionDrainTimeoutNanoseconds: 1_000_000
         )
 
         let session = try await provider.openSession(config: TranscriptionConfig(language: "en"))
@@ -172,7 +211,8 @@ struct DeepgramProviderSessionTests {
         let mock = MockWebSocketTransport()
         let provider = DeepgramProvider(
             apiKey: "test-key",
-            transportFactory: { _, _ in mock }
+            transportFactory: { _, _ in mock },
+            sessionDrainTimeoutNanoseconds: 1_000_000
         )
 
         let session = try await provider.openSession(config: TranscriptionConfig())
@@ -183,7 +223,7 @@ struct DeepgramProviderSessionTests {
         mock.enqueueText(json)
 
         var iterator = session.events.makeAsyncIterator()
-        let segment = await iterator.next()
+        let segment = try await iterator.next()
         #expect(segment != nil)
         #expect(segment?.text == "hello")
         #expect(segment?.isFinal == true)
@@ -196,18 +236,19 @@ struct DeepgramProviderSessionTests {
         let mock = MockWebSocketTransport()
         let provider = DeepgramProvider(
             apiKey: "test-key",
-            transportFactory: { _, _ in mock }
+            transportFactory: { _, _ in mock },
+            sessionDrainTimeoutNanoseconds: 1_000_000
         )
 
         let session = try await provider.openSession(config: TranscriptionConfig())
-        try await session.finish(closeMessage: #"{"type":"CloseStream"}"#)
+        try await session.finish()
 
         // The CloseStream text message should be in recordedSends
         let texts = mock.recordedSends.compactMap { msg -> String? in
             if case .text(let s) = msg { return s }
             return nil
         }
-        #expect(texts.contains(#"{"type":"CloseStream"}"#))
+        #expect(texts.contains(DeepgramProvider.closeStreamMessage))
         #expect(mock.didClose == true)
         #expect(mock.closeCode == .normalClosure)
     }
@@ -232,7 +273,8 @@ struct DeepgramProviderSessionTests {
         let mock = MockWebSocketTransport()
         let provider = DeepgramProvider(
             apiKey: "test-key",
-            transportFactory: { _, _ in mock }
+            transportFactory: { _, _ in mock },
+            sessionDrainTimeoutNanoseconds: 1_000_000
         )
 
         let session = try await provider.openSession(config: TranscriptionConfig())

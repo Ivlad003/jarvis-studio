@@ -564,6 +564,11 @@ private extension AVAudioPCMBuffer {
             return nil
         }
         buffer.frameLength = frameCount
+        if let channel = buffer.floatChannelData?[0] {
+            for i in 0..<Int(frameCount) {
+                channel[i] = 0
+            }
+        }
         return buffer
     }
 }

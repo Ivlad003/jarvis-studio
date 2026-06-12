@@ -24,6 +24,8 @@ import TranscriptionKit
 @MainActor
 final class ChatState {
 
+    static let defaultChatMaxTokens = 4_096
+
     // MARK: - Attached session discriminant
 
     enum AttachedSession: Hashable {
@@ -238,7 +240,8 @@ final class ChatState {
     /// frames from attached sessions' screen.mp4 (cap: 3 frames).
     func send() async {
         let text = inputDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isSending else { return }
+        guard !text.isEmpty,
+              Self.canStartTextSend(isSending: isSending, isSnapshotting: isSnapshotting) else { return }
 
         inputDraft = ""
         lastError = nil
@@ -274,7 +277,9 @@ final class ChatState {
         if !combinedFooter.isEmpty {
             parts.append(.text(combinedFooter))
         }
-        messages.append(ChatMessage(role: .user, parts: parts))
+        let userMessage = ChatMessage(role: .user, parts: parts)
+        let userMessageIndex = messages.count
+        messages.append(userMessage)
 
         do {
             let systemPrompt = await buildSystemPrompt()
@@ -282,11 +287,11 @@ final class ChatState {
             messages.append(ChatMessage(role: .assistant, content: reply))
         } catch let error as AIError {
             lastError = friendlyMessage(for: error)
-            messages.removeLast()
+            Self.rollbackUserMessage(at: userMessageIndex, matching: userMessage, from: &messages)
             inputDraft = text
         } catch {
             lastError = error.localizedDescription
-            messages.removeLast()
+            Self.rollbackUserMessage(at: userMessageIndex, matching: userMessage, from: &messages)
             inputDraft = text
         }
     }
@@ -325,6 +330,7 @@ final class ChatState {
     /// Captures the last ~60 s of the active recording via Whisper, then sends
     /// a message with the snapshot transcript as context.
     func sendSnapshot() async {
+        guard Self.canStartSnapshotSend(isSending: isSending, isSnapshotting: isSnapshotting) else { return }
         guard case .recording(let sid) = recorder.status else {
             lastError = "Not currently recording — start a recording to use live snapshot."
             return
@@ -343,6 +349,7 @@ final class ChatState {
 
         let language = settings.summaryLanguage == "auto" ? nil : settings.summaryLanguage
         let maker = SnapshotMaker(sessionStore: sessionStore, whisperProviderFactory: whisperProviderFactory)
+        var rollbackTarget: (index: Int, message: ChatMessage)?
 
         do {
             let snapshotText = try await maker.snapshot(
@@ -354,12 +361,17 @@ final class ChatState {
                 role: .user,
                 content: "[Live snapshot — last ~60 seconds of the active recording]\n\(snapshotText)\n\n---\n\nQuestion: \(q)"
             )
+            rollbackTarget = (messages.count, userMessage)
             messages.append(userMessage)
             snapshotQuestion = ""
 
             let reply = try await runProvider(messages: messages, systemPrompt: nil)
             messages.append(ChatMessage(role: .assistant, content: reply))
         } catch {
+            if let rollbackTarget {
+                Self.rollbackUserMessage(at: rollbackTarget.index, matching: rollbackTarget.message, from: &messages)
+                snapshotQuestion = q
+            }
             lastError = "Snapshot failed: \(error.localizedDescription)"
         }
     }
@@ -371,7 +383,11 @@ final class ChatState {
         guard let resolved = AIProviderResolver.resolve(settings.aiProviderConfig) else {
             throw AIError.authenticationFailed
         }
-        let config = AIConfig(model: resolved.model, systemPrompt: systemPrompt)
+        let config = AIConfig(
+            model: resolved.model,
+            maxTokens: Self.defaultChatMaxTokens,
+            systemPrompt: systemPrompt
+        )
         return try await resolved.provider.chat(messages: messages, config: config)
     }
 
@@ -445,7 +461,7 @@ final class ChatState {
     /// Parse timestamp patterns from `text`, extract ≤3 frames from attached
     /// sessions' screen.mp4, and return the image parts + a human-readable footer.
     private func extractFramesForTimestamps(in text: String) async -> ([ChatMessage.Part], String) {
-        let timestamps = parseTimestamps(from: text)
+        let timestamps = Self.parseTimestampMentions(from: text)
         guard !timestamps.isEmpty else { return ([], "") }
 
         // Collect sessions that have a screen.mp4 sidecar.
@@ -505,14 +521,14 @@ final class ChatState {
     ///   `0:12:34`      → h:mm:ss
     ///   `at minute 5`  → 5 * 60
     ///   `на 3 хвилині` / `на 3 хвилини` / `на 3 хвилинах` → 3 * 60
-    private func parseTimestamps(from text: String) -> [TimeInterval] {
-        var results: [TimeInterval] = []
+    static func parseTimestampMentions(from text: String) -> [TimeInterval] {
+        var results: [(location: Int, time: TimeInterval)] = []
         var seen = Set<TimeInterval>()
 
-        func add(_ t: TimeInterval) {
+        func add(_ t: TimeInterval, location: Int) {
             guard t >= 0, !seen.contains(t) else { return }
             seen.insert(t)
-            results.append(t)
+            results.append((location, t))
         }
 
         // h:mm:ss  (e.g. 1:23:45)
@@ -522,7 +538,8 @@ final class ChatState {
                 let h = Int(substring(text, range: m.range(at: 1))) ?? 0
                 let min = Int(substring(text, range: m.range(at: 2))) ?? 0
                 let sec = Int(substring(text, range: m.range(at: 3))) ?? 0
-                add(TimeInterval(h * 3600 + min * 60 + sec))
+                guard min < 60, sec < 60 else { continue }
+                add(TimeInterval(h * 3600 + min * 60 + sec), location: m.range.location)
             }
         }
 
@@ -532,7 +549,8 @@ final class ChatState {
             for m in matches {
                 let min = Int(substring(text, range: m.range(at: 1))) ?? 0
                 let sec = Int(substring(text, range: m.range(at: 2))) ?? 0
-                add(TimeInterval(min * 60 + sec))
+                guard sec < 60 else { continue }
+                add(TimeInterval(min * 60 + sec), location: m.range.location)
             }
         }
 
@@ -541,7 +559,7 @@ final class ChatState {
         if let matches = enMin?.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
             for m in matches {
                 let n = Int(substring(text, range: m.range(at: 1))) ?? 0
-                add(TimeInterval(n * 60))
+                add(TimeInterval(n * 60), location: m.range.location)
             }
         }
 
@@ -550,14 +568,31 @@ final class ChatState {
         if let matches = ukMin?.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
             for m in matches {
                 let n = Int(substring(text, range: m.range(at: 1))) ?? 0
-                add(TimeInterval(n * 60))
+                add(TimeInterval(n * 60), location: m.range.location)
             }
         }
 
-        return results
+        return results.sorted { $0.location < $1.location }.map(\.time)
     }
 
-    private func substring(_ text: String, range: NSRange) -> String {
+    static func canStartTextSend(isSending: Bool, isSnapshotting: Bool) -> Bool {
+        !isSending && !isSnapshotting
+    }
+
+    static func canStartSnapshotSend(isSending: Bool, isSnapshotting: Bool) -> Bool {
+        !isSending && !isSnapshotting
+    }
+
+    static func rollbackUserMessage(
+        at index: Int,
+        matching message: ChatMessage,
+        from messages: inout [ChatMessage]
+    ) {
+        guard messages.indices.contains(index), messages[index] == message else { return }
+        messages.remove(at: index)
+    }
+
+    private static func substring(_ text: String, range: NSRange) -> String {
         guard let r = Range(range, in: text) else { return "" }
         return String(text[r])
     }

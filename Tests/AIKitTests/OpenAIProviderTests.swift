@@ -61,7 +61,7 @@ struct OpenAIProviderRequestTests {
         #expect(msgs[1]["role"] as? String == "user")
     }
 
-    @Test("model, max_tokens, temperature are serialized correctly")
+    @Test("model, max_completion_tokens, temperature are serialized correctly")
     func parametersSerialised() throws {
         let config = AIConfig(model: "gpt-4o", temperature: 0.5, maxTokens: 1000)
         let request = try OpenAIProvider.buildRequest(
@@ -72,7 +72,8 @@ struct OpenAIProviderRequestTests {
         )
         let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as! [String: Any]
         #expect(body["model"] as? String == "gpt-4o")
-        #expect(body["max_tokens"] as? Int == 1000)
+        #expect(body["max_completion_tokens"] as? Int == 1000)
+        #expect(body["max_tokens"] == nil)
         let temp = body["temperature"] as? Double ?? 0
         #expect(abs(temp - 0.5) < 0.001)
     }

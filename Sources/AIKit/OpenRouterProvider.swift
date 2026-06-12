@@ -106,7 +106,7 @@ public final class OpenRouterProvider: AIProvider, Sendable {
 
         let body: [String: Any] = [
             "model": config.model,
-            "max_tokens": config.maxTokens,
+            "max_completion_tokens": config.maxTokens,
             "temperature": config.temperature,
             "messages": allMessages.map { msg -> [String: Any] in
                 ["role": msg.role.rawValue, "content": serializeParts(msg.parts)]

@@ -34,7 +34,7 @@ public actor ReconnectingSession {
     // MARK: Public surface
 
     /// Single stable stream of transcript events — survives reconnects.
-    public nonisolated let events: AsyncStream<TranscriptSegment>
+    public nonisolated let events: AsyncThrowingStream<TranscriptSegment, Error>
 
     // MARK: Configuration
 
@@ -45,34 +45,72 @@ public actor ReconnectingSession {
 
     // MARK: Private state
 
-    private let continuation: AsyncStream<TranscriptSegment>.Continuation
+    private let continuation: AsyncThrowingStream<TranscriptSegment, Error>.Continuation
     private let transportFactory: @Sendable () -> any WebSocketTransport
-    private let parser: TranscriptionEventParser
+    private let parserFactory: @Sendable (TimeInterval) -> TranscriptionEventParser
     private let clock: any ReconnectClock
+    private let audioBytesPerSecond: Double?
+    private let defaultCloseMessage: String?
+    private let finishDrainTimeoutNanoseconds: UInt64
+    private let lifecycle: WebSocketSessionLifecycle
 
-    /// Ring buffer: tuples of (wallClockDate, audioData).
+    /// Ring buffer: tuples of (wallClockDate, audioData, audioDurationSeconds).
     /// Entries older than 5 s are pruned before each reconnect replay.
-    private var ringBuffer: [(timestamp: Date, data: Data)] = []
+    private var ringBuffer: [(timestamp: Date, data: Data, duration: TimeInterval)] = []
     private static let ringBufferWindow: TimeInterval = 5.0
+    private var audioSentSeconds: TimeInterval = 0
+    private var connectionTimestampOffset: TimeInterval = 0
 
     /// The active transport. Replaced on each reconnect.
     private var transport: (any WebSocketTransport)?
     private var receiveTask: Task<Void, Never>?
+    private var keepAliveTask: Task<Void, Never>?
     private var closed = false
+    private var receiveLoopFinished = false
+    private static let keepAliveMessage = #"{"type":"KeepAlive"}"#
+    private static let keepAliveIntervalNanoseconds: UInt64 = 8_000_000_000
 
     // MARK: Init
 
     public init(
         transportFactory: @escaping @Sendable () -> any WebSocketTransport,
         parser: TranscriptionEventParser,
-        clock: any ReconnectClock = SystemClock()
+        clock: any ReconnectClock = SystemClock(),
+        defaultCloseMessage: String? = nil,
+        finishDrainTimeoutNanoseconds: UInt64 = 2_500_000_000
     ) {
-        let (stream, cont) = AsyncStream<TranscriptSegment>.makeStream()
+        let lifecycle = WebSocketSessionLifecycle()
+        let (stream, cont) = Self.makeEventStream(lifecycle: lifecycle)
         self.events = stream
         self.continuation = cont
         self.transportFactory = transportFactory
-        self.parser = parser
+        self.parserFactory = { _ in parser }
         self.clock = clock
+        self.audioBytesPerSecond = nil
+        self.defaultCloseMessage = defaultCloseMessage
+        self.finishDrainTimeoutNanoseconds = finishDrainTimeoutNanoseconds
+        self.lifecycle = lifecycle
+    }
+
+    public init(
+        transportFactory: @escaping @Sendable () -> any WebSocketTransport,
+        parserFactory: @escaping @Sendable (TimeInterval) -> TranscriptionEventParser,
+        clock: any ReconnectClock = SystemClock(),
+        audioBytesPerSecond: Double,
+        defaultCloseMessage: String? = nil,
+        finishDrainTimeoutNanoseconds: UInt64 = 2_500_000_000
+    ) {
+        let lifecycle = WebSocketSessionLifecycle()
+        let (stream, cont) = Self.makeEventStream(lifecycle: lifecycle)
+        self.events = stream
+        self.continuation = cont
+        self.transportFactory = transportFactory
+        self.parserFactory = parserFactory
+        self.clock = clock
+        self.audioBytesPerSecond = audioBytesPerSecond > 0 ? audioBytesPerSecond : nil
+        self.defaultCloseMessage = defaultCloseMessage
+        self.finishDrainTimeoutNanoseconds = finishDrainTimeoutNanoseconds
+        self.lifecycle = lifecycle
     }
 
     // MARK: Public API
@@ -80,16 +118,24 @@ public actor ReconnectingSession {
     /// Send raw PCM bytes to the active transport and push to the ring buffer.
     public func send(_ pcm: Data) async throws {
         if closed { throw TranscriptionError.alreadyClosed }
-        guard let t = transport else { throw TranscriptionError.sendFailed(message: "no active transport") }
+
+        // Buffer before touching the socket. If the transport write fails
+        // during an outage, reconnect replay still has the audio that was
+        // produced while the network was broken.
+        let now = Date()
+        let duration = audioDuration(for: pcm)
+        audioSentSeconds += duration
+        ringBuffer.append((timestamp: now, data: pcm, duration: duration))
+        pruneRingBuffer(before: now.addingTimeInterval(-Self.ringBufferWindow))
+
+        guard let t = transport else {
+            return
+        }
         do {
             try await t.send(.data(pcm))
         } catch {
-            throw TranscriptionError.sendFailed(message: "\(error)")
+            return
         }
-        // Buffer every chunk; prune old entries so we only keep last 5 s.
-        let now = Date()
-        ringBuffer.append((timestamp: now, data: pcm))
-        pruneRingBuffer(before: now.addingTimeInterval(-Self.ringBufferWindow))
     }
 
     /// Send a text control message (e.g. CloseStream) to the active transport.
@@ -108,13 +154,13 @@ public actor ReconnectingSession {
         if closed { return }
         closed = true
 
-        if let msg = closeMessage, let t = transport {
+        if let msg = closeMessage ?? defaultCloseMessage, let t = transport {
             try? await t.send(.text(msg))
         }
 
-        // Allow receive task to drain final segments from close-ack.
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        await waitForReceiveDrain(timeoutNanoseconds: finishDrainTimeoutNanoseconds)
 
+        keepAliveTask?.cancel()
         receiveTask?.cancel()
         transport?.close(code: .normalClosure)
         continuation.finish()
@@ -124,6 +170,7 @@ public actor ReconnectingSession {
     public func cancel() {
         if closed { return }
         closed = true
+        keepAliveTask?.cancel()
         receiveTask?.cancel()
         transport?.close(code: .abnormalClosure)
         continuation.finish()
@@ -134,19 +181,24 @@ public actor ReconnectingSession {
     /// Opens the first transport and starts the receive/reconnect loop.
     func start() {
         guard receiveTask == nil, !closed else { return }
+        connectionTimestampOffset = 0
         let firstTransport = transportFactory()
         self.transport = firstTransport
+        lifecycle.setTransport(firstTransport)
+        startKeepAlive()
         launchReceiveTask(consecutiveFailures: 0)
     }
 
     // MARK: Private — receive loop
 
     private func launchReceiveTask(consecutiveFailures: Int) {
+        receiveLoopFinished = false
         let cont = continuation
-        let parser = self.parser
+        let parser = self.parserFactory(connectionTimestampOffset)
 
         receiveTask = Task.detached { [weak self] in
             guard let self else { return }
+            var activeConsecutiveFailures = consecutiveFailures
 
             // Drain messages from the current transport until it fails or is cancelled.
             let currentTransport: any WebSocketTransport
@@ -163,33 +215,36 @@ public actor ReconnectingSession {
                 } catch {
                     // Receive failed — decide whether to reconnect or give up.
                     if Task.isCancelled { break }
+                    await self.markReceiveLoopFinished()
                     await self.handleReceiveFailure(
-                        consecutiveFailures: consecutiveFailures,
-                        cont: cont,
-                        parser: parser
+                        consecutiveFailures: activeConsecutiveFailures,
+                        cont: cont
                     )
                     return  // launchReceiveTask re-entry handles the rest.
                 }
+                // A received frame proves the fresh transport is healthy. Any
+                // later disconnect is a new consecutive-failure run, not a
+                // lifetime retry budget hit.
+                activeConsecutiveFailures = 0
                 let segments = parser.parse(message)
                 for segment in segments {
                     cont.yield(segment)
                 }
             }
+            await self.markReceiveLoopFinished()
         }
     }
 
     private func handleReceiveFailure(
         consecutiveFailures: Int,
-        cont: AsyncStream<TranscriptSegment>.Continuation,
-        parser: TranscriptionEventParser
+        cont: AsyncThrowingStream<TranscriptSegment, Error>.Continuation
     ) async {
         if closed { return }
 
         let nextFailureCount = consecutiveFailures + 1
 
         guard nextFailureCount <= Self.maxRetries else {
-            // Exhausted retries — finish the stream.
-            cont.finish()
+            cont.finish(throwing: TranscriptionError.maxRetriesExceeded)
             closed = true
             return
         }
@@ -207,11 +262,14 @@ public actor ReconnectingSession {
 
         let freshTransport = transportFactory()
         self.transport = freshTransport
+        lifecycle.setTransport(freshTransport)
 
         // Replay ring buffer contents (entries within the last 5 s) to the
         // new transport so Deepgram can re-process any audio it may have missed.
         let now = Date()
         pruneRingBuffer(before: now.addingTimeInterval(-Self.ringBufferWindow))
+        let replayDuration = ringBuffer.reduce(TimeInterval(0)) { $0 + $1.duration }
+        connectionTimestampOffset = max(0, audioSentSeconds - replayDuration)
         for entry in ringBuffer {
             try? await freshTransport.send(.data(entry.data))
         }
@@ -225,13 +283,74 @@ public actor ReconnectingSession {
         ringBuffer.removeAll { $0.timestamp < cutoff }
     }
 
+    private func audioDuration(for data: Data) -> TimeInterval {
+        guard let audioBytesPerSecond else { return 0 }
+        return TimeInterval(data.count) / audioBytesPerSecond
+    }
+
+    private static func makeEventStream(
+        lifecycle: WebSocketSessionLifecycle
+    ) -> (
+        AsyncThrowingStream<TranscriptSegment, Error>,
+        AsyncThrowingStream<TranscriptSegment, Error>.Continuation
+    ) {
+        var captured: AsyncThrowingStream<TranscriptSegment, Error>.Continuation!
+        let stream = AsyncThrowingStream<TranscriptSegment, Error>(
+            bufferingPolicy: .bufferingNewest(512)
+        ) { continuation in
+            captured = continuation
+        }
+        captured.onTermination = { @Sendable _ in
+            lifecycle.terminate(code: .abnormalClosure)
+        }
+        return (stream, captured)
+    }
+
+    private func startKeepAlive() {
+        guard keepAliveTask == nil else { return }
+        let task = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.keepAliveIntervalNanoseconds)
+                if Task.isCancelled { return }
+                await self?.sendKeepAliveIfOpen()
+            }
+        }
+        keepAliveTask = task
+        lifecycle.setKeepAliveTask(task)
+    }
+
+    private func sendKeepAliveIfOpen() async {
+        guard !closed, let transport else { return }
+        try? await transport.send(.text(Self.keepAliveMessage))
+    }
+
+    private func waitForReceiveDrain(timeoutNanoseconds: UInt64) async {
+        let deadline = Date().addingTimeInterval(Double(timeoutNanoseconds) / 1_000_000_000)
+        while !receiveLoopFinished && Date() < deadline {
+            try? await Task.sleep(nanoseconds: min(10_000_000, timeoutNanoseconds))
+        }
+    }
+
+    private func markReceiveLoopFinished() {
+        receiveLoopFinished = true
+    }
+
     // MARK: Test seams
 
     /// Insert a ring-buffer entry with a back-dated timestamp. Used by tests to
     /// verify that chunks older than the 5-s window are pruned before replay.
     func injectStaleRingBufferEntry(data: Data, age: TimeInterval) {
+        injectStaleRingBufferEntry(data: data, age: age, duration: 0)
+    }
+
+    /// Insert a ring-buffer entry and account for its timeline duration. Used
+    /// by timestamp-offset tests to emulate audio that was sent before the
+    /// replay window and should therefore advance the original session clock
+    /// without being replayed.
+    func injectStaleRingBufferEntry(data: Data, age: TimeInterval, duration: TimeInterval) {
         let timestamp = Date().addingTimeInterval(-age)
-        ringBuffer.append((timestamp: timestamp, data: data))
+        ringBuffer.append((timestamp: timestamp, data: data, duration: duration))
+        audioSentSeconds += duration
     }
 }
 

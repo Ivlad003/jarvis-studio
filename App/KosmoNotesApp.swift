@@ -4,6 +4,8 @@ import AVFoundation
 import KeyboardShortcuts
 import StorageKit
 import DictationKit
+import UserNotifications
+import CaptureKit
 
 @main
 struct KosmoNotesApp: App {
@@ -40,6 +42,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var agentConsoleHolder: AnyObject?   // AgentConsoleWindowController (macOS 14+)
     private var startupScreenRecordingWarning: String?
 
+    private static var isRunningUnderXCTest: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+    }
+
     // Library window controller. Stored as AnyObject to avoid @available on
     // a stored property (Swift disallows that). Cast at use-site with #available.
     private var libraryControllerHolder: AnyObject?
@@ -54,6 +61,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// and SubscriptionID is itself macOS-14-gated.
     private var libraryDoubleTapSub: Any?
     private var libraryDoubleTapObserver: NSObjectProtocol?
+
+    /// 1 Hz poll that drives the status-item badge and user-notification
+    /// surface for mic health. The menu-bar dot is only visible when the
+    /// user has the menu open; this loop guarantees the user sees within
+    /// ≤1 s when mic capture has degraded, satisfying invariant I1 of the
+    /// always-on capture design.
+    private var micHealthBadgeTask: Task<Void, Never>?
+    /// Last mic-health state we surfaced through the status item. Used to
+    /// detect transitions so we only post a notification on edges rather
+    /// than every 1 s tick.
+    private var lastSurfacedMicHealthState: MicHealthBadgeState = .quiet
+    private var notificationPermissionRequested: Bool = false
+
+    /// Discretised mic-health state for the menu-bar badge. We collapse the
+    /// real `MicHealth` cases into "quiet / degraded / dead" because the bar
+    /// only needs to know whether to show the warning glyph.
+    private enum MicHealthBadgeState: Equatable {
+        case quiet
+        case degraded
+        case dead
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // AC-6: minimum-OS gate. Deployment target is 14.0+ (LSMinimumSystemVersion
@@ -74,6 +102,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // recordings, sessions, and API keys after the bundle-ID rename.
         // Idempotent — flips a UserDefault flag once done.
         MigrationService.runIfNeeded()
+
+        // Foreground notification presentation: without a delegate, macOS
+        // silences banners while the app is frontmost — and the app flips to
+        // `.regular` whenever Settings/Library/Chat are open, which is exactly
+        // when the user is looking at it. See `willPresent` below.
+        UNUserNotificationCenter.current().delegate = self
 
         configureStatusItem()
         configureMenu()
@@ -168,12 +202,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // If a recording is in progress, defer termination until stop() finishes
-        // so segments are finalized and SleepAssertion is released. Returning
-        // .terminateLater suspends the quit until we call NSApp.reply(...).
+        // If a recording or post-stop pipeline is in progress, defer
+        // termination so segments are finalized, the transcript/summary land
+        // on disk, and SleepAssertion is released. Returning .terminateLater
+        // suspends the quit until we call NSApp.reply(...).
         if #available(macOS 14.0, *), let recorder = recorderState, recorder.status.isBusy {
             Task { @MainActor in
-                await recorder.stop()
+                // Flush an in-flight recording; stop() runs the whole
+                // post-stop pipeline inline, so awaiting it covers
+                // transcription/summary/indexing too.
+                if case .recording = recorder.status {
+                    await recorder.stop()
+                }
+                // Still busy? A stop() started elsewhere (user stop, fail-safe
+                // auto-stop) is mid-pipeline — `.transcribing` — or our stop()
+                // bounced off the reentrancy gate. Poll until it settles,
+                // bounded so a hung provider call can't block quit forever.
+                let deadline = ContinuousClock.now.advanced(by: .seconds(120))
+                while recorder.status.isBusy && ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
                 NSApp.reply(toApplicationShouldTerminate: true)
             }
             return .terminateLater
@@ -201,6 +249,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
         NSApp.terminate(nil)
         return false
+    }
+
+    // MARK: - Mic-health surface
+
+    /// Polling (not Observation tracking) is intentional: `withObservationTracking`
+    /// callbacks only fire once per change set, which fights us in the
+    /// pause/resume case where the same value re-appears.
+    @available(macOS 14.0, *)
+    private func startMicHealthBadgeObserver(recorder: RecorderState) {
+        micHealthBadgeTask?.cancel()
+        lastSurfacedMicHealthState = .quiet
+        // Request notification permission once — defer until the first
+        // recording so we don't startle users at first launch.
+        micHealthBadgeTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                if Task.isCancelled { break }
+                guard let self else { break }
+                self.refreshMicHealthBadge(recorder: recorder)
+            }
+        }
+    }
+
+    @available(macOS 14.0, *)
+    private func refreshMicHealthBadge(recorder: RecorderState) {
+        let state = Self.discretiseMicHealth(recorder.micHealth)
+        Self.applyMicHealthToStatusItem(item: statusItem, state: state)
+        guard state != lastSurfacedMicHealthState else { return }
+        if state == .degraded || state == .dead {
+            // Lazy permission ask the first time we actually need it. The
+            // post is chained behind the authorization callback — posting in
+            // the same tick as requestAuthorization races it and the very
+            // first (often only) notification gets dropped.
+            ensureNotificationPermission { [weak self] in
+                self?.postMicHealthNotification(state: state, recorder: recorder)
+            }
+        }
+        lastSurfacedMicHealthState = state
+    }
+
+    @available(macOS 14.0, *)
+    private static func discretiseMicHealth(_ h: MicHealth) -> MicHealthBadgeState {
+        switch h {
+        case .idle, .warmingUp, .ok, .muted: return .quiet
+        case .degraded: return .degraded
+        case .dead: return .dead
+        }
+    }
+
+    @MainActor
+    private static func applyMicHealthToStatusItem(item: NSStatusItem?, state: MicHealthBadgeState) {
+        guard let button = item?.button else { return }
+        switch state {
+        case .quiet:
+            button.title = "KN"
+        case .degraded:
+            button.title = "🟡 KN"
+        case .dead:
+            button.title = "🔴 KN"
+        }
+    }
+
+    /// Request notification permission once, then run `post`. On the first
+    /// call `post` is deferred until the authorization callback fires so the
+    /// post doesn't race the pending request; afterwards it runs immediately.
+    @MainActor
+    private func ensureNotificationPermission(then post: @escaping @MainActor () -> Void) {
+        guard !notificationPermissionRequested else {
+            post()
+            return
+        }
+        notificationPermissionRequested = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+            // Result deliberately ignored — without permission the badge in
+            // the status item still surfaces the problem; the notification
+            // is a bonus (posting after denial is a harmless no-op).
+            Task { @MainActor in post() }
+        }
+    }
+
+    @available(macOS 14.0, *)
+    @MainActor
+    private func postMicHealthNotification(state: MicHealthBadgeState, recorder: RecorderState) {
+        let content = UNMutableNotificationContent()
+        switch state {
+        case .quiet:
+            return
+        case .degraded:
+            content.title = "Microphone unresponsive"
+            content.body = recorder.micHealthMessage ?? "KosmoNotes is recovering microphone capture."
+            content.sound = nil
+        case .dead:
+            content.title = "Microphone dropped"
+            content.body = recorder.micHealthMessage ?? "Microphone capture stopped. KosmoNotes will auto-stop the recording."
+            content.sound = .default
+        }
+        let request = UNNotificationRequest(
+            identifier: "dev.kosmonotes.studio.micHealth.\(state)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { _ in }
     }
 
     // MARK: - Status item + menu
@@ -274,6 +424,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         screenWarningItem.isEnabled = false
         screenWarningItem.isHidden = true
         menu.addItem(screenWarningItem)
+
+        // Mic-health badge. Shown only when capture is degraded or dead so
+        // the menu stays quiet on the happy path. Title is prefixed with a
+        // coloured emoji acting as the "dot" — NSMenuItem doesn't render
+        // tinted SF Symbols reliably across themes, but emoji is rock-solid.
+        let micHealthItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        micHealthItem.identifier = NSUserInterfaceItemIdentifier("micHealth")
+        micHealthItem.isEnabled = false
+        micHealthItem.isHidden = true
+        menu.addItem(micHealthItem)
 
         menu.addItem(.separator())
 
@@ -407,18 +567,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.recorderHolder = recorder
 
+            startMicHealthBadgeObserver(recorder: recorder)
+
             // Dictation: register the global hotkey monitor. The pipeline itself
             // is rebuilt on every press so settings changes apply without relaunch.
-            // sessionStore is wired so each successful dictation lands in Library
-            // as a mode = .dictation SessionRecord with audio.m4a + transcript.
-            let dictation = DictationState(settings: settings, sessionStore: sessionStore)
+            let dictation = DictationState(
+                settings: settings,
+                sessionStore: sessionStore,
+                recorder: recorder
+            )
             dictation.install()
             self.dictationHolder = dictation
 
             // Push-to-Markdown: same press/hold/release shape as Dictation,
             // saves a `.md` file at markdownExportFolder via MarkdownExporter
             // instead of pasting into the focused field.
-            let p2md = PushToMarkdownState(settings: settings, sessionStore: sessionStore)
+            let p2md = PushToMarkdownState(
+                settings: settings,
+                sessionStore: sessionStore,
+                recorder: recorder
+            )
             p2md.install()
             self.pushToMarkdownHolder = p2md
 
@@ -428,7 +596,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // future enable doesn't require relaunch.
             let agentSession = AgentSessionState(settings: settings)
             self.agentSessionHolder = agentSession
-            let agentHotkey = AgentHotkeyState(settings: settings, agentSession: agentSession)
+            let agentHotkey = AgentHotkeyState(
+                settings: settings,
+                agentSession: agentSession,
+                recorder: recorder
+            )
             agentHotkey.install()
             self.agentHotkeyHolder = agentHotkey
 
@@ -437,7 +609,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem?.menu?.update()
 
             // After migration, scan for orphan sessions and offer recovery.
-            let coordinator = RecoveryCoordinator(sessionStore: sessionStore, database: database)
+            let recoveryPromptOverride: (([RecoveryService.OrphanSession]) -> NSApplication.ModalResponse)? =
+                Self.isRunningUnderXCTest ? { _ in .alertSecondButtonReturn } : nil
+            let coordinator = RecoveryCoordinator(
+                sessionStore: sessionStore,
+                database: database,
+                promptResponseOverride: recoveryPromptOverride
+            )
             let recoveryResult = await coordinator.runAtLaunch(rootDir: recordingsDir)
             switch recoveryResult {
             case .noOrphans, .userDeclined:
@@ -469,6 +647,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @available(macOS 14.0, *)
     private var recorderState: RecorderState? {
         recorderHolder as? RecorderState
+    }
+
+    @available(macOS 14.0, *)
+    var canClearLibrarySessions: Bool {
+        guard let recorder = recorderState else { return true }
+        if case .recording = recorder.status {
+            return false
+        }
+        return true
     }
 
     @available(macOS 14.0, *)
@@ -757,6 +944,7 @@ extension AppDelegate: NSMenuDelegate {
         let muteItem = menu.items.first(where: { $0.identifier?.rawValue == "toggleMicMute" })
         let liveTranscriptItem = menu.items.first(where: { $0.identifier?.rawValue == "liveTranscriptStatus" })
         let screenWarningItem = menu.items.first(where: { $0.identifier?.rawValue == "screenRecordingWarning" })
+        let micHealthItem = menu.items.first(where: { $0.identifier?.rawValue == "micHealth" })
         guard let openLastItem = menu.items.first(where: { $0.identifier?.rawValue == "openLastSession" }) else { return }
 
         // Mute item: only meaningful while a recording is in flight.
@@ -771,6 +959,7 @@ extension AppDelegate: NSMenuDelegate {
         if #available(macOS 14.0, *), let recorder = recorderState {
             updateLiveTranscriptItem(liveTranscriptItem, recorder: recorder)
             updateScreenRecordingWarningItem(screenWarningItem, recorder: recorder)
+            updateMicHealthItem(micHealthItem, recorder: recorder)
             switch recorder.status {
             case .idle:
                 recordItem.title = "Start Recording"
@@ -810,6 +999,7 @@ extension AppDelegate: NSMenuDelegate {
             openLastItem.isEnabled = false
             liveTranscriptItem?.isHidden = true
             screenWarningItem?.isHidden = true
+            micHealthItem?.isHidden = true
         }
     }
 
@@ -822,6 +1012,21 @@ extension AppDelegate: NSMenuDelegate {
             return
         }
 
+        item.isHidden = false
+        item.title = title
+    }
+
+    @available(macOS 14.0, *)
+    private func updateMicHealthItem(_ item: NSMenuItem?, recorder: RecorderState) {
+        guard let item else { return }
+        guard let title = RecorderMenuPresenter.micHealthTitle(
+            health: recorder.micHealth,
+            message: recorder.micHealthMessage
+        ) else {
+            item.isHidden = true
+            item.title = ""
+            return
+        }
         item.isHidden = false
         item.title = title
     }
@@ -867,6 +1072,22 @@ extension AppDelegate: NSMenuDelegate {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count > limit else { return trimmed }
         return String(trimmed.prefix(limit)) + "…"
+    }
+}
+
+// MARK: - UNUserNotificationCenterDelegate
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    /// Present mic-health notifications even while the app is frontmost.
+    /// Without this, UNUserNotificationCenter silences banners for the
+    /// foreground app — and KosmoNotes is `.regular` (foreground-capable)
+    /// whenever Settings/Library/Chat are open.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
     }
 }
 

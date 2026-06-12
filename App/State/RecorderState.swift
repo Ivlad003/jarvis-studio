@@ -103,6 +103,22 @@ final class RecorderState {
     /// Non-nil when screen recording was requested but failed (e.g. TCC denied/changed
     /// after re-signing). Audio recording proceeds normally; this is a soft warning only.
     var screenRecordingWarning: String? = nil
+    /// Live mic-health surface, projected from `CaptureSession.micHealth`. UI
+    /// reads this directly — green dot when .ok, yellow + banner when
+    /// .degraded, red + banner when .dead. Mirrors the invariant that the
+    /// user must see within 5 s when their voice has stopped reaching disk.
+    var micHealth: MicHealth = .idle
+    /// User-facing message attached to the most recent .degraded or .dead
+    /// transition. Nil while healthy. Cleared on session stop.
+    var micHealthMessage: String? = nil
+    /// True after the fail-safe auto-stop fires. The Library row is tagged
+    /// with this in the finalize() path so the user can tell at a glance.
+    private(set) var micFailSafeTriggered: Bool = false
+    /// True after tier-2 fallback demoted screen recording to keep mic alive.
+    /// Drives the user-facing "screen video stopped mid-session" copy in the
+    /// recorder UI and persists into the session via enhancementStatus =
+    /// .partial.
+    private(set) var screenDemotedDuringRecording: Bool = false
 
     var showsLiveTranscript: Bool {
         !liveTranscriptStableText.isEmpty ||
@@ -130,6 +146,23 @@ final class RecorderState {
     /// 10 s, surfacing routing issues (Bluetooth HFP mic, wrong default
     /// input device) that otherwise look like "voice didn't record".
     private var micWatchdogTask: Task<Void, Never>?
+    /// Polls CaptureSession.micHealth on a 1 s cadence, projects it onto the
+    /// observable `micHealth` property, and triggers the fail-safe auto-stop
+    /// after 30 s of `.dead`. This is the surface the design doc calls "I1
+    /// (no silent mic death)" + "I2 (hard fail-safe)" — see
+    /// docs/plans/2026-06-06-always-on-capture-design.md.
+    private var micHealthPollerTask: Task<Void, Never>?
+    /// Synchronous reentrancy gate for start()/stop(). Both methods cross
+    /// multiple suspension points before `status` reflects the transition,
+    /// so a fail-safe auto-stop racing a user stop (or a start() slotting
+    /// into the transient `.failed` window mid-stop) could double-enter the
+    /// lifecycle pipeline. Set as the FIRST statement of each — before any
+    /// await — and reset via `defer` on every exit path.
+    private var lifecycleTransitionInFlight = false
+    /// On the SCStream-mic path, polls `CaptureSession.micLevel` on the same
+    /// ~33 ms cadence MicLevelMeter would use. Stored separately so teardown
+    /// can cancel it. Nil on the AudioEngine path.
+    private var scStreamMicLevelPollerTask: Task<Void, Never>?
     /// os_log channel surfaced in Settings → Logs.
     fileprivate static let recorderLog = Logger(subsystem: "dev.kosmonotes.studio", category: "RecorderState")
     private let sleepAssertion = SleepAssertion()
@@ -185,8 +218,11 @@ final class RecorderState {
 
     /// Begin a recording session.
     func start(mode: SessionMode) async {
-        // Idempotent: only proceed when not already mid-session.
-        guard !status.isBusy else { return }
+        // Idempotent: only proceed when not already mid-session AND no other
+        // start()/stop() is between its first await and its status flip.
+        guard !status.isBusy, !lifecycleTransitionInFlight else { return }
+        lifecycleTransitionInFlight = true
+        defer { lifecycleTransitionInFlight = false }
 
         // Pre-flight: API key for the configured transcription provider. The
         // selection in Settings → Transcription was previously decorative — the
@@ -254,6 +290,11 @@ final class RecorderState {
         // audio whenever screen recording is on; users can still uncheck
         // `systemAudioEnabled` and stay in audio-only mode to opt out.
         let systemAudioEnabled = settings.systemAudioEnabled || screenEnabled
+        let speakerEchoWarning = RecordingStartWarningPolicy.speakerEchoWarning(
+            systemAudioEnabled: systemAudioEnabled,
+            echoCancellationEnabled: settings.echoCancellationEnabled,
+            defaultOutputBuiltIn: AudioDevicesSnapshot.defaultOutputIsBuiltIn()
+        )
 
         // Diagnostic: snapshot config + active audio devices before the
         // recording graph is built. Lets the Logs tab show exactly which mic /
@@ -304,6 +345,7 @@ final class RecorderState {
             let config = CaptureSession.Config(
                 micEnabled: true,
                 systemAudioEnabled: systemAudioEnabled,
+                echoCancellationEnabled: settings.echoCancellationEnabled,
                 sessionDir: dir,
                 screenRecordingEnabled: screenEnabled,
                 screenOutputURL: screenEnabled ? dir.appendingPathComponent("screen.mp4") : nil,
@@ -337,16 +379,19 @@ final class RecorderState {
             // provider is configured. Failure to arm is non-fatal — recorder
             // proceeds in batch-only mode (existing post-stop transcript path).
             let liveTee: RecorderLiveTee?
+            let liveSink: (any LivePCMSink)?
             if let liveProvider = settings.makeLiveProvider() {
                 let engine = LiveTranscriptEngine(provider: liveProvider, exporter: LiveWindowExporter())
                 let tee = RecorderLiveTee(engine: engine)
                 liveTee = tee
+                liveSink = SourceFilteredPCMSink(tee, allowedSources: [.mic])
                 Self.recorderLog.info("RecorderState.start: live transcript engine armed")
             } else {
                 liveTee = nil
+                liveSink = nil
             }
 
-            let capture = CaptureSession(config: config, liveSink: liveTee)
+            let capture = CaptureSession(config: config, liveSink: liveSink)
             try await capture.start()
             self.captureSession = capture
 
@@ -374,19 +419,95 @@ final class RecorderState {
                 }
                 Self.recorderLog.warning("RecorderState.start: screen recording failed, continuing audio-only — \(srErr.localizedDescription, privacy: .public)")
             } else {
-                self.screenRecordingWarning = nil
+                self.screenRecordingWarning = speakerEchoWarning
             }
 
             await liveTee?.start()
             self.liveTranscriptTee = liveTee
 
-            let meter = MicLevelMeter()
-            try meter.start { [weak self] level in
-                Task { @MainActor [weak self] in
-                    self?.micLevel = level
+            // / invariant I3: when SCStream owns the mic HAL
+            // we must NOT start a second AVAudioEngine just to drive the UI
+            // meter. CaptureSession exposes a cheap EMA-smoothed `micLevel`
+            // computed from the same SCStream PCM buffers; we poll it on the
+            // same ~33 ms cadence that MicLevelMeter used. Audio-only and
+            // macOS 14 paths still use MicLevelMeter because there's no
+            // SCStream client to fight there.
+            let micSource = await capture.activeMicSource
+            if micSource == .scStream {
+                Self.recorderLog.info("RecorderState.start: SCStream mic owns the HAL — skipping MicLevelMeter (single-HAL invariant).")
+                self.micMeter = nil
+                let scStreamCapture = capture
+                self.scStreamMicLevelPollerTask?.cancel()
+                self.scStreamMicLevelPollerTask = Task { @MainActor [weak self] in
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(33))
+                        if Task.isCancelled { break }
+                        guard let self else { break }
+                        let level = await scStreamCapture.micLevel
+                        self.micLevel = level
+                    }
+                }
+            } else {
+                let meter = MicLevelMeter()
+                try meter.start { [weak self] level in
+                    Task { @MainActor [weak self] in
+                        self?.micLevel = level
+                    }
+                }
+                self.micMeter = meter
+            }
+
+            // MicHealth poller: project CaptureSession.micHealth into the
+            // observable surface every 1 s, and trigger the fail-safe stop
+            // the moment we observe `.dead`. `.dead` is
+            // emitted by the CaptureKit classifier ONLY after a 30 s stall
+            // and recovery exhaustion, so waiting another 30 s here put the
+            // total auto-stop budget at ~60 s — twice the invariant. Stopping
+            // on first `.dead` keeps the user-visible budget at the documented
+            // 30 s.
+            self.micFailSafeTriggered = false
+            self.screenDemotedDuringRecording = false
+            self.micHealth = .warmingUp
+            self.micHealthMessage = nil
+            let healthStart = Date()
+            self.micHealthPollerTask = Task { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(1))
+                    if Task.isCancelled { break }
+                    guard let self, let session = self.captureSession else { break }
+                    let h = await session.micHealth
+                    self.micHealth = h
+                    // Mirror tier-2 demotion into the @Observable surface so
+                    // the UI can show the partial-screen warning while the
+                    // session is still running, not only after finalize.
+                    let demoted = await session.tier2DemotedScreenRecording
+                    if demoted && !self.screenDemotedDuringRecording {
+                        self.screenDemotedDuringRecording = true
+                    }
+                    switch h {
+                    case .ok, .muted, .idle, .warmingUp:
+                        self.micHealthMessage = nil
+                    case .degraded(let reason):
+                        self.micHealthMessage = reason
+                    case .dead(let reason):
+                        self.micHealthMessage = reason
+                        Self.recorderLog.error("RecorderState: fail-safe auto-stop on first .dead observation (reason: \(reason, privacy: .public)). The classifier emits .dead only after 30 s of stall + recovery exhaustion, so total elapsed from mic stall ≈ 30 s. Elapsed since recording start: \(Int(Date().timeIntervalSince(healthStart)), privacy: .public)s")
+                        self.micFailSafeTriggered = true
+                        // Fire stop() from a fresh unstructured task and end
+                        // the poller: stop() cancels micHealthPollerTask —
+                        // i.e. THIS task — so awaiting stop() inline would
+                        // run the entire post-stop pipeline (URLSession
+                        // transcription, asset loads, retry sleeps) under
+                        // cooperative cancellation and fail it with
+                        // "cancelled". Unstructured Tasks don't inherit
+                        // cancellation from their spawning task.
+                        Task { @MainActor [weak self] in
+                            await self?.stop()
+                        }
+                        return
+                    }
                 }
             }
-            self.micMeter = meter
 
             // Mic-silence watchdog: every 5 s, log the current mic level so
             // the user can verify in Settings → Logs that the mic actually
@@ -435,7 +556,21 @@ final class RecorderState {
 
     /// Stop recording, finalize segments, run Whisper, persist transcript.
     func stop() async {
-        guard case .recording(let sessionId) = status else { return }
+        // Reentrancy gate: a fail-safe auto-stop racing a user stop must not
+        // double-enter — caller B would see captureSession == nil, get zero
+        // segments, and clobber `status` with .failed while caller A is mid-
+        // transcription. The flag is set synchronously before the first await.
+        guard case .recording(let sessionId) = status,
+              !lifecycleTransitionInFlight else { return }
+        lifecycleTransitionInFlight = true
+        defer { lifecycleTransitionInFlight = false }
+
+        // Read capture-side flags BEFORE we tear the session down: tier-2
+        // demotion of screen recording must be persisted onto
+        // the session record so the Library row can show "screen video
+        // stopped mid-session" — the supervisor's flag goes away with the
+        // CaptureSession reference and there is no other source of truth.
+        let tier2Demoted = (await captureSession?.tier2DemotedScreenRecording) ?? false
 
         // Tear down capture + meter regardless of what happens next.
         let segments: [URL]
@@ -447,22 +582,66 @@ final class RecorderState {
         captureSession = nil
         micMeter?.stop()
         micMeter = nil
+        scStreamMicLevelPollerTask?.cancel()
+        scStreamMicLevelPollerTask = nil
         micLevel = 0
         micWatchdogTask?.cancel()
         micWatchdogTask = nil
+        micHealthPollerTask?.cancel()
+        micHealthPollerTask = nil
+        micHealth = .idle
         sleepAssertion.release()
         await cameraBubbleController.hide()
         clearLiveTranscript()
 
+        if tier2Demoted {
+            self.screenDemotedDuringRecording = true
+        }
+
         guard !segments.isEmpty else {
-            self.status = .failed(message: "No audio captured (check Microphone permission in System Settings).")
+            let msg = micFailSafeTriggered
+                ? "Recording auto-stopped: mic stopped delivering audio. Likely an audio HAL conflict (Bluetooth disconnect, screen-recording HAL race, or device pull). Try again — the SCStream mic path should be more resilient on macOS 15+."
+                : "No audio captured (check Microphone permission in System Settings)."
+            self.status = .failed(message: msg)
             return
+        }
+        if micFailSafeTriggered {
+            // Recording was auto-stopped mid-session because mic died and
+            // could not be recovered. We still have N seconds of audio that
+            // captured before the failure; finalize and surface a warning so
+            // the user sees the row is incomplete.
+            self.screenRecordingWarning = "Mic stopped delivering audio mid-session; recording was auto-stopped. Captured up to the failure point."
+        } else if tier2Demoted {
+            // tier-2 fallback succeeded — we kept the mic
+            // alive but the screen capture is partial. Surface a distinct
+            // copy from the mic fail-safe so the user knows screen video
+            // stopped, not audio.
+            self.screenRecordingWarning = "Screen capture stopped mid-session; recording continued audio-only after the fallback. Screen video is partial."
         }
 
         self.status = .transcribing(sessionId: sessionId)
 
         do {
             let dir = await sessionStore.sessionDir(for: sessionId)
+
+            // persist a sidecar tag whenever tier-2 fallback
+            // demoted screen recording mid-session. The Library row reads
+            // this to show "screen video is partial" instead of the generic
+            // post-process partial message — capture warnings are about the
+            // recording itself, post-process warnings are about optional
+            // cleanup/summary stages, and the two should not collapse to the
+            // same help text.
+            // The mic fail-safe is the more severe signal, so it wins the
+            // sidecar when both fired in the same session.
+            if micFailSafeTriggered {
+                let sidecar = dir.appendingPathComponent("capture-warning.txt")
+                let message = "mic-failsafe: mic stopped delivering audio mid-session; recording was auto-stopped. Audio is captured up to the failure point."
+                try? Data(message.utf8).write(to: sidecar, options: .atomic)
+            } else if tier2Demoted {
+                let sidecar = dir.appendingPathComponent("capture-warning.txt")
+                let message = "screen-demoted: screen capture stopped mid-session; recording continued audio-only after the fallback. Screen video is partial."
+                try? Data(message.utf8).write(to: sidecar, options: .atomic)
+            }
 
             // Concatenate .m4a segments into a single audio.m4a via AVMutableComposition.
             let orphan = RecoveryService.OrphanSession(
@@ -553,11 +732,15 @@ final class RecorderState {
             // `transcript.timestamped.txt` preserves [HH:MM:SS] anchors per
             // raw segment so the Library player / chat can scrub by moment.
             try? await store.writeTimestamped()
-            // Track whether any opt-in enhancement step degraded silently.
-            // Audit §4.2 flagged that the user had no visible cue when an
-            // opted-in feature didn't run — `partial` surfaces that in the
-            // Library row.
-            var enhancement: SessionEnhancementStatus = .ok
+            // Track whether any opt-in enhancement step degraded silently —
+            // `partial` surfaces that in the Library row. Also seed `partial`
+            // when tier-2 fallback demoted screen recording mid-session: the
+            // screen.mp4 the user gets is truncated, and the Library row
+            // should reflect that even if every post-stop enhancement succeeded.
+            // Same for the mic fail-safe: the audio itself is truncated at the
+            // failure point, which is the definition of a partial session.
+            var enhancement: SessionEnhancementStatus =
+                (tier2Demoted || micFailSafeTriggered) ? .partial : .ok
             if settings.transcriptCleanupEnabled, cleanedText != result.text {
                 let rawURL = dir.appendingPathComponent("transcript.raw.txt")
                 try? AtomicWriter.write(Data(result.text.utf8), to: rawURL)
@@ -710,9 +893,14 @@ final class RecorderState {
         }
         micMeter?.stop()
         micMeter = nil
+        scStreamMicLevelPollerTask?.cancel()
+        scStreamMicLevelPollerTask = nil
         micLevel = 0
         micWatchdogTask?.cancel()
         micWatchdogTask = nil
+        micHealthPollerTask?.cancel()
+        micHealthPollerTask = nil
+        micHealth = .idle
         sleepAssertion.release()
         await cameraBubbleController.hide()
         clearLiveTranscript()

@@ -32,8 +32,8 @@ private actor RecorderLiveTeeEngineBox {
 
     await tee.start()
     let buffer = try #require(makeBuffer(frameCount: 1_600, sampleRate: 16_000))
-    await tee.receive(buffer, at: 0)
-    await tee.receive(buffer, at: 0)
+    await tee.receive(buffer, at: 0, source: .mic)
+    await tee.receive(buffer, at: 0, source: .mic)
 
     let ingests = await box.ingests
     #expect(ingests.count == 2)

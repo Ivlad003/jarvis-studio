@@ -94,7 +94,8 @@ actor TestPCMSink: LivePCMSink {
     
     private(set) var receivedBuffers: [RecordedBuffer] = []
     
-    func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64) async {
+    func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64, source: LivePCMSource) async {
+        _ = source
         // Store key properties rather than the buffer itself (AVAudioPCMBuffer isn't Sendable)
         receivedBuffers.append(RecordedBuffer(frameLength: buffer.frameLength, hostTime: hostTime))
     }
@@ -122,7 +123,8 @@ final class BlockingTestPCMSink: @unchecked Sendable, LivePCMSink {
         self.delay = delay
     }
 
-    func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64) async {
+    func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64, source: LivePCMSource) async {
+        _ = source
         stateQueue.sync { _startedCount += 1 }
 
         try? await Task.sleep(for: delay)
@@ -156,8 +158,9 @@ actor TaggedIndexPCMSink: LivePCMSink {
         self.delay = delay
     }
 
-    func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64) async {
+    func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64, source: LivePCMSource) async {
         _ = hostTime
+        _ = source
         if delay > .zero {
             try? await Task.sleep(for: delay)
         }

@@ -171,7 +171,7 @@ public final class OpenRouterAudioProvider: BatchTranscriptionProvider, Sendable
             "temperature": 0.0,
             // OpenRouter passes through; some models don't honor very large maxTokens
             // but 16k is enough for most multi-hour transcripts.
-            "max_tokens": 16384,
+            "max_completion_tokens": 16384,
             "response_format": ["type": "json_object"],
         ]
     }

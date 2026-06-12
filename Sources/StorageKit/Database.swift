@@ -238,6 +238,10 @@ public actor AppDatabase {
 
     public func indexTranscript(sid: String, text: String) async throws {
         try await pool.write { db in
+            // Delete any prior rows for this sid first so re-indexing is
+            // idempotent — a bare INSERT would accumulate duplicate FTS rows
+            // (same pattern deleteSession uses).
+            try db.execute(sql: "DELETE FROM transcripts_fts WHERE sid = ?", arguments: [sid])
             try db.execute(
                 sql: "INSERT INTO transcripts_fts (sid, text) VALUES (?, ?)",
                 arguments: [sid, text]
@@ -245,12 +249,16 @@ public actor AppDatabase {
         }
     }
 
-    /// Full-text search. Returns up to `limit` hits with a snippet from the matching text.
+    /// Full-text search. Returns up to `limit` hits with a snippet from the
+    /// matching text, ordered best-match-first (FTS5 BM25 rank ascending).
     public func searchTranscripts(query: String, limit: Int = 50) async throws -> [SearchHit] {
         // Build a safe FTS5 pattern from user input; bail early on blank input.
         guard let pattern = FTS5Pattern(matchingAllTokensIn: query) else { return [] }
         return try await pool.read { db in
             // snippet() col index 1 = the "text" column (0-based, sid is col 0).
+            // ORDER BY rank is load-bearing: without it FTS5 returns rows in
+            // arbitrary order, and callers (ChatState auto-context, Library)
+            // treat the returned order as relevance order.
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -258,6 +266,7 @@ public actor AppDatabase {
                            snippet(transcripts_fts, 1, '<b>', '</b>', '…', 10) AS snip
                     FROM transcripts_fts
                     WHERE transcripts_fts MATCH ?
+                    ORDER BY rank
                     LIMIT ?
                     """,
                 arguments: [pattern.rawPattern, limit]

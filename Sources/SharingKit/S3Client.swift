@@ -8,25 +8,29 @@ import Foundation
 public struct S3Client: Sendable {
 
     public typealias HTTPClient = @Sendable (URLRequest, Data?) async throws -> (Data, URLResponse)
+    public typealias FileHTTPClient = @Sendable (URLRequest, URL) async throws -> (Data, URLResponse)
 
     public let endpoint: URL          // e.g. https://s3.amazonaws.com or https://<account>.r2.cloudflarestorage.com
     public let region: String         // e.g. us-east-1 / auto
     public let bucket: String
     public let credentials: SigV4.Credentials
     public let httpClient: HTTPClient
+    public let fileHTTPClient: FileHTTPClient
 
     public init(
         endpoint: URL,
         region: String,
         bucket: String,
         credentials: SigV4.Credentials,
-        httpClient: @escaping HTTPClient = S3Client.defaultHTTPClient
+        httpClient: @escaping HTTPClient = S3Client.defaultHTTPClient,
+        fileHTTPClient: @escaping FileHTTPClient = S3Client.defaultFileHTTPClient
     ) {
         self.endpoint = endpoint
         self.region = region
         self.bucket = bucket
         self.credentials = credentials
         self.httpClient = httpClient
+        self.fileHTTPClient = fileHTTPClient
     }
 
     public static let defaultHTTPClient: HTTPClient = { request, body in
@@ -39,10 +43,35 @@ public struct S3Client: Sendable {
         return try await URLSession.shared.data(for: req)
     }
 
+    public static let defaultFileHTTPClient: FileHTTPClient = { request, fileURL in
+        var req = request
+        req.httpBody = nil
+        return try await URLSession.shared.upload(for: req, fromFile: fileURL)
+    }
+
     /// Build the URL for a key under this bucket. Uses path-style addressing
     /// (https://endpoint/bucket/key) which works across all S3-compatibles.
     public func objectURL(key: String) -> URL {
-        endpoint
+        guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
+            return endpoint
+                .appendingPathComponent(bucket, isDirectory: true)
+                .appendingPathComponent(key)
+        }
+
+        let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let encodedBucket = SigV4.awsEncode(bucket, encodeSlash: true)
+        let encodedKey = SigV4.awsEncode(key, encodeSlash: false)
+
+        var path = "/"
+        if !basePath.isEmpty {
+            path += basePath + "/"
+        }
+        path += encodedBucket
+        if !encodedKey.isEmpty {
+            path += "/" + encodedKey
+        }
+        components.percentEncodedPath = path
+        return components.url ?? endpoint
             .appendingPathComponent(bucket, isDirectory: true)
             .appendingPathComponent(key)
     }
@@ -59,24 +88,67 @@ public struct S3Client: Sendable {
         contentType: String = "application/octet-stream",
         now: Date = Date()
     ) async throws -> URL {
+        let payloadHash = SigV4.sha256Hex(data)
+        let request = try signedPutRequest(
+            key: key,
+            payloadHash: payloadHash,
+            contentLength: Int64(data.count),
+            contentType: contentType,
+            now: now
+        )
+
+        let (responseData, response) = try await httpClient(request, data)
+        try validatePutResponse(data: responseData, response: response)
+        return request.url!
+    }
+
+    /// Upload a file without loading the whole artifact into memory. The file
+    /// is hashed in bounded chunks for SigV4, then URLSession streams it from
+    /// disk via `upload(for:fromFile:)`.
+    @discardableResult
+    public func putObject(
+        key: String,
+        fileURL: URL,
+        contentType: String = "application/octet-stream",
+        now: Date = Date()
+    ) async throws -> URL {
+        let payloadHash = try SigV4.sha256Hex(fileURL: fileURL)
+        let contentLength = try fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize.map(Int64.init) ?? 0
+        let request = try signedPutRequest(
+            key: key,
+            payloadHash: payloadHash,
+            contentLength: contentLength,
+            contentType: contentType,
+            now: now
+        )
+
+        let (responseData, response) = try await fileHTTPClient(request, fileURL)
+        try validatePutResponse(data: responseData, response: response)
+        return request.url!
+    }
+
+    private func signedPutRequest(
+        key: String,
+        payloadHash: String,
+        contentLength: Int64,
+        contentType: String,
+        now: Date
+    ) throws -> URLRequest {
         let url = objectURL(key: key)
         guard let host = url.host else { throw S3Error.invalidEndpoint }
 
         let amzDate = SigV4.amzDateTime(now)
-        let payloadHash = SigV4.sha256Hex(data)
-
         var headers: [String: String] = [
             "host": host,
             "x-amz-date": amzDate,
             "x-amz-content-sha256": payloadHash,
             "content-type": contentType,
-            "content-length": "\(data.count)",
+            "content-length": "\(contentLength)",
         ]
 
-        let path = url.path  // already includes /bucket/key
         let canonical = SigV4.canonicalize(
             method: "PUT",
-            path: path,
+            path: url.path,
             query: [],
             headers: headers,
             payloadHash: payloadHash
@@ -95,22 +167,22 @@ public struct S3Client: Sendable {
             service: "s3"
         )
         let scope = "\(SigV4.amzDateOnly(now))/\(region)/s3/aws4_request"
-        let auth = "AWS4-HMAC-SHA256 Credential=\(credentials.accessKeyId)/\(scope), SignedHeaders=\(canonical.signedHeaders), Signature=\(sig)"
-        headers["authorization"] = auth
+        headers["authorization"] = "AWS4-HMAC-SHA256 Credential=\(credentials.accessKeyId)/\(scope), SignedHeaders=\(canonical.signedHeaders), Signature=\(sig)"
 
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
         for (k, v) in headers {
             request.setValue(v, forHTTPHeaderField: k)
         }
+        return request
+    }
 
-        let (responseData, response) = try await httpClient(request, data)
+    private func validatePutResponse(data responseData: Data, response: URLResponse) throws {
         guard let http = response as? HTTPURLResponse else { throw S3Error.nonHTTPResponse }
         if !(200..<300).contains(http.statusCode) {
             let body = String(data: responseData, encoding: .utf8) ?? "<unreadable>"
             throw S3Error.httpStatus(http.statusCode, body)
         }
-        return url
     }
 
     // MARK: - Presigned GET

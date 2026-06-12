@@ -7,7 +7,7 @@ private let segmentWriterLog = Logger(subsystem: "dev.kosmonotes.studio", catego
 // MARK: - AudioSource
 
 /// Identifies which capture source produced a PCM buffer.
-public enum AudioSource: Sendable {
+public enum AudioSource: Sendable, Equatable, Hashable {
     /// Microphone input (track 0 in the segment .m4a).
     case mic
     /// System audio (whole-system SCKit mixdown — track 1 in the segment .m4a).
@@ -68,6 +68,10 @@ public actor SegmentWriter {
     /// `markAsFinished()`. Without this, the second task's append hits
     /// `_transitionToClientInitiatedTerminalStatus` and aborts the process.
     private var finalizing: Bool = false
+    /// Once `close()` has been requested, this writer is terminal. Late
+    /// producer tasks may still call `append()` after stop teardown; they must
+    /// not reopen a fresh segment behind the caller's back.
+    private var closed: Bool = false
 
     // MARK: Init
 
@@ -113,6 +117,11 @@ public actor SegmentWriter {
 
     /// Append a PCM buffer from the given source. Opens a new segment if needed.
     public func append(_ pcmBuffer: AVAudioPCMBuffer, source: AudioSource) async throws {
+        if closed {
+            segmentWriterLog.debug("SegmentWriter.append: writer already closed; dropping late buffer")
+            return
+        }
+
         // While the previous segment is still being finalized (the
         // `await writer.finishWriting()` suspension below in
         // `finalizeCurrentSegment`), the actor allows queued `append` calls
@@ -162,6 +171,7 @@ public actor SegmentWriter {
 
     /// Finalize the current segment and return all segment paths (in order).
     public func close() async throws -> [URL] {
+        closed = true
         try await finalizeCurrentSegment()
         return segmentPaths
     }

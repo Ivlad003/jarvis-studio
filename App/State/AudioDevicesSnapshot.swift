@@ -42,6 +42,14 @@ enum AudioDevicesSnapshot {
         defaultDeviceName(selector: kAudioHardwarePropertyDefaultOutputDevice)
     }
 
+    /// True when the default output is the built-in speaker route.
+    static func defaultOutputIsBuiltIn() -> Bool {
+        guard let deviceID = defaultDeviceID(selector: kAudioHardwarePropertyDefaultOutputDevice) else {
+            return false
+        }
+        return transportType(of: deviceID) == kAudioDeviceTransportTypeBuiltIn
+    }
+
     /// Default input device name via Core Audio HAL — useful as a cross-check
     /// against `AVCaptureDevice.default(for: .audio)` when the two disagree
     /// (rare, but happens when an app overrides input via AVAudioEngine).
@@ -62,6 +70,23 @@ enum AudioDevicesSnapshot {
     // MARK: - HAL helpers
 
     private static func defaultDeviceName(selector: AudioObjectPropertySelector) -> String? {
+        guard let deviceID = defaultDeviceID(selector: selector) else { return nil }
+
+        var name: CFString = "" as CFString
+        var nameSize = UInt32(MemoryLayout<CFString>.size)
+        var nameAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let nameStatus = withUnsafeMutablePointer(to: &name) { ptr in
+            AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &nameSize, ptr)
+        }
+        guard nameStatus == noErr else { return nil }
+        return name as String
+    }
+
+    private static func defaultDeviceID(selector: AudioObjectPropertySelector) -> AudioDeviceID? {
         var deviceID = AudioDeviceID(0)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         var addr = AudioObjectPropertyAddress(
@@ -78,18 +103,19 @@ enum AudioDevicesSnapshot {
             &deviceID
         )
         guard getStatus == noErr, deviceID != 0 else { return nil }
+        return deviceID
+    }
 
-        var name: CFString = "" as CFString
-        var nameSize = UInt32(MemoryLayout<CFString>.size)
-        var nameAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioObjectPropertyName,
+    private static func transportType(of deviceID: AudioDeviceID) -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        let nameStatus = withUnsafeMutablePointer(to: &name) { ptr in
-            AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &nameSize, ptr)
-        }
-        guard nameStatus == noErr else { return nil }
-        return name as String
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport)
+        guard status == noErr else { return 0 }
+        return transport
     }
 }

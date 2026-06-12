@@ -41,6 +41,13 @@ public actor CoreAudioTap {
     /// instances of those bundles to PIDs (apps not running at start time are
     /// silently skipped — there's no "wait for app to launch" semantics in v1.0).
     public func start(bundleIDs: [String]) async throws -> sending AsyncStream<AVAudioPCMBuffer> {
+        if engine != nil
+            || continuation != nil
+            || tapID != kAudioObjectUnknown
+            || aggregateID != kAudioObjectUnknown {
+            await stop()
+        }
+
         let pids = Self.resolvePIDs(for: bundleIDs)
         guard !pids.isEmpty else { throw CoreAudioTapError.noMatchingProcesses }
 
@@ -90,7 +97,7 @@ public actor CoreAudioTap {
 
         // Attach AVAudioEngine input to the aggregate device. The engine is the
         // simplest path to get PCM buffers out of an arbitrary AudioDeviceID.
-        let (asyncStream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (asyncStream, cont) = AudioPCMBufferStream.makeStream()
         self.continuation = cont
 
         let engine = AVAudioEngine()

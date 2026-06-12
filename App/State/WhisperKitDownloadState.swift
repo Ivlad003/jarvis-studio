@@ -39,6 +39,7 @@ final class WhisperKitDownloadState {
     // MARK: - Dependencies
 
     private let manager: WhisperKitModelManager
+    private var downloadGeneration = 0
 
     init(manager: WhisperKitModelManager) {
         self.manager = manager
@@ -73,13 +74,26 @@ final class WhisperKitDownloadState {
             return
         }
         lastError = nil
+        downloadGeneration += 1
+        let generation = downloadGeneration
         inFlight = (variant, 0)
-        defer { inFlight = nil }
+        defer {
+            if downloadGeneration == generation {
+                inFlight = nil
+            }
+        }
 
         do {
             try await manager.download(variant: variant) { [weak self] fraction in
                 Task { @MainActor [weak self] in
-                    self?.inFlight = (variant, fraction)
+                    guard let self,
+                          Self.shouldApplyProgress(
+                              callbackGeneration: generation,
+                              currentGeneration: self.downloadGeneration,
+                              callbackVariant: variant,
+                              currentInFlightVariant: self.inFlight?.variant
+                          ) else { return }
+                    self.inFlight = (variant, fraction)
                 }
             }
             // Repopulate downloaded set + sizes after success.
@@ -108,6 +122,15 @@ final class WhisperKitDownloadState {
 
     func isDownloaded(_ variant: String) -> Bool {
         downloadedVariants.contains(variant)
+    }
+
+    static func shouldApplyProgress(
+        callbackGeneration: Int,
+        currentGeneration: Int,
+        callbackVariant: String,
+        currentInFlightVariant: String?
+    ) -> Bool {
+        callbackGeneration == currentGeneration && callbackVariant == currentInFlightVariant
     }
 
     /// Format a size for the UI (e.g. "75 MB", "1.5 GB"). Bytes go through

@@ -20,6 +20,10 @@ import Testing
     )
 )
 struct CaptureSessionTests {
+    private enum TestStartupError: Error {
+        case micBootstrap
+        case tier2MicBootstrap
+    }
 
     private func makeTempDir() throws -> URL {
         let dir = URL.temporaryDirectory.appendingPathComponent("KosmoNotesSessionTests-\(UUID().uuidString)")
@@ -47,6 +51,7 @@ struct CaptureSessionTests {
 
         #expect(config.micEnabled == true)
         #expect(config.systemAudioEnabled == false)
+        #expect(config.echoCancellationEnabled == false)
         #expect(config.sessionDir == dir)
         #expect(config.segmentDurationSeconds == 3.0)
     }
@@ -59,6 +64,7 @@ struct CaptureSessionTests {
         let config = CaptureSession.Config(sessionDir: dir)
         #expect(config.micEnabled == true)
         #expect(config.systemAudioEnabled == false)
+        #expect(config.echoCancellationEnabled == false)
         #expect(config.segmentDurationSeconds == 5.0)
     }
 
@@ -77,6 +83,23 @@ struct CaptureSessionTests {
         let engineConfig = CaptureSession.micAudioEngineConfig(for: config)
         #expect(engineConfig.sampleRate == 24_000)
         #expect(engineConfig.channels == 1)
+        #expect(engineConfig.voiceProcessing == false)
+    }
+
+    @Test("CaptureSession forwards echo cancellation to mic AudioEngine config")
+    func micAudioEngineConfigUsesEchoCancellationFlag() throws {
+        let dir = try makeTempDir()
+        defer { cleanup(dir) }
+
+        let config = CaptureSession.Config(
+            micEnabled: true,
+            systemAudioEnabled: true,
+            echoCancellationEnabled: true,
+            sessionDir: dir
+        )
+
+        let engineConfig = CaptureSession.micAudioEngineConfig(for: config)
+        #expect(engineConfig.voiceProcessing == true)
     }
 
     // MARK: - Direct SegmentWriter-based integration (feeds synthetic buffers)
@@ -180,6 +203,40 @@ struct CaptureSessionTests {
         let paths = try await session.stop()
 
         // No buffers fed, so no completed segments
+        #expect(paths.isEmpty)
+    }
+
+    @Test("CaptureSession failed mic bootstrap tears down partial start resources")
+    func failedMicBootstrapTearsDownPartialStartResources() async throws {
+        let sessionDir = try makeTempDir()
+        defer { cleanup(sessionDir) }
+
+        let config = CaptureSession.Config(
+            micEnabled: true,
+            systemAudioEnabled: false,
+            sessionDir: sessionDir
+        )
+        let session = CaptureSession(
+            config: config,
+            liveSink: nil,
+            testMicStartupError: TestStartupError.micBootstrap
+        )
+
+        do {
+            try await session.start()
+            Issue.record("Expected start() to throw the injected mic bootstrap error")
+        } catch TestStartupError.micBootstrap {
+            // Expected path.
+        } catch {
+            Issue.record("Expected TestStartupError.micBootstrap, got \(error)")
+        }
+
+        let hasResources = await session.hasAllocatedCaptureResourcesForTesting
+        #expect(hasResources == false)
+        let activeMicSource = await session.activeMicSource
+        #expect(activeMicSource == .none)
+
+        let paths = try await session.stop()
         #expect(paths.isEmpty)
     }
 
@@ -412,6 +469,295 @@ struct CaptureSessionTests {
             for i in 1..<indices.count {
                 #expect(indices[i] > indices[i - 1], "Tagged indices should stay in ascending order")
             }
+        }
+    }
+
+    // MARK: - MicHealth surface
+
+    @Test("CaptureSession.micHealth starts in .idle before recording begins")
+    func micHealthStartsIdle() async throws {
+        let dir = try makeTempDir()
+        defer { cleanup(dir) }
+        let config = CaptureSession.Config(
+            micEnabled: true,
+            systemAudioEnabled: false,
+            sessionDir: dir
+        )
+        let session = CaptureSession(config: config)
+        let health = await session.micHealth
+        #expect(health == .idle, "Expected .idle before start, got \(health)")
+    }
+
+    @Test("MicHealth equality covers associated-value reasons")
+    func micHealthEquatable() {
+        #expect(MicHealth.idle == .idle)
+        #expect(MicHealth.ok != .idle)
+        #expect(MicHealth.degraded(reason: "x") == .degraded(reason: "x"))
+        #expect(MicHealth.degraded(reason: "x") != .degraded(reason: "y"))
+        #expect(MicHealth.dead(reason: "x") != .degraded(reason: "x"))
+    }
+
+    // MARK: - MicHealthClassifier (deterministic state machine)
+
+    @Test("Classifier reports muted regardless of stall")
+    func classifierMuted() {
+        let s = MicHealthSnapshot(
+            isMuted: true,
+            everDelivered: true,
+            sinceLastBuffer: 100,
+            sinceStart: 200
+        )
+        #expect(MicHealthClassifier.classify(s) == .muted)
+    }
+
+    @Test("Classifier reports warmingUp before first delivery within grace")
+    func classifierWarmupGrace() {
+        let s = MicHealthSnapshot(
+            isMuted: false,
+            everDelivered: false,
+            sinceLastBuffer: 4,
+            sinceStart: 4
+        )
+        #expect(MicHealthClassifier.classify(s) == .warmingUp)
+    }
+
+    @Test("Classifier reports ok when buffers are recent")
+    func classifierOk() {
+        let s = MicHealthSnapshot(
+            isMuted: false,
+            everDelivered: true,
+            sinceLastBuffer: 0.5,
+            sinceStart: 10
+        )
+        #expect(MicHealthClassifier.classify(s) == .ok)
+    }
+
+    @Test("Classifier transitions to degraded at 5 s of stall")
+    func classifierDegradedAt5s() {
+        let s = MicHealthSnapshot(
+            isMuted: false,
+            everDelivered: true,
+            sinceLastBuffer: 5.0,
+            sinceStart: 30
+        )
+        switch MicHealthClassifier.classify(s) {
+        case .degraded: break
+        default: Issue.record("Expected .degraded at 5s stall")
+        }
+    }
+
+    @Test("Classifier transitions to dead at 30 s of stall")
+    func classifierDeadAt30s() {
+        let s = MicHealthSnapshot(
+            isMuted: false,
+            everDelivered: true,
+            sinceLastBuffer: 30.0,
+            sinceStart: 60
+        )
+        switch MicHealthClassifier.classify(s) {
+        case .dead: break
+        default: Issue.record("Expected .dead at 30s stall — fail-safe trigger threshold")
+        }
+    }
+
+    @Test("Classifier reports dead immediately when tier-2 also failed")
+    func classifierTier2Dead() {
+        let s = MicHealthSnapshot(
+            isMuted: false,
+            everDelivered: true,
+            sinceLastBuffer: 2,
+            sinceStart: 60,
+            scStreamRecoveryGaveUp: true,
+            tier2Attempted: true
+        )
+        switch MicHealthClassifier.classify(s) {
+        case .dead(let reason):
+            #expect(reason.contains("tier-2"), "Tier-2 failure should be reflected in the dead reason; got: \(reason)")
+        default:
+            Issue.record("Expected .dead when both SCStream recovery and tier-2 failed")
+        }
+    }
+
+    @Test("Classifier never re-enters warmingUp after first delivery")
+    func classifierNoReWarmup() {
+        let s = MicHealthSnapshot(
+            isMuted: false,
+            everDelivered: true,
+            sinceLastBuffer: 2,
+            sinceStart: 2
+        )
+        #expect(MicHealthClassifier.classify(s) == .ok)
+    }
+
+    // MARK: - Deterministic invariants (mic source graph + pause/resume)
+
+    @Test("CaptureSession with test mic stream reports activeMicSource == .scStream while recording")
+    func activeMicSourceIsScStreamWithTestStream() async throws {
+        let sessionDir = try makeTempDir()
+        defer { cleanup(sessionDir) }
+
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let config = CaptureSession.Config(
+            micEnabled: true,
+            systemAudioEnabled: false,
+            sessionDir: sessionDir,
+            segmentDurationSeconds: 5.0
+        )
+        let session = CaptureSession(config: config, liveSink: nil, testMicStream: stream)
+
+        let pre = await session.activeMicSource
+        #expect(pre == .none, "Before start, mic source must be .none")
+
+        try await session.start()
+        let during = await session.activeMicSource
+        #expect(during == .scStream, "Test-stream path mirrors the SCStream-mic path; start must flip the enum to .scStream so RecorderState skips MicLevelMeter")
+
+        continuation.finish()
+        _ = try await session.stop()
+
+        let post = await session.activeMicSource
+        #expect(post == .none, "After stop, mic source must reset to .none")
+    }
+
+    @Test("CaptureSession SCStream-mode pause+resume keeps the mic feed task alive")
+    func scStreamModePauseResumeKeepsMicFeedAlive() async throws {
+        let sessionDir = try makeTempDir()
+        defer { cleanup(sessionDir) }
+
+        let sink = TestPCMSink()
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let config = CaptureSession.Config(
+            micEnabled: true,
+            systemAudioEnabled: false,
+            sessionDir: sessionDir,
+            segmentDurationSeconds: 5.0
+        )
+        let session = CaptureSession(config: config, liveSink: sink, testMicStream: stream)
+
+        try await session.start()
+
+        // Pause immediately — before any audio is fed. We're proving the
+        // SCStream feed task survives pause/resume; the pre-pause writer's
+        // segments are out of scope.
+        try await session.pause()
+        let pausedSource = await session.activeMicSource
+        #expect(pausedSource == .scStream, "pause() must leave activeMicSource == .scStream so resume() can rebrand without recreating the iterator")
+
+        try await session.resume()
+        let resumedSource = await session.activeMicSource
+        #expect(resumedSource == .scStream, "resume() must keep the mic source enum on .scStream")
+
+        // Feed three buffers AFTER resume. If pause() were to cancel the
+        // mic task (AsyncStream cannot be re-iterated), no buffer would
+        // reach the live sink — count would stay at 0.
+        for _ in 0..<3 {
+            if let buf = AVAudioPCMBuffer.sineWave(frameCount: 4800) {
+                continuation.yield(buf)
+            }
+        }
+        try await Task.sleep(for: .milliseconds(150))
+
+        let count = await sink.count()
+        #expect(count == 3, "After pause+resume the live sink must still receive buffers from the surviving SCStream mic feed task; got \(count).")
+
+        continuation.finish()
+        _ = try await session.stop()
+
+        let postStop = await session.activeMicSource
+        #expect(postStop == .none, "stop() must reset activeMicSource to .none")
+    }
+
+    @Test("Tier-2 fallback preserves requested mute and marks mic dead when bootstrap fails")
+    func tier2FallbackPreservesMuteAndMarksDeadWhenBootstrapFails() async throws {
+        let sessionDir = try makeTempDir()
+        defer { cleanup(sessionDir) }
+
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let config = CaptureSession.Config(
+            micEnabled: true,
+            systemAudioEnabled: false,
+            sessionDir: sessionDir,
+            segmentDurationSeconds: 5.0
+        )
+        let session = CaptureSession(
+            config: config,
+            liveSink: nil,
+            testMicStream: stream,
+            testTier2MicStartupError: TestStartupError.tier2MicBootstrap
+        )
+
+        try await session.start()
+        await session.setMicMuted(true)
+
+        await session.forceTier2FallbackForTesting(stallSeconds: 6)
+
+        #expect(await session.requestedMicMutedForTesting == true)
+        #expect(await session.tier2MicBootstrapFailedForTesting == true)
+        #expect(await session.activeMicSource == .none)
+        switch await session.micHealth {
+        case .dead(let reason):
+            #expect(reason.contains("tier-2"))
+        default:
+            let health = await session.micHealth
+            Issue.record("Expected .dead after failed tier-2 bootstrap, got \(String(describing: health))")
+        }
+
+        continuation.finish()
+        _ = try await session.stop()
+    }
+
+    // MARK: - ScreenRecorder restart failure surfaces the give-up flag
+
+    @Test("Classifier marks .dead when tier-2 attempted but SCStream recovery is exhausted")
+    func classifierDeadWhenTier2ExhaustedAndSCStreamRecoveryFailed() {
+        // Emulates the post-failed-restart state described by audit issue #4:
+        // ScreenRecorder.restartSCStreamForMicRecovery returned failure, the
+        // tick set micRecoveryGaveUp=true, and CaptureSession's supervisor
+        // already attempted tier-2 (also failed). The classifier MUST collapse
+        // to .dead, not .degraded — otherwise the fail-safe stop never fires.
+        let snap = MicHealthSnapshot(
+            isMuted: false,
+            everDelivered: true,
+            sinceLastBuffer: 2,
+            sinceStart: 60,
+            scStreamRecoveryGaveUp: true,
+            tier2Attempted: true
+        )
+        switch MicHealthClassifier.classify(snap) {
+        case .dead:
+            break
+        default:
+            Issue.record("Expected .dead when scStreamRecoveryGaveUp == true and tier-2 already attempted; got \(MicHealthClassifier.classify(snap)).")
+        }
+    }
+
+    // MARK: - 30s fail-safe budget (classifier emits .dead exactly at 30 s)
+
+    @Test("Fail-safe budget — classifier flips to .dead at exactly the configured deadThreshold")
+    func classifierFailSafeBudgetIs30Seconds() {
+        // Default deadThreshold is 30. We assert the boundary in both
+        // directions so a future tweak (e.g. someone trimming it to 25) is
+        // caught by this test.
+        let just29 = MicHealthSnapshot(
+            isMuted: false,
+            everDelivered: true,
+            sinceLastBuffer: 29.0,
+            sinceStart: 60
+        )
+        switch MicHealthClassifier.classify(just29) {
+        case .degraded: break
+        default: Issue.record("29 s of stall must be .degraded, not .dead")
+        }
+
+        let at30 = MicHealthSnapshot(
+            isMuted: false,
+            everDelivered: true,
+            sinceLastBuffer: 30.0,
+            sinceStart: 60
+        )
+        switch MicHealthClassifier.classify(at30) {
+        case .dead: break
+        default: Issue.record("30 s of stall must be .dead — RecorderState stops on first .dead so total budget == this threshold")
         }
     }
 }

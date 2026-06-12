@@ -33,14 +33,23 @@ enum MigrationService {
 
     /// Top-level entry. Called once from `applicationDidFinishLaunching`
     /// before any subsystem reads from Keychain or the AppSupport folder.
-    static func runIfNeeded() {
-        if UserDefaults.standard.bool(forKey: didMigrateKey) {
+    static func runIfNeeded(
+        defaults: UserDefaults = .standard,
+        appSupportRoot: URL? = nil,
+        documentsRoot: URL? = nil,
+        migrateKeychain: () -> Bool = MigrationService.migrateKeychain
+    ) {
+        if defaults.bool(forKey: didMigrateKey) {
             return
         }
-        migrateAppSupport()
-        migrateAgentWorkspace()
-        migrateKeychain()
-        UserDefaults.standard.set(true, forKey: didMigrateKey)
+        let appSupportOK = migrateAppSupport(root: appSupportRoot)
+        let agentWorkspaceOK = migrateAgentWorkspace(root: documentsRoot)
+        let keychainOK = migrateKeychain()
+        guard appSupportOK, agentWorkspaceOK, keychainOK else {
+            migrationLog.error("MigrationService: JarvisNote → KosmoNotes rename incomplete; will retry on next launch")
+            return
+        }
+        defaults.set(true, forKey: didMigrateKey)
         migrationLog.info("MigrationService: completed JarvisNote → KosmoNotes rename")
     }
 
@@ -49,42 +58,51 @@ enum MigrationService {
     /// `~/Library/Application Support/JarvisNote/` → `…/KosmoNotes/`. Skips
     /// if the new dir already exists (don't clobber a fresh install) or the
     /// old dir is absent (clean install on this machine).
-    private static func migrateAppSupport() {
+    private static func migrateAppSupport(root injectedRoot: URL? = nil) -> Bool {
         let fm = FileManager.default
-        guard let appSupport = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true) else {
-            return
+        let appSupport: URL
+        if let injectedRoot {
+            appSupport = injectedRoot
+        } else if let resolved = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true) {
+            appSupport = resolved
+        } else {
+            return false
         }
         let oldURL = appSupport.appendingPathComponent(Const.oldAppSupportDir, isDirectory: true)
         let newURL = appSupport.appendingPathComponent(Const.newAppSupportDir, isDirectory: true)
 
-        guard fm.fileExists(atPath: oldURL.path) else { return }
+        guard fm.fileExists(atPath: oldURL.path) else { return true }
         if fm.fileExists(atPath: newURL.path) {
             migrationLog.info("MigrationService: \(newURL.path, privacy: .public) already exists — skipping AppSupport move")
-            return
+            return true
         }
         do {
             try fm.moveItem(at: oldURL, to: newURL)
             migrationLog.info("MigrationService: moved \(oldURL.path, privacy: .public) → \(newURL.path, privacy: .public)")
+            return true
         } catch {
             migrationLog.error("MigrationService: AppSupport move failed — \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
     /// `~/Documents/JarvisNote-agent/` → `…/KosmoNotes-agent/`. Same rules.
     /// User-set workspace overrides (AppSettings.agentWorkspaceFolder) are
     /// untouched — only the default location.
-    private static func migrateAgentWorkspace() {
+    private static func migrateAgentWorkspace(root injectedRoot: URL? = nil) -> Bool {
         let fm = FileManager.default
-        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first
+        let docs = injectedRoot ?? fm.urls(for: .documentDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents")
         let oldURL = docs.appendingPathComponent(Const.oldAgentDocsDir, isDirectory: true)
         let newURL = docs.appendingPathComponent(Const.newAgentDocsDir, isDirectory: true)
-        guard fm.fileExists(atPath: oldURL.path), !fm.fileExists(atPath: newURL.path) else { return }
+        guard fm.fileExists(atPath: oldURL.path), !fm.fileExists(atPath: newURL.path) else { return true }
         do {
             try fm.moveItem(at: oldURL, to: newURL)
             migrationLog.info("MigrationService: moved agent workspace \(oldURL.path, privacy: .public) → \(newURL.path, privacy: .public)")
+            return true
         } catch {
             migrationLog.error("MigrationService: agent workspace move failed — \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
@@ -93,7 +111,7 @@ enum MigrationService {
     /// Copy every account from the old Keychain service to the new one,
     /// then delete from old. Skips any account that already has a value
     /// under the new service so a re-run can't blow away a freshly-typed key.
-    private static func migrateKeychain() {
+    private static func migrateKeychain() -> Bool {
         let oldKC = Keychain(service: Const.oldKeychainService).accessibility(.afterFirstUnlockThisDeviceOnly)
         let newKC = Keychain(service: Const.newKeychainService).accessibility(.afterFirstUnlockThisDeviceOnly)
 
@@ -111,6 +129,7 @@ enum MigrationService {
             "s3.secret_access_key",
         ]
 
+        var succeeded = true
         for account in accounts {
             do {
                 if (try newKC.get(account))?.isEmpty == false { continue }
@@ -119,8 +138,10 @@ enum MigrationService {
                 try? oldKC.remove(account)
                 migrationLog.info("MigrationService: migrated keychain entry '\(account, privacy: .public)'")
             } catch {
+                succeeded = false
                 migrationLog.error("MigrationService: keychain '\(account, privacy: .public)' move failed — \(error.localizedDescription, privacy: .public)")
             }
         }
+        return succeeded
     }
 }

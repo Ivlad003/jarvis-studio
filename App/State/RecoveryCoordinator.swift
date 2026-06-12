@@ -22,10 +22,16 @@ final class RecoveryCoordinator {
     private let recoveryService = RecoveryService()
     private let sessionStore: SessionStore
     private let database: AppDatabase
+    private let promptResponseOverride: (([RecoveryService.OrphanSession]) -> NSApplication.ModalResponse)?
 
-    init(sessionStore: SessionStore, database: AppDatabase) {
+    init(
+        sessionStore: SessionStore,
+        database: AppDatabase,
+        promptResponseOverride: (([RecoveryService.OrphanSession]) -> NSApplication.ModalResponse)? = nil
+    ) {
         self.sessionStore = sessionStore
         self.database = database
+        self.promptResponseOverride = promptResponseOverride
     }
 
     /// Scan for orphans; if any exist, prompt the user via a blocking NSAlert.
@@ -42,11 +48,15 @@ final class RecoveryCoordinator {
 
         guard !orphans.isEmpty else { return .noOrphans }
 
-        // Bring app into regular mode so the alert is visible over other windows.
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-
-        let response = showPromptAlert(orphans: orphans)
+        let response: NSApplication.ModalResponse
+        if let promptResponseOverride {
+            response = promptResponseOverride(orphans)
+        } else {
+            // Bring app into regular mode so the alert is visible over other windows.
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            response = showPromptAlert(orphans: orphans)
+        }
         guard response == .alertFirstButtonReturn else { return .userDeclined }
 
         var recovered = 0

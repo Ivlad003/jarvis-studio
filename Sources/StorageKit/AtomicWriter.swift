@@ -27,17 +27,20 @@ public enum AtomicWriter {
             throw AtomicWriterError.writeFailed(underlying: error)
         }
 
-        // fsync the temp file
-        do {
-            let fh = try FileHandle(forWritingTo: tmpURL)
-            defer { try? fh.close() }
-            try fh.synchronize()
-        } catch let e as AtomicWriterError {
+        // fsync the temp file. Use POSIX directly so errno is captured from
+        // the failing syscall rather than guessed from a Foundation throw.
+        let tmpFd = Darwin.open(tmpURL.path, O_RDONLY)
+        if tmpFd == -1 {
+            let e = Foundation.errno
             try? FileManager.default.removeItem(at: tmpURL)
-            throw e
-        } catch {
+            throw AtomicWriterError.fsyncFailed(errno: e)
+        }
+        let tmpFsyncResult = Darwin.fsync(tmpFd)
+        let tmpFsyncErrno = Foundation.errno
+        Darwin.close(tmpFd)
+        if tmpFsyncResult != 0 {
             try? FileManager.default.removeItem(at: tmpURL)
-            throw AtomicWriterError.fsyncFailed(errno: Foundation.errno)
+            throw AtomicWriterError.fsyncFailed(errno: tmpFsyncErrno)
         }
 
         // fsync the parent directory to durably record the future rename
@@ -71,9 +74,14 @@ public enum AtomicWriter {
         // next OS-driven flush could roll back to the old file (or no file at
         // all on first write), undoing what callers thought was committed.
         let dirFd2 = Darwin.open(parentPath, O_RDONLY)
-        if dirFd2 != -1 {
-            _ = Darwin.fsync(dirFd2)
-            Darwin.close(dirFd2)
+        if dirFd2 == -1 {
+            throw AtomicWriterError.parentDirOpenFailed(errno: Foundation.errno)
+        }
+        let postRenameFsyncResult = Darwin.fsync(dirFd2)
+        let postRenameFsyncErrno = Foundation.errno
+        Darwin.close(dirFd2)
+        if postRenameFsyncResult != 0 {
+            throw AtomicWriterError.fsyncFailed(errno: postRenameFsyncErrno)
         }
     }
 

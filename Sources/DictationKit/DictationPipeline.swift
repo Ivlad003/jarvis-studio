@@ -112,10 +112,30 @@ public final class DictationPipeline {
     let eventHook: EventHook?
     let transcriber: Transcriber
     let paster: Paster
+    /// Optional preflight check called at the start of `startRecording`.
+    /// Returning `.micOwnedByActiveRecording` causes start to throw
+    /// `DictationError.micOwnedByActiveRecording` so the caller can show a
+    /// "another recording is using the mic" alert instead of fighting the
+    /// active SCStream/AVAudioEngine for the HAL.
+    let preflight: Preflight?
+
+    /// Preflight outcome the pipeline can act on. We deliberately keep this
+    /// coarse — "ok" or "refuse" — so the caller's check doesn't leak its
+    /// reason all the way into DictationKit.
+    public enum PreflightResult: Sendable, Equatable {
+        case ok
+        case micOwnedByActiveRecording
+    }
+    public typealias Preflight = @Sendable () async -> PreflightResult
 
     // MARK: - Engine state (nonisolated storage via actor-hop-safe box)
 
     private var engineBox: EngineBox? = nil
+    /// 5-second zero-frame watchdog. Lives inside the pipeline rather than
+    /// at the call site so every caller (DictationState, PushToMarkdownState,
+    /// AgentHotkeyState) fails loudly instead of silently pasting an empty
+    /// transcript when the mic engine never delivers a frame.
+    private var watchdogTask: Task<Void, Never>? = nil
 
     /// The URL of the live CAF audio file being written during the current
     /// recording. Non-nil between `startRecording()` and
@@ -123,6 +143,12 @@ public final class DictationPipeline {
     /// The live-adapter path reads this immediately after `startRecording()`
     /// returns to attach the engine before any audio arrives.
     public var currentLiveAudioURL: URL? { engineBox?.liveAudioURL }
+
+    /// Live mic-frame counter exposed for watchdog/UI use during a hold-to-talk
+    /// session. Returns 0 when the engine isn't running. Lets the app layer
+    /// detect "tap installed but no audio arriving" within a few seconds and
+    /// surface a fail-loud error instead of pasting an empty transcript.
+    public var liveSampleCount: Int { engineBox?.sampleCountSnapshot ?? 0 }
 
     // MARK: - Init
 
@@ -137,7 +163,8 @@ public final class DictationPipeline {
         maxDurationSeconds: Int,
         insertionStrategy: DictationInsertionStrategy = .clipboardSimulatedV,
         logger: Logger? = nil,
-        eventHook: EventHook? = nil
+        eventHook: EventHook? = nil,
+        preflight: Preflight? = nil
     ) {
         self.llmProvider = llmProvider
         self.llmModel = llmModel
@@ -151,6 +178,7 @@ public final class DictationPipeline {
         self.paster = { text in
             AccessibilityPaster.paste(text, strategy: strategy)
         }
+        self.preflight = preflight
     }
 
     /// Initializer that injects custom transcription / paste shims. Originally
@@ -165,7 +193,8 @@ public final class DictationPipeline {
         llmModel: String = "claude-sonnet-4-6",
         maxDurationSeconds: Int,
         logger: Logger? = nil,
-        eventHook: EventHook? = nil
+        eventHook: EventHook? = nil,
+        preflight: Preflight? = nil
     ) {
         self.llmProvider = llmProvider
         self.llmModel = llmModel
@@ -174,6 +203,7 @@ public final class DictationPipeline {
         self.eventHook = eventHook
         self.transcriber = transcriber
         self.paster = paster
+        self.preflight = preflight
     }
 
     // MARK: - Signpost helpers
@@ -195,6 +225,18 @@ public final class DictationPipeline {
             if case .failed = status { return true } else { return false }
         }() else { return }
 
+        // refuse to start when the SCStream-mic path of an
+        // active recording owns the audio HAL. Standing up a parallel
+        // AVAudioEngine on the same HAL is exactly the multi-client failure
+        // the always-on capture design forbids.
+        if let preflight = preflight {
+            let outcome = await preflight()
+            if outcome == .micOwnedByActiveRecording {
+                logger?("[DictationPipeline] preflight refused: mic owned by active recording")
+                throw DictationError.micOwnedByActiveRecording
+            }
+        }
+
         // Wipe last-run capture so the consumer never sees stale data from a
         // previous press if startRecording is called twice without a stop.
         lastTranscript = nil
@@ -208,12 +250,49 @@ public final class DictationPipeline {
         engineBox = box
         status = .recording
         logger?("[DictationPipeline] recording started")
+
+        // shared mic-flow watchdog. If the engine delivers
+        // zero frames in the first 5 s, abort loudly so the user sees an
+        // error instead of having the eventual paste land an empty string.
+        // Lives inside the pipeline so PushToMarkdownState and
+        // AgentHotkeyState — neither of which installed their own watchdog
+        // historically — get the protection for free.
+        watchdogTask?.cancel()
+        let pipelineRef = self
+        let boxRef = box
+        watchdogTask = Task { @MainActor [weak pipelineRef] in
+            try? await Task.sleep(for: .seconds(5))
+            if Task.isCancelled { return }
+            guard let p = pipelineRef else { return }
+            // Only fire if we're still in the .recording state — the
+            // caller may have already released and moved past us.
+            guard p.status == .recording else { return }
+            if boxRef.sampleCountSnapshot == 0 {
+                p.logger?("[DictationPipeline] watchdog: 5 s with zero mic frames — aborting")
+                await p.failWatchdog()
+            }
+        }
+    }
+
+    /// Internal: called by the mic-flow watchdog when the 5 s grace window
+    /// elapses with zero mic frames. Tears the engine down and flips status
+    /// to .failed so the caller's status switch surfaces an error rather
+    /// than the empty-transcript paste.
+    func failWatchdog() async {
+        if let box = engineBox {
+            engineBox = nil
+            _ = await box.stop()
+        }
+        watchdogTask = nil
+        status = .failed("Microphone not delivering audio. Check System Settings → Sound → Input.")
     }
 
     /// Stop capture, transcribe, optionally clean with LLM, paste. Updates status throughout.
     public func stopAndProcess() async {
         guard status == .recording, let box = engineBox else { return }
         engineBox = nil
+        watchdogTask?.cancel()
+        watchdogTask = nil
 
         // Encode captured PCM to a temp WAV file
         let pcmData = await box.stop()
@@ -313,6 +392,8 @@ public final class DictationPipeline {
 
     /// Abort capture without processing.
     public func cancel() async {
+        watchdogTask?.cancel()
+        watchdogTask = nil
         if let box = engineBox {
             engineBox = nil
             _ = await box.stop()
@@ -330,6 +411,8 @@ public final class DictationPipeline {
     public func stopCapture() async {
         guard status == .recording, let box = engineBox else { return }
         engineBox = nil
+        watchdogTask?.cancel()
+        watchdogTask = nil
         let pcmData = await box.stop()
         guard !pcmData.isEmpty else {
             status = .failed("No audio captured")
@@ -388,7 +471,7 @@ public final class DictationPipeline {
         pcmData.withUnsafeBytes { rawPtr in
             guard let floatPtr = rawPtr.bindMemory(to: Float.self).baseAddress,
                   let channelData = buffer.floatChannelData else { return }
-            channelData[0].assign(from: floatPtr, count: frameCount)
+            channelData[0].update(from: floatPtr, count: frameCount)
         }
 
         do {
@@ -419,6 +502,11 @@ private final class EngineBox: @unchecked Sendable {
     /// not mutated thereafter. Safe to read from the main actor between
     /// `start()` and `stop()` without locking.
     private(set) var liveAudioURL: URL?
+
+    /// Snapshot of the current sample count for the watchdog. Lock-guarded.
+    var sampleCountSnapshot: Int {
+        lock.withLock { samples.count }
+    }
 
     // 16 kHz mono Float32 — Whisper's preferred format
     private static let sampleRate: Double = 16_000
@@ -519,7 +607,7 @@ private final class EngineBox: @unchecked Sendable {
         var data = Data(count: captured.count * MemoryLayout<Float>.size)
         data.withUnsafeMutableBytes { rawPtr in
             guard let dst = rawPtr.bindMemory(to: Float.self).baseAddress else { return }
-            dst.assign(from: captured, count: captured.count)
+            dst.update(from: captured, count: captured.count)
         }
         return data
     }
@@ -539,6 +627,20 @@ private final class EngineBox: @unchecked Sendable {
 
 // MARK: - Errors
 
-public enum DictationError: Error, Sendable {
+public enum DictationError: Error, LocalizedError, Sendable {
     case formatCreationFailed
+    /// Returned from `startRecording` when the preflight closure reports
+    /// that an active recording owns the mic HAL via SCStream. Stops
+    /// dictation from standing up a second AVAudioEngine on the same HAL
+    /// (invariant I3).
+    case micOwnedByActiveRecording
+
+    public var errorDescription: String? {
+        switch self {
+        case .formatCreationFailed:
+            return "Could not create AVAudioFormat for PCM source"
+        case .micOwnedByActiveRecording:
+            return "Microphone is in use by an active recording. Stop the recording, then try dictation again."
+        }
+    }
 }

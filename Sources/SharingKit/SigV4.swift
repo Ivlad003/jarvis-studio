@@ -38,6 +38,21 @@ public enum SigV4 {
         sha256Hex(Data(string.utf8))
     }
 
+    /// SHA-256 hex digest for a file, read in bounded chunks so large
+    /// recordings don't need to be loaded into memory just to sign a PUT.
+    public static func sha256Hex(fileURL: URL, chunkSize: Int = 1_048_576) throws -> String {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        while true {
+            let chunk = handle.readData(ofLength: chunkSize)
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
     /// HMAC-SHA256.
     public static func hmacSHA256(_ data: Data, key: Data) -> Data {
         let mac = HMAC<SHA256>.authenticationCode(for: data, using: SymmetricKey(data: key))
@@ -155,9 +170,11 @@ public enum SigV4 {
         }
         let canonicalQuery = joined.joined(separator: "&")
 
-        // Lowercase header keys, trim values, join with newlines, append trailing newline.
+        // Lowercase header keys, trim and compress values, join with newlines,
+        // append trailing newline. SigV4 canonical headers require sequential
+        // spaces/tabs/newlines inside values to collapse to one space.
         let lowered = headers.map { (k, v) -> (String, String) in
-            (k.lowercased(), v.trimmingCharacters(in: .whitespaces))
+            (k.lowercased(), canonicalHeaderValue(v))
         }.sorted { $0.0 < $1.0 }
 
         let canonicalHeaders = lowered
@@ -174,6 +191,12 @@ public enum SigV4 {
             signedHeaders: signedHeaders,
             payloadHash: payloadHash
         )
+    }
+
+    private static func canonicalHeaderValue(_ value: String) -> String {
+        value
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 
     // MARK: - String-to-sign + signature

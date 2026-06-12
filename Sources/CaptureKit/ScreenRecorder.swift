@@ -30,6 +30,16 @@ public actor ScreenRecorder: NSObject {
         public let outputURL: URL
         public let displayID: UInt32
         public let captureSystemAudio: Bool
+        /// macOS 15+: capture mic via SCStream's native microphone output, which
+        /// shares the audio HAL with screen + system audio in one synchronized
+        /// stream. This avoids the AVAudioEngine -10868 cascade (mid-session mic
+        /// loss reported by users — see `_handleSampleBuffer` and the project
+        /// CLAUDE.md history). Ignored on macOS <15. Default false for
+        /// backward compatibility — callers must opt in.
+        public let captureMicrophone: Bool
+        /// Optional UID of the mic device to capture from. Nil uses system
+        /// default input. Only meaningful when `captureMicrophone` is true.
+        public let microphoneDeviceUID: String?
         public let frameRate: Int
         public let scaleFactor: CGFloat
         /// Use HEVC (H.265) instead of H.264. ~50 % smaller at the same quality;
@@ -46,6 +56,8 @@ public actor ScreenRecorder: NSObject {
             outputURL: URL,
             displayID: UInt32 = 0,
             captureSystemAudio: Bool = true,
+            captureMicrophone: Bool = false,
+            microphoneDeviceUID: String? = nil,
             frameRate: Int = 15,
             scaleFactor: CGFloat = 1.0,
             useHEVC: Bool = true,
@@ -56,6 +68,8 @@ public actor ScreenRecorder: NSObject {
             self.outputURL = outputURL
             self.displayID = displayID
             self.captureSystemAudio = captureSystemAudio
+            self.captureMicrophone = captureMicrophone
+            self.microphoneDeviceUID = microphoneDeviceUID
             self.frameRate = frameRate
             self.scaleFactor = scaleFactor
             self.useHEVC = useHEVC
@@ -74,7 +88,60 @@ public actor ScreenRecorder: NSObject {
     private var audioInput: AVAssetWriterInput?
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var streamOutput: ScreenStreamOutput?
+    private var streamDelegate: SCStreamStopDelegate?
     private var firstSampleTime: CMTime?
+
+    /// macOS 15+ SCStream microphone path. Non-nil only when `config.captureMicrophone`
+    /// is true AND the OS supports the API. The recorder yields AVAudioPCMBuffer
+    /// to consumers (CaptureSession → SegmentWriter for audio.m4a mic track) so the
+    /// existing ScreenAudioMixer post-process still adds mic into screen.mp4 by
+    /// pulling track 0 of audio.m4a. No mic track is written into screen.mp4
+    /// directly — that keeps the file layout unchanged.
+    private var micContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+    /// Target PCM format that downstream consumers expect — built from
+    /// `config.audioSampleRate` (typically 48 kHz mono Float32). SCStream's
+    /// mic output arrives at the device's native rate, which is 24 kHz when
+    /// the active mic is a Bluetooth headset / AirPods on HFP/SCO. Without
+    /// the conversion below, every buffer fails SegmentWriter's defense-in-
+    /// depth rate check and the resulting recording has zero mic audio.
+    private var micTargetFormat: AVAudioFormat?
+    /// Lazily-built AVAudioConverter from the SCStream-delivered format to
+    /// `micTargetFormat`. Cached because format probing per-buffer would
+    /// allocate on the audio-callback thread.
+    private var micConverterCache: MicConverterCache?
+    /// Counter incremented every time a mic CMSampleBuffer arrives. Used by the
+    /// mic-flow watchdog (see `micRecoveryTask`).
+    private let micBufferCounter = MicBufferCounter()
+    /// Live mute flag for SCStream mic. Replaces incoming PCM with silence
+    /// before yielding so the writer timeline keeps growing during mute.
+    private let micMuteFlag = TapMuteFlag()
+    /// Recovery supervisor: monitors `micBufferCounter`, restarts SCStream when
+    /// mic samples stall for >5 s. Bounded to 3 attempts per session.
+    private var micRecoveryTask: Task<Void, Never>?
+    private var micRecoveryAttempts: Int = 0
+    /// Incremented whenever start/stop takes ownership of the SCStream lifecycle.
+    /// Restart code checks this after every await so a user stop cannot race a
+    /// recovery restart into creating an ownerless stream.
+    private var streamGeneration: UInt64 = 0
+    private var isStopping = false
+    private let screenSampleQueue = DispatchQueue(
+        label: "dev.kosmonotes.studio.screen-recorder.screen-samples",
+        qos: .userInteractive
+    )
+    private let systemAudioSampleQueue = DispatchQueue(
+        label: "dev.kosmonotes.studio.screen-recorder.system-audio-samples",
+        qos: .userInitiated
+    )
+    private let microphoneSampleQueue = DispatchQueue(
+        label: "dev.kosmonotes.studio.screen-recorder.microphone-samples",
+        qos: .userInitiated
+    )
+    /// Set when the mic recovery watchdog has exhausted its retries. Callers
+    /// (CaptureSession → RecorderState) can surface this to the UI.
+    public private(set) var micRecoveryGaveUp: Bool = false
+    /// Set when SCStream itself reports an external terminal stop, such as the
+    /// macOS Stop Sharing control or system-level stream termination.
+    public private(set) var streamStopError: SCStreamStopFailure?
 
     // MARK: - Init
 
@@ -84,10 +151,21 @@ public actor ScreenRecorder: NSObject {
 
     // MARK: - Public API
 
-    public func start(config: Config) async throws {
+    /// Start screen capture. When `config.captureMicrophone` is true AND the OS
+    /// supports it (macOS 15+), the returned AsyncStream yields mic PCM buffers
+    /// synchronized with the screen + system-audio capture. Returns nil when mic
+    /// capture isn't enabled or isn't available — callers fall back to
+    /// AVAudioEngine.
+    @discardableResult
+    public func start(config: Config) async throws -> sending AsyncStream<AVAudioPCMBuffer>? {
         self.config = config
+        isStopping = false
+        streamGeneration &+= 1
         pendingSampleTasks.open()
-        screenRecorderLog.info("ScreenRecorder.start: outputURL=\(config.outputURL.path, privacy: .public) hevc=\(config.useHEVC, privacy: .public) videoBitrate=\(config.videoBitrate, privacy: .public) audio=\(config.captureSystemAudio, privacy: .public) fps=\(config.frameRate, privacy: .public)")
+        micRecoveryAttempts = 0
+        micRecoveryGaveUp = false
+        streamStopError = nil
+        screenRecorderLog.info("ScreenRecorder.start: outputURL=\(config.outputURL.path, privacy: .public) hevc=\(config.useHEVC, privacy: .public) videoBitrate=\(config.videoBitrate, privacy: .public) audio=\(config.captureSystemAudio, privacy: .public) mic=\(config.captureMicrophone, privacy: .public) fps=\(config.frameRate, privacy: .public)")
 
         let content: SCShareableContent
         do {
@@ -109,7 +187,7 @@ public actor ScreenRecorder: NSObject {
         let height = Int(CGFloat(display.height) * config.scaleFactor)
         screenRecorderLog.info("ScreenRecorder.start: selected displayID=\(display.displayID, privacy: .public) source=\(display.width, privacy: .public)×\(display.height, privacy: .public) → output \(width, privacy: .public)×\(height, privacy: .public)")
 
-        // Configure SCStream for video + optional audio.
+        // Configure SCStream for video + optional audio + optional mic.
         let streamConfig = SCStreamConfiguration()
         streamConfig.width = width
         streamConfig.height = height
@@ -119,6 +197,41 @@ public actor ScreenRecorder: NSObject {
         streamConfig.excludesCurrentProcessAudio = true  // may be ignored on macOS 26+
         streamConfig.sampleRate = config.audioSampleRate
         streamConfig.channelCount = 1
+
+        // Microphone capture via SCStream — macOS 15+ only. When enabled, SCStream
+        // becomes the single client of the audio HAL for both system audio AND
+        // mic, eliminating the AVAudioEngine vs SCStream HAL contention that
+        // caused -10868 cascades and mid-session mic silence.
+        var micStreamReturn: AsyncStream<AVAudioPCMBuffer>? = nil
+        var micCaptureWillRun = false
+        if config.captureMicrophone {
+            if #available(macOS 15.0, *) {
+                streamConfig.captureMicrophone = true
+                if let deviceUID = config.microphoneDeviceUID, !deviceUID.isEmpty {
+                    streamConfig.microphoneCaptureDeviceID = deviceUID
+                }
+                // Drop the oldest mic buffer when downstream stalls (pause, slow
+                // disk). 100 buffers ≈ ~1 s at the typical 10 ms SCStream cadence.
+                let (s, cont) = AudioPCMBufferStream.makeStream()
+                self.micContinuation = cont
+                // Build the target format that downstream (SegmentWriter)
+                // expects. Float32 mono — same shape AudioEngine/DeviceAudioCapture
+                // produce. SCStream often delivers the source at the mic's
+                // native rate (24 kHz on Bluetooth HFP); we convert per-buffer.
+                self.micTargetFormat = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: Double(config.audioSampleRate),
+                    channels: 1,
+                    interleaved: false
+                )
+                self.micConverterCache = MicConverterCache()
+                micStreamReturn = s
+                micCaptureWillRun = true
+                screenRecorderLog.info("ScreenRecorder.start: SCStream microphone capture ENABLED (macOS 15+, deviceUID=\(config.microphoneDeviceUID ?? "default", privacy: .public))")
+            } else {
+                screenRecorderLog.error("ScreenRecorder.start: captureMicrophone requested but OS<macOS 15 — SCStream mic API unavailable. Caller must fall back to AVAudioEngine.")
+            }
+        }
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
 
@@ -182,19 +295,44 @@ public actor ScreenRecorder: NSObject {
         let output = ScreenStreamOutput(recorder: self)
         self.streamOutput = output
 
-        let scStream = SCStream(filter: filter, configuration: streamConfig, delegate: nil)
+        let stopDelegate = SCStreamStopDelegate { [weak self] failure in
+            Task {
+                await self?.recordExternalStreamStop(failure)
+            }
+        }
+        self.streamDelegate = stopDelegate
+
+        let scStream = SCStream(filter: filter, configuration: streamConfig, delegate: stopDelegate)
         do {
-            try scStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+            try scStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: screenSampleQueue)
             if config.captureSystemAudio {
-                try scStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: .global(qos: .userInitiated))
+                try scStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: systemAudioSampleQueue)
+            }
+            if micCaptureWillRun, #available(macOS 15.0, *) {
+                try scStream.addStreamOutput(output, type: .microphone, sampleHandlerQueue: microphoneSampleQueue)
             }
             try await scStream.startCapture()
         } catch {
             screenRecorderLog.error("ScreenRecorder.start: SCStream.startCapture failed — \(error.localizedDescription, privacy: .public)")
+            micContinuation?.finish()
+            micContinuation = nil
+            micTargetFormat = nil
+            micConverterCache = nil
+            streamOutput = nil
+            streamDelegate = nil
             throw error
         }
         self.stream = scStream
         screenRecorderLog.info("ScreenRecorder.start: SCStream capturing, awaiting first frame")
+
+        // Recovery supervisor for mic capture. Only run when SCStream mic is
+        // actually feeding our pipeline — otherwise the watchdog has nothing
+        // to recover. The first mic buffer can take a few hundred ms to arrive
+        // post-startCapture, so the supervisor's grace window must be > that.
+        if micCaptureWillRun {
+            startMicRecoverySupervisor()
+        }
+        return micStreamReturn
     }
 
     private static func selectDisplay(from displays: [SCDisplay], preferredID: UInt32) -> SCDisplay? {
@@ -205,20 +343,52 @@ public actor ScreenRecorder: NSObject {
         return displays.first
     }
 
+    /// Live-toggle mute for the SCStream mic track. No-op when the SCStream
+    /// mic isn't active. Mirrors `AudioEngine.setMuted` so the menu/popover
+    /// can share the toggle path.
+    public func setMicMuted(_ muted: Bool) {
+        micMuteFlag.setMuted(muted)
+    }
+
+    /// True when the SCStream mic is currently muted.
+    public var isMicMuted: Bool {
+        micMuteFlag.isMuted
+    }
+
+    /// Snapshot of mic delivery for diagnostics / external watchdogs.
+    public var micFlowSnapshot: (count: Int, totalFrames: Int) {
+        micBufferCounter.snapshot
+    }
+
     /// Stop capture, finalize the MP4, and return the output URL.
     @discardableResult
     public func stop() async throws -> URL {
-        guard let scStream = stream else {
+        guard writer != nil, config != nil else {
             screenRecorderLog.error("ScreenRecorder.stop: not started")
             throw ScreenRecorderError.notStarted
         }
-        do {
-            try await scStream.stopCapture()
-        } catch {
-            screenRecorderLog.error("ScreenRecorder.stop: SCStream.stopCapture threw — \(error.localizedDescription, privacy: .public) (continuing to finalize writer)")
+        isStopping = true
+        streamGeneration &+= 1
+        defer { isStopping = false }
+        // Cancel mic supervisor BEFORE stopping the stream so it can't race
+        // the teardown with a restart attempt.
+        micRecoveryTask?.cancel()
+        micRecoveryTask = nil
+        if let scStream = stream {
+            do {
+                try await scStream.stopCapture()
+            } catch {
+                screenRecorderLog.error("ScreenRecorder.stop: SCStream.stopCapture threw — \(error.localizedDescription, privacy: .public) (continuing to finalize writer)")
+            }
+        } else {
+            screenRecorderLog.error("ScreenRecorder.stop: stream is nil; finalizing writer from recovery/partial-stop state")
         }
         stream = nil
         streamOutput = nil
+        streamDelegate = nil
+        // Finish the mic AsyncStream so consumers' for-await loops exit cleanly.
+        micContinuation?.finish()
+        micContinuation = nil
 
         guard let w = writer, let cfg = config else { throw ScreenRecorderError.notStarted }
 
@@ -248,11 +418,11 @@ public actor ScreenRecorder: NSObject {
 
     // MARK: - Internal: called from ScreenStreamOutput
 
-    /// Bag of in-flight `_handleSampleBuffer` tasks. The bag is recorded
+    /// Bounded serial `_handleSampleBuffer` dispatcher. Samples are enqueued
     /// synchronously inside the nonisolated entry point (no actor hop), so
-    /// `stop()` can `await` every queued task before tearing down the writer.
-    /// Without this, Tasks queued behind the actor could land *after*
-    /// `writer.finishWriting()` and corrupt the tail of `screen.mp4`.
+    /// `stop()` can wait for already-accepted callbacks before tearing down
+    /// the writer. FIFO dispatch preserves per-output PTS order across the
+    /// async actor hop.
     private let pendingSampleTasks = SCSampleTaskBag()
 
     /// Routes a sample buffer from the stream delegate into the correct writer input.
@@ -265,6 +435,18 @@ public actor ScreenRecorder: NSObject {
         bag.add { [weak self] in
             await self?._handleSampleBuffer(box.buffer, ofType: box.type)
         }
+    }
+
+    func recordExternalStreamStop(_ failure: SCStreamStopFailure) {
+        guard !isStopping else { return }
+        streamStopError = failure
+        micRecoveryGaveUp = true
+        stream = nil
+        streamOutput = nil
+        streamDelegate = nil
+        micContinuation?.finish()
+        micContinuation = nil
+        screenRecorderLog.error("ScreenRecorder: SCStream stopped externally — \(failure.message, privacy: .public)")
     }
 
     private var screenFrameCount: Int = 0
@@ -334,19 +516,364 @@ public actor ScreenRecorder: NSObject {
         case .audio:
             guard let aInput = audioInput, aInput.isReadyForMoreMediaData else { return }
             if let adjusted = sampleBuffer.copyWithAdjustedPTS(offset: firstSampleTime!) {
-                aInput.append(adjusted)
+                let appended = aInput.append(adjusted)
+                if !appended {
+                    screenRecorderLog.error("ScreenRecorder: audio append returned false — writerStatus=\(w.status.rawValue, privacy: .public) error=\(w.error?.localizedDescription ?? "nil", privacy: .public)")
+                }
             }
 
         case .microphone:
-            // Added in macOS 15 SDK — SCStream can emit a synchronized mic
-            // track. We don't enable it (capturesAudio is the only output
-            // type we configure), but the case must exist to keep Swift 6's
-            // exhaustive-switch happy.
-            break
+            // macOS 15+: SCStream emits a synchronized mic track when
+            // `streamConfig.captureMicrophone = true`. The buffer is delivered
+            // alongside screen + system audio with a single HAL client, so
+            // there's no AVAudioEngine / SCStream race. We convert to
+            // AVAudioPCMBuffer and yield to consumers; the existing
+            // ScreenAudioMixer post-process still mixes mic from audio.m4a
+            // into screen.mp4 for playback.
+            guard let cont = micContinuation else { return }
+            guard let pcm = sampleBuffer.toAVAudioPCMBuffer() else {
+                screenRecorderLog.error("ScreenRecorder: mic CMSampleBuffer→AVAudioPCMBuffer conversion failed")
+                return
+            }
+            // Resample / channel-fold to the format downstream consumers
+            // expect. On built-in mics this is a no-op (already 48 kHz mono).
+            // On Bluetooth HFP/SCO (AirPods, headsets) the source is typically
+            // 24 kHz mono and the writer at 48 kHz would otherwise drop every
+            // buffer as a "slow-bassy" rate mismatch.
+            let yieldedBuffer: AVAudioPCMBuffer
+            if let target = micTargetFormat,
+               let cache = micConverterCache,
+               let converted = ScreenRecorder.convertToTargetFormat(
+                   buffer: pcm,
+                   target: target,
+                   cache: cache
+               ) {
+                yieldedBuffer = converted
+            } else {
+                yieldedBuffer = pcm
+            }
+            micBufferCounter.increment(frames: Int(yieldedBuffer.frameLength))
+            if micMuteFlag.isMuted {
+                ScreenRecorder.overwriteWithSilence(yieldedBuffer)
+            }
+            cont.yield(yieldedBuffer)
+            let snapshot = micBufferCounter.snapshot
+            if snapshot.count == 1 || snapshot.count % 200 == 0 {
+                screenRecorderLog.info("ScreenRecorder: mic buffer #\(snapshot.count, privacy: .public) yielded (totalFrames=\(snapshot.totalFrames, privacy: .public))")
+            }
 
         @unknown default:
             break
         }
+    }
+}
+
+// MARK: - Mic recovery supervisor
+
+@available(macOS 12.3, *)
+extension ScreenRecorder {
+    /// Replace PCM samples with zeroes in-place. Used by mute and by recovery
+    /// in case SCStream delivers a malformed buffer mid-restart.
+    fileprivate nonisolated static func overwriteWithSilence(_ buffer: AVAudioPCMBuffer) {
+        let abl = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        for ab in abl {
+            guard let data = ab.mData else { continue }
+            memset(data, 0, Int(ab.mDataByteSize))
+        }
+    }
+
+    /// Mic-flow watchdog. Polls `micBufferCounter` every second; if the count
+    /// hasn't moved for `stallThreshold` consecutive ticks, restarts SCStream
+    /// to recover from a silent HAL stall. Bounded at `maxAttempts` so a
+    /// permanently broken device can't loop forever.
+    fileprivate func startMicRecoverySupervisor() {
+        let stallThreshold = 5  // 5 s without mic samples = stalled
+        let maxAttempts = 3
+        micRecoveryTask?.cancel()
+        let baseline = micBufferCounter.snapshot.count
+        micRecoveryTask = Task { [weak self] in
+            var lastCount = baseline
+            var stalledTicks = 0
+            // Grace window: SCStream's mic sub-component can take 500–1500 ms
+            // post-startCapture to deliver the first buffer. Don't bark during
+            // initial bring-up.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { break }
+                await self?.micRecoveryTick(lastCount: &lastCount, stalledTicks: &stalledTicks, stallThreshold: stallThreshold, maxAttempts: maxAttempts)
+            }
+        }
+        screenRecorderLog.info("ScreenRecorder: mic recovery supervisor started (stallThreshold=\(stallThreshold, privacy: .public)s, maxAttempts=\(maxAttempts, privacy: .public))")
+    }
+
+    /// One supervisor tick. Inout state lives on the Task to avoid actor hops
+    /// per read; restart work is actor-isolated so we don't double-restart.
+    ///
+    /// After the rework for the always-on capture audit, this tick must NEVER
+    /// silently no-op when the stream is gone. The prior version short-circuited
+    /// whenever `stream == nil`, which meant a failed restart that cleared the
+    /// stream left the supervisor idle forever and tier-2 fallback never fired.
+    /// Now we treat `stream == nil` as a terminal recovery error.
+    private func micRecoveryTick(
+        lastCount: inout Int,
+        stalledTicks: inout Int,
+        stallThreshold: Int,
+        maxAttempts: Int
+    ) async {
+        if micRecoveryGaveUp {
+            stalledTicks = 0
+            return
+        }
+        if stream == nil {
+            // A restart attempt cleared the stream and never recreated it.
+            // Without a stream there will never be more mic samples — fail
+            // loudly so CaptureSession's supervisor can schedule tier-2.
+            if !micRecoveryGaveUp {
+                screenRecorderLog.error("ScreenRecorder.micRecovery: stream is nil — restart did not recreate it. Marking recovery as given up so tier-2 fallback can run.")
+                micRecoveryGaveUp = true
+            }
+            stalledTicks = 0
+            return
+        }
+        if micMuteFlag.isMuted {
+            // Muted: SCStream is still delivering buffers and the tap still
+            // increments the counter (we just overwrite with silence). No
+            // stall accounting needed.
+            stalledTicks = 0
+            lastCount = micBufferCounter.snapshot.count
+            return
+        }
+        let current = micBufferCounter.snapshot.count
+        if current != lastCount {
+            lastCount = current
+            stalledTicks = 0
+            return
+        }
+        stalledTicks += 1
+        if stalledTicks < stallThreshold {
+            return
+        }
+        stalledTicks = 0
+        if micRecoveryAttempts >= maxAttempts {
+            if !micRecoveryGaveUp {
+                screenRecorderLog.error("ScreenRecorder.micRecovery: exhausted \(maxAttempts, privacy: .public) restart attempts — giving up. User must stop and restart recording.")
+                micRecoveryGaveUp = true
+            }
+            return
+        }
+        micRecoveryAttempts += 1
+        screenRecorderLog.error("ScreenRecorder.micRecovery: no mic samples for ~\(stallThreshold, privacy: .public)s — attempting SCStream restart (attempt \(self.micRecoveryAttempts, privacy: .public)/\(maxAttempts, privacy: .public))")
+        let restarted = await restartSCStreamForMicRecovery()
+        if !restarted {
+            // The restart cycle could not recreate the SCStream. Don't keep
+            // burning attempts on a permanently broken HAL — flag the recovery
+            // as given up so CaptureSession can demote to tier-2 fallback on
+            // the next tick.
+            if !micRecoveryGaveUp {
+                screenRecorderLog.error("ScreenRecorder.micRecovery: restart attempt \(self.micRecoveryAttempts, privacy: .public)/\(maxAttempts, privacy: .public) failed — giving up so tier-2 fallback can run.")
+                micRecoveryGaveUp = true
+            }
+            return
+        }
+        // Re-baseline AFTER restart so the next tick measures from the new
+        // counter (which may have new buffers already).
+        lastCount = micBufferCounter.snapshot.count
+    }
+
+    /// Stop the current SCStream and start a fresh one with the same Config.
+    /// The mic AsyncStream's continuation is preserved — consumers see no gap
+    /// from their POV; samples just resume after a brief silence.
+    ///
+    /// Returns `true` only when a fresh SCStream is successfully started and
+    /// reassigned to `self.stream`. Any failure path (SCShareableContent throw,
+    /// no display, startCapture throw) returns `false` so the supervisor can
+    /// escalate to tier-2 instead of looping silently with `stream == nil`.
+    @discardableResult
+    private func restartSCStreamForMicRecovery() async -> Bool {
+        guard let cfg = config, let oldStream = stream, !isStopping else { return false }
+        let restartGeneration = streamGeneration
+        do {
+            try await oldStream.stopCapture()
+        } catch {
+            screenRecorderLog.error("ScreenRecorder.micRecovery: stopCapture threw — \(error.localizedDescription, privacy: .public)")
+        }
+        guard !isStopping, restartGeneration == streamGeneration else { return false }
+        stream = nil
+        streamOutput = nil
+        streamDelegate = nil
+
+        // Rebuild SCStreamConfiguration from the cached Config. Don't touch the
+        // writer / continuation — they keep accepting samples from the new stream.
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        } catch {
+            screenRecorderLog.error("ScreenRecorder.micRecovery: SCShareableContent failed during restart — \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+        guard !isStopping, restartGeneration == streamGeneration else { return false }
+        guard let display = Self.selectDisplay(from: content.displays, preferredID: cfg.displayID) else {
+            screenRecorderLog.error("ScreenRecorder.micRecovery: no display available during restart")
+            return false
+        }
+        let width = Int(CGFloat(display.width) * cfg.scaleFactor)
+        let height = Int(CGFloat(display.height) * cfg.scaleFactor)
+
+        let streamConfig = SCStreamConfiguration()
+        streamConfig.width = width
+        streamConfig.height = height
+        streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: Int32(cfg.frameRate))
+        streamConfig.pixelFormat = kCVPixelFormatType_32BGRA
+        streamConfig.capturesAudio = cfg.captureSystemAudio
+        streamConfig.excludesCurrentProcessAudio = true
+        streamConfig.sampleRate = cfg.audioSampleRate
+        streamConfig.channelCount = 1
+        if #available(macOS 15.0, *) {
+            streamConfig.captureMicrophone = cfg.captureMicrophone
+            if let uid = cfg.microphoneDeviceUID, !uid.isEmpty {
+                streamConfig.microphoneCaptureDeviceID = uid
+            }
+        }
+
+        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+        let output = ScreenStreamOutput(recorder: self)
+        self.streamOutput = output
+
+        let stopDelegate = SCStreamStopDelegate { [weak self] failure in
+            Task {
+                await self?.recordExternalStreamStop(failure)
+            }
+        }
+        self.streamDelegate = stopDelegate
+
+        let newStream = SCStream(filter: filter, configuration: streamConfig, delegate: stopDelegate)
+        do {
+            try newStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: screenSampleQueue)
+            if cfg.captureSystemAudio {
+                try newStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: systemAudioSampleQueue)
+            }
+            if cfg.captureMicrophone, #available(macOS 15.0, *) {
+                try newStream.addStreamOutput(output, type: .microphone, sampleHandlerQueue: microphoneSampleQueue)
+            }
+            guard !isStopping, restartGeneration == streamGeneration else {
+                streamOutput = nil
+                streamDelegate = nil
+                return false
+            }
+            try await newStream.startCapture()
+            guard !isStopping, restartGeneration == streamGeneration else {
+                try? await newStream.stopCapture()
+                streamOutput = nil
+                streamDelegate = nil
+                return false
+            }
+            stream = newStream
+            screenRecorderLog.info("ScreenRecorder.micRecovery: SCStream restarted successfully")
+            return true
+        } catch {
+            streamOutput = nil
+            streamDelegate = nil
+            screenRecorderLog.error("ScreenRecorder.micRecovery: SCStream restart failed — \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+}
+
+/// Lock-protected mic buffer counter. Lives at file scope (not nested in the
+/// actor) so it can be incremented from any thread the SCStream delivery queue
+/// uses without an actor hop.
+@available(macOS 12.3, *)
+final class MicBufferCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _count: Int = 0
+    private var _totalFrames: Int = 0
+
+    func increment(frames: Int) {
+        lock.lock()
+        _count += 1
+        _totalFrames += frames
+        lock.unlock()
+    }
+
+    var snapshot: (count: Int, totalFrames: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (_count, _totalFrames)
+    }
+}
+
+// MARK: - MicConverterCache
+
+/// Lazily-built AVAudioConverter cache for the SCStream mic path. Mirrors the
+/// pattern used by `AudioEngine.ConverterCache` and
+/// `DeviceAudioCapture.ConverterCacheRef` so behaviour stays consistent across
+/// the three mic producers. NSLock-guarded because a sample-rate change
+/// mid-session (e.g. Bluetooth profile flip from A2DP→HFP) can still interleave
+/// with reads from the SCStream callback path.
+@available(macOS 12.3, *)
+final class MicConverterCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var converter: AVAudioConverter?
+    private var sourceFormat: AVAudioFormat?
+
+    func converter(from source: AVAudioFormat, to target: AVAudioFormat) -> AVAudioConverter? {
+        lock.lock(); defer { lock.unlock() }
+        if let existing = converter,
+           let cached = sourceFormat,
+           cached.sampleRate == source.sampleRate,
+           cached.channelCount == source.channelCount,
+           cached.commonFormat == source.commonFormat {
+            return existing
+        }
+        let new = AVAudioConverter(from: source, to: target)
+        converter = new
+        sourceFormat = source
+        return new
+    }
+}
+
+// MARK: - ScreenRecorder mic conversion helper
+
+@available(macOS 12.3, *)
+extension ScreenRecorder {
+    /// Resample/channel-fold `buffer` to `target` using `cache`. Returns the
+    /// original buffer when the format already matches (zero-copy fast path),
+    /// the converted buffer on success, or `nil` if the conversion failed.
+    /// `nonisolated static` so it can be unit-tested without instantiating an
+    /// actor or touching SCStream.
+    nonisolated static func convertToTargetFormat(
+        buffer: AVAudioPCMBuffer,
+        target: AVAudioFormat,
+        cache: MicConverterCache
+    ) -> AVAudioPCMBuffer? {
+        let src = buffer.format
+        if src.sampleRate == target.sampleRate
+            && src.channelCount == target.channelCount
+            && src.commonFormat == target.commonFormat {
+            return buffer
+        }
+        guard let converter = cache.converter(from: src, to: target) else {
+            return nil
+        }
+        let frameCapacity = AVAudioFrameCount(
+            Double(buffer.frameLength) * target.sampleRate / src.sampleRate
+        ) + 1
+        guard let converted = AVAudioPCMBuffer(
+            pcmFormat: target,
+            frameCapacity: max(1, frameCapacity)
+        ) else {
+            return nil
+        }
+        var error: NSError?
+        let source = buffer
+        let status = converter.convert(to: converted, error: &error) { _, outStatus in
+            outStatus.pointee = .haveData
+            return source
+        }
+        if status == .error || converted.frameLength == 0 {
+            return nil
+        }
+        return converted
     }
 }
 
@@ -366,35 +893,50 @@ private final class SBBox: @unchecked Sendable {
     }
 }
 
-/// Lock-protected bag of in-flight sample-handler Tasks. Recorded
+/// Lock-protected, bounded FIFO dispatcher for sample-handler work. Recorded
 /// synchronously inside `ScreenRecorder.handleSampleBuffer` (which is
-/// `nonisolated`) so `stop()` can `drain()` and `await` every queued task
-/// before tearing down the writer. Without this, Tasks queued behind the
-/// actor land *after* `writer.finishWriting()` and corrupt the tail of
+/// `nonisolated`) so `stop()` can `drain()` and await every accepted callback
+/// before tearing down the writer. Without this, callbacks queued behind the
+/// actor can land after `writer.finishWriting()` and corrupt the tail of
 /// `screen.mp4`.
 @available(macOS 12.3, *)
 final class SCSampleTaskBag: @unchecked Sendable {
-    private final class Entry {
-        var task: Task<Void, Never>?
+    private struct Worker {
+        let id: UInt64
+        let task: Task<Void, Never>
     }
 
+    private typealias Operation = @Sendable () async -> Void
+
     private let lock = NSLock()
-    private var tasks: [UInt64: Entry] = [:]
-    private var nextID: UInt64 = 0
+    private let maxQueuedOperations: Int
+    private var queue: [Operation] = []
+    private var worker: Worker?
+    private var workerIsExecuting = false
+    private var nextWorkerID: UInt64 = 0
     private var closed = false
+
+    init(maxQueuedOperations: Int = 240) {
+        self.maxQueuedOperations = max(1, maxQueuedOperations)
+    }
 
     var activeTaskCount: Int {
         lock.lock()
-        let count = tasks.count
+        let count = closed ? 0 : queue.count + (workerIsExecuting ? 1 : 0)
         lock.unlock()
         return count
     }
 
     func open() {
         lock.lock()
-        tasks.removeAll()
+        queue.removeAll(keepingCapacity: true)
         closed = false
+        nextWorkerID &+= 1
+        let staleWorker = worker?.task
+        worker = nil
+        workerIsExecuting = false
         lock.unlock()
+        staleWorker?.cancel()
     }
 
     @discardableResult
@@ -405,24 +947,11 @@ final class SCSampleTaskBag: @unchecked Sendable {
             return nil
         }
 
-        let id = nextID
-        nextID &+= 1
-        let entry = Entry()
-        tasks[id] = entry
-        lock.unlock()
-
-        let task = Task<Void, Never> { [weak self] in
-            defer { self?.remove(id: id) }
-            await operation()
+        if queue.count >= maxQueuedOperations {
+            queue.removeFirst(queue.count - maxQueuedOperations + 1)
         }
-
-        lock.lock()
-        guard !closed, tasks[id] === entry else {
-            lock.unlock()
-            task.cancel()
-            return nil
-        }
-        entry.task = task
+        queue.append(operation)
+        let task = ensureWorkerLocked()
         lock.unlock()
         return task
     }
@@ -430,16 +959,51 @@ final class SCSampleTaskBag: @unchecked Sendable {
     func drain() -> [Task<Void, Never>] {
         lock.lock()
         closed = true
-        let out = tasks.values.compactMap(\.task)
-        tasks.removeAll()
+        let out = worker.map { [$0.task] } ?? []
         lock.unlock()
         return out
     }
 
-    private func remove(id: UInt64) {
+    private func ensureWorkerLocked() -> Task<Void, Never> {
+        if let worker {
+            return worker.task
+        }
+
+        nextWorkerID &+= 1
+        let id = nextWorkerID
+        let task = Task<Void, Never> { [weak self] in
+            await self?.runWorker(id: id)
+        }
+        worker = Worker(id: id, task: task)
+        return task
+    }
+
+    private func runWorker(id: UInt64) async {
+        while let operation = nextOperation(for: id) {
+            await operation()
+        }
+    }
+
+    private func nextOperation(for id: UInt64) -> Operation? {
         lock.lock()
-        tasks[id] = nil
-        lock.unlock()
+        defer { lock.unlock() }
+
+        guard let worker, worker.id == id else {
+            return nil
+        }
+        if Task.isCancelled {
+            queue.removeAll(keepingCapacity: true)
+            self.worker = nil
+            workerIsExecuting = false
+            return nil
+        }
+        guard !queue.isEmpty else {
+            self.worker = nil
+            workerIsExecuting = false
+            return nil
+        }
+        workerIsExecuting = true
+        return queue.removeFirst()
     }
 }
 
@@ -505,16 +1069,24 @@ public actor ScreenRecorder: NSObject {
     public struct Config: Sendable {
         public let outputURL: URL
         public let captureSystemAudio: Bool
+        public let captureMicrophone: Bool
+        public let microphoneDeviceUID: String?
         public let frameRate: Int
         public let scaleFactor: CGFloat
-        public init(outputURL: URL, captureSystemAudio: Bool = true, frameRate: Int = 24, scaleFactor: CGFloat = 1.0) {
+        public init(outputURL: URL, captureSystemAudio: Bool = true, captureMicrophone: Bool = false, microphoneDeviceUID: String? = nil, frameRate: Int = 24, scaleFactor: CGFloat = 1.0) {
             self.outputURL = outputURL; self.captureSystemAudio = captureSystemAudio
+            self.captureMicrophone = captureMicrophone; self.microphoneDeviceUID = microphoneDeviceUID
             self.frameRate = frameRate; self.scaleFactor = scaleFactor
         }
     }
+    public private(set) var micRecoveryGaveUp: Bool = false
     public override init() {}
-    public func start(config: Config) async throws { throw ScreenRecorderError.noDisplayAvailable }
+    @discardableResult
+    public func start(config: Config) async throws -> AsyncStream<AVAudioPCMBuffer>? { throw ScreenRecorderError.noDisplayAvailable }
     public func stop() async throws -> URL { throw ScreenRecorderError.noDisplayAvailable }
+    public func setMicMuted(_ muted: Bool) {}
+    public var isMicMuted: Bool { false }
+    public var micFlowSnapshot: (count: Int, totalFrames: Int) { (0, 0) }
     nonisolated func handleSampleBuffer(_ sampleBuffer: CMSampleBuffer, ofType type: SCStreamOutputType) {}
 }
 

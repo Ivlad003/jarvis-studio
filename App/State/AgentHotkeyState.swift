@@ -44,14 +44,23 @@ final class AgentHotkeyState {
 
     private let settings: AppSettings
     private let agentSession: AgentSessionState
+    /// Weak ref to RecorderState so the dictation preflight can refuse to
+    /// start a parallel AVAudioEngine while a meeting recording owns the
+    /// mic HAL.
+    private weak var recorder: RecorderState?
     private var pipeline: DictationPipeline?
     private var liveAdapter: HoldToTalkLiveAdapter?
     private let installer = TriggerHotkeyInstaller(comboName: .agentTrigger, label: "Agent")
     private var triggerChangeObserver: NSObjectProtocol?
 
-    init(settings: AppSettings, agentSession: AgentSessionState) {
+    init(
+        settings: AppSettings,
+        agentSession: AgentSessionState,
+        recorder: RecorderState? = nil
+    ) {
         self.settings = settings
         self.agentSession = agentSession
+        self.recorder = recorder
     }
 
     func install() {
@@ -133,7 +142,8 @@ final class AgentHotkeyState {
             paster: saver,
             llmProvider: nil,
             llmModel: "claude-sonnet-4-6",
-            maxDurationSeconds: max(15, settings.dictationMaxSeconds)
+            maxDurationSeconds: max(15, settings.dictationMaxSeconds),
+            preflight: DictationState.makePreflight(recorder: recorder)
         )
         self.pipeline = p
         do {

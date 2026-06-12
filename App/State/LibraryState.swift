@@ -42,6 +42,7 @@ final class LibraryState {
     let database: AppDatabase
     let sessionStore: SessionStore
     let settings: AppSettings?
+    private let canClearAllSessions: @MainActor () -> Bool
 
     // MARK: - Observable state
 
@@ -58,10 +59,16 @@ final class LibraryState {
 
     // MARK: - Init
 
-    init(database: AppDatabase, sessionStore: SessionStore, settings: AppSettings? = nil) {
+    init(
+        database: AppDatabase,
+        sessionStore: SessionStore,
+        settings: AppSettings? = nil,
+        canClearAllSessions: @escaping @MainActor () -> Bool = { true }
+    ) {
         self.database = database
         self.sessionStore = sessionStore
         self.settings = settings
+        self.canClearAllSessions = canClearAllSessions
     }
 
     // MARK: - Data loading
@@ -102,8 +109,9 @@ final class LibraryState {
                     for try await record in group {
                         if let r = record { results.append(r) }
                     }
-                    // Re-sort newest-first (TaskGroup ordering is non-deterministic).
-                    return results.sorted { $0.recordedAt > $1.recordedAt }
+                    // TaskGroup ordering is non-deterministic; restore the
+                    // FTS/semantic relevance order the user searched for.
+                    return Self.records(results, orderedBy: orderedSids)
                 }
             }
 
@@ -188,6 +196,10 @@ final class LibraryState {
     /// then the recordings root is emptied so even abandoned-mid-record session
     /// directories that never made it to the DB are removed.
     func clearAllSessions() async {
+        guard canClearAllSessions() else {
+            print("[LibraryState] clearAllSessions refused: active recording in progress")
+            return
+        }
         let all = (try? await database.listSessions(limit: 10_000)) ?? []
         for record in all {
             try? await database.deleteSession(id: record.id)
@@ -203,6 +215,14 @@ final class LibraryState {
     }
 
     // MARK: - Private
+
+    static func records(_ records: [SessionRecord], orderedBy orderedSids: [String]) -> [SessionRecord] {
+        var byID: [String: SessionRecord] = [:]
+        for record in records {
+            byID[record.id] = record
+        }
+        return orderedSids.compactMap { byID[$0] }
+    }
 
     /// Embed `query` and return up to 20 sids ordered by descending cosine
     /// similarity to stored session embeddings. Returns `[]` when semantic
@@ -234,13 +254,16 @@ final class LibraryState {
     // Debounce: refresh fires on the next run-loop turn after the last mutation.
     // Avoids a DB round-trip per keystroke while still feeling live.
     private var refreshTask: Task<Void, Never>?
+    private var refreshGeneration = 0
 
     private func scheduleRefresh() {
+        refreshGeneration += 1
+        let generation = refreshGeneration
         refreshTask?.cancel()
         refreshTask = Task { @MainActor [weak self] in
             // Yield once to coalesce rapid changes (e.g. filter + query changed together).
             await Task.yield()
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, self?.refreshGeneration == generation else { return }
             await self?.refresh()
         }
     }

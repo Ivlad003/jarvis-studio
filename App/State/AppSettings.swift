@@ -39,6 +39,7 @@ final class AppSettings {
         // ollamaBearer is Keychain-backed; this constant is the account name reference.
         static let ollamaBearer = "ollamaBearer"
         static let systemAudioEnabled = "systemAudioEnabled"
+        static let echoCancellationEnabled = "echoCancellationEnabled"
         static let dictationLLMCleanup = "dictationLLMCleanup"
         // Three insertion strategies for the cleaned dictation transcript:
         //   - axapiThenClipboard (faster, less reliable in Electron)
@@ -336,6 +337,11 @@ final class AppSettings {
     var systemAudioEnabled: Bool {
         didSet { UserDefaults.standard.set(systemAudioEnabled, forKey: Defaults.systemAudioEnabled) }
     }
+    /// Apple voice-processing echo cancellation for speaker-based meetings.
+    /// Default ON; users can disable it for high-fidelity ambient recording.
+    var echoCancellationEnabled: Bool {
+        didSet { UserDefaults.standard.set(echoCancellationEnabled, forKey: Defaults.echoCancellationEnabled) }
+    }
     /// Run an LLM cleanup pass on the Whisper transcript before pasting (Dictation Mode).
     /// On = cleaner output, slower (extra round-trip). Off = paste raw transcript.
     var dictationLLMCleanup: Bool {
@@ -532,6 +538,7 @@ final class AppSettings {
     // MARK: Init
 
     private let keychain: Keychain
+    private var keychainReadFailedAccounts: Set<KeychainAccount> = []
 
     init() {
         // Keychain service must match the bundle identifier.
@@ -594,9 +601,13 @@ final class AppSettings {
         let modeRaw = UserDefaults.standard.string(forKey: Defaults.recordingMode) ?? RecordingMode.audioOnly.rawValue
         self.recordingMode = RecordingMode(rawValue: modeRaw) ?? .audioOnly
 
-        // Default $1.00; treat stored 0.0 as "never set" and use the default.
-        let cap = UserDefaults.standard.double(forKey: Defaults.costCapUSD)
-        self.costCapUSD = cap > 0 ? cap : 1.00
+        // Default $1.00 only when the preference is absent. A stored 0.0 is a
+        // deliberate "disable spend" cap and must survive reloads.
+        if UserDefaults.standard.object(forKey: Defaults.costCapUSD) == nil {
+            self.costCapUSD = 1.00
+        } else {
+            self.costCapUSD = max(0.0, UserDefaults.standard.double(forKey: Defaults.costCapUSD))
+        }
 
         self.ollamaEndpoint = UserDefaults.standard.string(forKey: Defaults.ollamaEndpoint) ?? "http://localhost:11434"
 
@@ -606,6 +617,7 @@ final class AppSettings {
         self.ollamaModel = UserDefaults.standard.string(forKey: Defaults.ollamaModel) ?? "qwen2.5:14b"
 
         self.systemAudioEnabled = UserDefaults.standard.bool(forKey: Defaults.systemAudioEnabled)
+        self.echoCancellationEnabled = (UserDefaults.standard.object(forKey: Defaults.echoCancellationEnabled) as? Bool) ?? true
         // Default true for cleanup; UserDefaults.bool returns false for missing keys, so check object presence.
         self.dictationLLMCleanup = (UserDefaults.standard.object(forKey: Defaults.dictationLLMCleanup) as? Bool) ?? true
         // Default `clipboardSimulatedV` — universal compatibility. The
@@ -706,14 +718,25 @@ final class AppSettings {
     // MARK: Persistence
 
     private func loadKeysFromKeychain() {
-        deepgramApiKey = (try? keychain.get(KeychainAccount.deepgram.rawValue)) ?? ""
-        openaiApiKey = (try? keychain.get(KeychainAccount.openaiWhisper.rawValue)) ?? ""
-        anthropicApiKey = (try? keychain.get(KeychainAccount.anthropic.rawValue)) ?? ""
-        ollamaBearer = (try? keychain.get(KeychainAccount.ollama.rawValue)) ?? ""
-        openrouterApiKey = (try? keychain.get(KeychainAccount.openrouter.rawValue)) ?? ""
-        geminiApiKey = (try? keychain.get(KeychainAccount.gemini.rawValue)) ?? ""
-        s3AccessKey = (try? keychain.get(KeychainAccount.s3AccessKey.rawValue)) ?? ""
-        s3SecretKey = (try? keychain.get(KeychainAccount.s3SecretKey.rawValue)) ?? ""
+        deepgramApiKey = loadKey(.deepgram)
+        openaiApiKey = loadKey(.openaiWhisper)
+        anthropicApiKey = loadKey(.anthropic)
+        ollamaBearer = loadKey(.ollama)
+        openrouterApiKey = loadKey(.openrouter)
+        geminiApiKey = loadKey(.gemini)
+        s3AccessKey = loadKey(.s3AccessKey)
+        s3SecretKey = loadKey(.s3SecretKey)
+    }
+
+    private func loadKey(_ account: KeychainAccount) -> String {
+        do {
+            keychainReadFailedAccounts.remove(account)
+            return try keychain.get(account.rawValue) ?? ""
+        } catch {
+            keychainReadFailedAccounts.insert(account)
+            appSettingsLog.error("Keychain read failed for account \(account.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return ""
+        }
     }
 
     /// Persist all currently-loaded values to Keychain. Empty strings are
@@ -731,11 +754,20 @@ final class AppSettings {
 
     func commit(_ account: KeychainAccount, value: String) {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let action = Self.keychainCommitAction(
+            trimmedValue: trimmed,
+            readFailed: keychainReadFailedAccounts.contains(account)
+        )
         do {
-            if trimmed.isEmpty {
+            switch action {
+            case .remove:
                 try keychain.remove(account.rawValue)
-            } else {
-                try keychain.set(trimmed, key: account.rawValue)
+                keychainReadFailedAccounts.remove(account)
+            case .set(let value):
+                try keychain.set(value, key: account.rawValue)
+                keychainReadFailedAccounts.remove(account)
+            case .skipEmptyRemovalAfterReadFailure:
+                appSettingsLog.error("Skipped empty Keychain commit for account \(account.rawValue, privacy: .public) because the startup read failed")
             }
         } catch {
             // Log so failures are visible in Console.app (subsystem
@@ -745,6 +777,19 @@ final class AppSettings {
             // but auth still fails" symptom is otherwise impossible to debug.
             appSettingsLog.error("Keychain commit failed for account \(account.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    enum KeychainCommitAction: Equatable {
+        case remove
+        case set(String)
+        case skipEmptyRemovalAfterReadFailure
+    }
+
+    static func keychainCommitAction(trimmedValue: String, readFailed: Bool) -> KeychainCommitAction {
+        if trimmedValue.isEmpty {
+            return readFailed ? .skipEmptyRemovalAfterReadFailure : .remove
+        }
+        return .set(trimmedValue)
     }
 
     // MARK: - WhisperKit paths
@@ -785,6 +830,7 @@ final class AppSettings {
             "llm=\(llmProvider.rawValue)",
             "recordingMode=\(recordingMode.rawValue)",
             "systemAudioEnabled=\(systemAudioEnabled)",
+            "echoCancellationEnabled=\(echoCancellationEnabled)",
             "useProcessTap=\(useProcessTap)",
             "systemAudioDeviceUID=\(systemAudioDeviceUID.isEmpty ? "(default SCKit)" : systemAudioDeviceUID)",
             "screenCaptureDisplayID=\(screenCaptureDisplayID)",

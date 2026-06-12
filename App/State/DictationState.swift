@@ -11,12 +11,9 @@ private let dictationLog = Logger(subsystem: "dev.kosmonotes.studio", category: 
 
 // MARK: - DictationState
 
-/// App-layer @Observable wrapper around DictationPipeline.
-/// Owns the HotkeyMonitor and lazily creates the pipeline on first use.
-/// When a `sessionStore` is provided, every successful dictation is persisted
+/// When `sessionStore` is provided, every successful dictation is persisted
 /// into the Library as a `mode = .dictation` SessionRecord with audio.m4a +
-/// transcript.txt + transcript.jsonl, so the user can replay the audio and see
-/// what was transcribed.
+/// transcript.txt + transcript.jsonl.
 @available(macOS 14.0, *)
 @Observable
 @MainActor
@@ -39,18 +36,26 @@ final class DictationState {
 
     private let settings: AppSettings
     private let sessionStore: SessionStore?
+    /// Weak reference to the meeting recorder so the dictation preflight can
+    /// refuse to start a parallel AVAudioEngine while an active recording
+    /// owns the mic HAL (invariant I3).
+    private weak var recorder: RecorderState?
     private var pipeline: DictationPipeline?
     private var liveAdapter: HoldToTalkLiveAdapter?
     private let installer = TriggerHotkeyInstaller(comboName: .dictation, label: "Dictation")
     /// NotificationCenter token observing AppSettings.dictationTriggerDidChange,
     /// so a Settings change re-registers the hotkey live.
     private var triggerChangeObserver: NSObjectProtocol?
-
     // MARK: - Init
 
-    init(settings: AppSettings, sessionStore: SessionStore? = nil) {
+    init(
+        settings: AppSettings,
+        sessionStore: SessionStore? = nil,
+        recorder: RecorderState? = nil
+    ) {
         self.settings = settings
         self.sessionStore = sessionStore
+        self.recorder = recorder
     }
 
     // MARK: - Public API
@@ -133,6 +138,11 @@ final class DictationState {
             uiStatus = .failed("Could not start dictation: \(error.localizedDescription)")
             return
         }
+
+        // Zero-frame mic-flow protection lives inside DictationPipeline
+        // (pipeline-internal 5 s watchdog → status = .failed), so
+        // PushToMarkdownState and AgentHotkeyState get it for free.
+        // handleRelease surfaces that .failed status to the user.
 
         // Wire a live adapter if the current transcription provider supports it.
         // When available, handleRelease will use the adapter path instead of the
@@ -228,6 +238,8 @@ final class DictationState {
         let model = resolved?.model ?? ""
         let insertionStrategy = settings.dictationInsertion
 
+        let preflight = Self.makePreflight(recorder: recorder)
+
         return DictationPipeline(
             transcriber: { url, cfg in
                 try await whisper.transcribe(audioFile: url, config: cfg)
@@ -237,8 +249,30 @@ final class DictationState {
             },
             llmProvider: llm,
             llmModel: model,
-            maxDurationSeconds: settings.dictationMaxSeconds
+            maxDurationSeconds: settings.dictationMaxSeconds,
+            preflight: preflight
         )
+    }
+
+    /// Build the HAL-ownership preflight closure for DictationPipeline.
+    /// Returns `.micOwnedByActiveRecording` whenever a meeting/voice-note
+    /// recording is in flight, regardless of OS version — running a parallel
+    /// AVAudioEngine on the same mic HAL is the exact failure mode the
+    /// always-on capture design forbids.
+    static func makePreflight(recorder: RecorderState?) -> DictationPipeline.Preflight? {
+        guard let recorder else { return nil }
+        return { [weak recorder] in
+            guard let recorder else { return .ok }
+            // Only an in-flight *recording* owns the mic HAL. `.transcribing`
+            // also reads as busy, but the capture session is torn down before
+            // that status begins — blocking hold-to-talk for the whole
+            // transcription window (minutes) was a false positive.
+            let recording: Bool = await MainActor.run {
+                if case .recording = recorder.status { return true }
+                return false
+            }
+            return recording ? .micOwnedByActiveRecording : .ok
+        }
     }
 
     /// Kept separate so the hold-to-talk live adapter can target the same

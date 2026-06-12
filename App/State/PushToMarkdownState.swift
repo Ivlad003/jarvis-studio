@@ -10,17 +10,10 @@ private let pushToMDLog = Logger(subsystem: "dev.kosmonotes.studio", category: "
 
 // MARK: - PushToMarkdownState
 
-/// Push-to-Markdown is the same press / hold / release pattern as Dictation,
-/// but instead of pasting the cleaned text into the focused field it goes
-/// straight through `MarkdownExporter` (the same system + user prompts the
-/// user configured in Settings → Markdown) and lands as a new `.md` file
-/// at the configured folder. Each press = one file.
-///
-/// Implementation reuses `DictationPipeline` for the mic capture + Whisper
-/// transcription + optional LLM cleanup. The "paste" stage is hijacked: the
-/// injected `Paster` closure spawns a detached Task that calls
-/// `MarkdownExporter.export(...)`, then returns `.clipboardSimulatedV` so
-/// the pipeline's own status flips to `.completed`.
+/// Reuses `DictationPipeline` (mic capture → Whisper → optional LLM cleanup)
+/// and hijacks the "paste" stage: the injected `Paster` closure runs
+/// `MarkdownExporter.export(...)` in a detached Task and returns
+/// `.clipboardSimulatedV` so the pipeline status flips to `.completed`.
 @available(macOS 14.0, *)
 @Observable
 @MainActor
@@ -43,6 +36,10 @@ final class PushToMarkdownState {
 
     private let settings: AppSettings
     private let sessionStore: SessionStore
+    /// Weak ref to RecorderState so the dictation preflight can refuse to
+    /// start a parallel AVAudioEngine while a meeting recording owns the
+    /// mic HAL.
+    private weak var recorder: RecorderState?
     private var pipeline: DictationPipeline?
     private var liveAdapter: HoldToTalkLiveAdapter?
     private let installer = TriggerHotkeyInstaller(comboName: .pushToMarkdown, label: "PushToMarkdown")
@@ -50,9 +47,14 @@ final class PushToMarkdownState {
 
     // MARK: - Init
 
-    init(settings: AppSettings, sessionStore: SessionStore) {
+    init(
+        settings: AppSettings,
+        sessionStore: SessionStore,
+        recorder: RecorderState? = nil
+    ) {
         self.settings = settings
         self.sessionStore = sessionStore
+        self.recorder = recorder
     }
 
     /// Wire up the global hotkey. Call once on launch alongside DictationState.
@@ -226,7 +228,8 @@ final class PushToMarkdownState {
             paster: saver,
             llmProvider: llm,
             llmModel: model,
-            maxDurationSeconds: max(15, settings.dictationMaxSeconds)
+            maxDurationSeconds: max(15, settings.dictationMaxSeconds),
+            preflight: DictationState.makePreflight(recorder: recorder)
         )
     }
 

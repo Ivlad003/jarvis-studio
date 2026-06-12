@@ -20,17 +20,23 @@ public final class DeepgramProvider: TranscriptionProvider, Sendable {
     private let apiKey: String
     private let endpoint: URL
     private let transportFactory: TransportFactory
+    private let sessionDrainTimeoutNanoseconds: UInt64
+
+    public static let closeStreamMessage = #"{"type":"CloseStream"}"#
+    public static let keepAliveMessage = #"{"type":"KeepAlive"}"#
 
     // MARK: Init
 
     public init(
         apiKey: String,
         endpoint: URL = DeepgramProvider.defaultEndpoint,
-        transportFactory: @escaping TransportFactory = DeepgramProvider.defaultTransportFactory
+        transportFactory: @escaping TransportFactory = DeepgramProvider.defaultTransportFactory,
+        sessionDrainTimeoutNanoseconds: UInt64 = 2_500_000_000
     ) {
         self.apiKey = apiKey
         self.endpoint = endpoint
         self.transportFactory = transportFactory
+        self.sessionDrainTimeoutNanoseconds = sessionDrainTimeoutNanoseconds
     }
 
     // MARK: TranscriptionProvider
@@ -41,7 +47,10 @@ public final class DeepgramProvider: TranscriptionProvider, Sendable {
         let transport = transportFactory(url, headers)
         let session = TranscriptionSession(
             transport: transport,
-            parser: DeepgramEventParser.makeParser()
+            parser: DeepgramEventParser.makeParser(),
+            defaultCloseMessage: Self.closeStreamMessage,
+            finishDrainTimeoutNanoseconds: sessionDrainTimeoutNanoseconds,
+            terminalMessage: DeepgramEventParser.isTerminalMetadata
         )
         await session.startReceiving()
         return session
@@ -63,8 +72,12 @@ public final class DeepgramProvider: TranscriptionProvider, Sendable {
         let factory = transportFactory
         let session = ReconnectingSession(
             transportFactory: { factory(url, headers) },
-            parser: DeepgramEventParser.makeParser(),
-            clock: clock
+            parserFactory: { offset in
+                DeepgramEventParser.makeParser(timestampOffset: offset)
+            },
+            clock: clock,
+            audioBytesPerSecond: Double(config.sampleRate * config.channels * 2),
+            defaultCloseMessage: Self.closeStreamMessage
         )
         await session.start()
         return session
@@ -93,7 +106,7 @@ public final class DeepgramProvider: TranscriptionProvider, Sendable {
             URLQueryItem(name: "model", value: config.model),
             URLQueryItem(name: "smart_format", value: config.punctuate ? "true" : "false"),
             URLQueryItem(name: "interim_results", value: config.interimResults ? "true" : "false"),
-            URLQueryItem(name: "endpointing", value: "true"),
+            URLQueryItem(name: "endpointing", value: "300"),
         ]
         if let lang = config.language {
             items.append(URLQueryItem(name: "language", value: lang))
@@ -115,13 +128,26 @@ public final class DeepgramProvider: TranscriptionProvider, Sendable {
 public enum DeepgramEventParser {
 
     public static func makeParser() -> TranscriptionEventParser {
+        makeParser(timestampOffset: 0)
+    }
+
+    public static func makeParser(timestampOffset: TimeInterval) -> TranscriptionEventParser {
         TranscriptionEventParser { message in
-            DeepgramEventParser.parse(message)
+            DeepgramEventParser.parse(message, timestampOffset: timestampOffset)
         }
     }
 
     /// Parse a single WebSocket message into zero or more transcript segments.
     public static func parse(_ message: WebSocketMessage) -> [TranscriptSegment] {
+        parse(message, timestampOffset: 0)
+    }
+
+    /// Parse a single WebSocket message and offset provider-local timestamps
+    /// into the original session timeline.
+    public static func parse(
+        _ message: WebSocketMessage,
+        timestampOffset: TimeInterval
+    ) -> [TranscriptSegment] {
         let json: String
         switch message {
         case .text(let s): json = s
@@ -142,7 +168,7 @@ public enum DeepgramEventParser {
         }
         let text = alternative.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return [] }
-        let start = event.start ?? 0
+        let start = (event.start ?? 0) + timestampOffset
         let duration = event.duration ?? 0
         return [
             TranscriptSegment(
@@ -154,6 +180,21 @@ public enum DeepgramEventParser {
                 speaker: alternative.words?.first?.speaker
             ),
         ]
+    }
+
+    public static func isTerminalMetadata(_ message: WebSocketMessage) -> Bool {
+        let json: String
+        switch message {
+        case .text(let s): json = s
+        case .data(let d):
+            guard let s = String(data: d, encoding: .utf8) else { return false }
+            json = s
+        }
+        guard let data = json.data(using: .utf8),
+              let event = try? JSONDecoder().decode(DeepgramEvent.self, from: data) else {
+            return false
+        }
+        return event.type == "Metadata"
     }
 }
 
