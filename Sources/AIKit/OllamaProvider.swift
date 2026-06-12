@@ -201,6 +201,8 @@ public final class OllamaProvider: AIProvider, Sendable {
                 textParts.append(s)
             case .image(let jpegData, _):
                 imageBase64.append(jpegData.base64EncodedString())
+            case .toolUse, .toolResult:
+                continue
             }
         }
 
@@ -282,8 +284,10 @@ public final class OllamaProvider: AIProvider, Sendable {
                     "type": "image_url",
                     "image_url": ["url": dataURL] as [String: Any],
                 ]
+            case .toolUse, .toolResult:
+                return [:]
             }
-        }
+        }.filter { !$0.isEmpty }
     }
 
     static func parseOpenAICompat(data: Data) throws -> String {

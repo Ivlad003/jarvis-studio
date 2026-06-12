@@ -125,6 +125,36 @@ struct AnthropicProviderRequestTests {
         #expect(source["media_type"] as? String == "image/jpeg")
         #expect(source["data"] as? String == jpegData.base64EncodedString())
     }
+
+    @Test("Tool specs are serialized as Anthropic input schemas")
+    func toolSpecsSerializedAsInputSchemas() throws {
+        let request = try AnthropicProvider.buildRequest(
+            endpoint: AnthropicProvider.defaultEndpoint,
+            apiKey: "sk-ant-x",
+            messages: [ChatMessage(role: .user, content: "Search")],
+            tools: [
+                ToolSpec(
+                    name: "search_live_transcript",
+                    description: "Search the active transcript",
+                    parameters: .object([
+                        "type": .string("object"),
+                        "properties": .object([
+                            "query": .object(["type": .string("string")]),
+                        ]),
+                    ])
+                ),
+            ],
+            config: baseConfig
+        )
+
+        let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as! [String: Any]
+        let tools = body["tools"] as! [[String: Any]]
+        #expect(tools.count == 1)
+        #expect(tools[0]["name"] as? String == "search_live_transcript")
+        #expect(tools[0]["description"] as? String == "Search the active transcript")
+        let inputSchema = tools[0]["input_schema"] as! [String: Any]
+        #expect(inputSchema["type"] as? String == "object")
+    }
 }
 
 // MARK: - Response parser
@@ -187,6 +217,41 @@ struct AnthropicProviderParserTests {
         """
         let result = try AnthropicProvider.parse(data: Data(json.utf8))
         #expect(result == "After tool.")
+    }
+
+    @Test("Parses text and tool_use blocks with stop reason")
+    func parsesTextAndToolUseBlocks() throws {
+        let json = """
+        {
+          "id": "msg_04",
+          "type": "message",
+          "role": "assistant",
+          "content": [
+            {"type": "text", "text": "I will search."},
+            {
+              "type": "tool_use",
+              "id": "toolu_1",
+              "name": "search_live_transcript",
+              "input": {"query": "budget"}
+            }
+          ],
+          "stop_reason": "tool_use",
+          "model": "claude-sonnet-4-6",
+          "usage": {"input_tokens": 10, "output_tokens": 3}
+        }
+        """
+
+        let response = try AnthropicProvider.parseResponse(data: Data(json.utf8))
+
+        #expect(response.stopReason == .toolUse)
+        #expect(response.parts == [
+            .text("I will search."),
+            .toolUse(.init(
+                id: "toolu_1",
+                name: "search_live_transcript",
+                arguments: .object(["query": .string("budget")])
+            )),
+        ])
     }
 
     @Test("Throws decodingFailed on malformed JSON")

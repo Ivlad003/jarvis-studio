@@ -137,7 +137,9 @@ public final class OpenRouterProvider: AIProvider, Sendable {
                     "type": "image_url",
                     "image_url": ["url": dataURL] as [String: Any],
                 ]
+            case .toolUse, .toolResult:
+                return [:]
             }
-        }
+        }.filter { !$0.isEmpty }
     }
 }

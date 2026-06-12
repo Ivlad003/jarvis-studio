@@ -440,7 +440,8 @@ private struct MessageBubble: View {
         switch message.role {
         case .user:      return Color.accentColor
         case .assistant: return Color(NSColor.controlBackgroundColor)
-        case .system:    return Color(NSColor.windowBackgroundColor)
+        case .system,
+             .tool:      return Color(NSColor.windowBackgroundColor)
         }
     }
 

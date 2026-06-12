@@ -45,10 +45,15 @@ public final class AnthropicProvider: AIProvider, Sendable {
     // MARK: AIProvider
 
     public func chat(messages: [ChatMessage], config: AIConfig) async throws -> String {
+        try await chat(messages: messages, tools: [], config: config).text
+    }
+
+    public func chat(messages: [ChatMessage], tools: [ToolSpec], config: AIConfig) async throws -> ChatResponse {
         let request = try Self.buildRequest(
             endpoint: endpoint,
             apiKey: apiKey,
             messages: messages,
+            tools: tools,
             config: config
         )
 
@@ -65,7 +70,7 @@ public final class AnthropicProvider: AIProvider, Sendable {
 
         switch httpResponse.statusCode {
         case 200:
-            return try Self.parse(data: data)
+            return try Self.parseResponse(data: data)
         case 401:
             throw AIError.authenticationFailed
         case 429:
@@ -82,6 +87,7 @@ public final class AnthropicProvider: AIProvider, Sendable {
         endpoint: URL,
         apiKey: String,
         messages: [ChatMessage],
+        tools: [ToolSpec] = [],
         config: AIConfig
     ) throws -> URLRequest {
         var request = URLRequest(url: endpoint)
@@ -110,6 +116,9 @@ public final class AnthropicProvider: AIProvider, Sendable {
         if let system = systemField {
             body["system"] = system
         }
+        if !tools.isEmpty {
+            body["tools"] = tools.map(Self.serializeTool)
+        }
 
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -122,12 +131,25 @@ public final class AnthropicProvider: AIProvider, Sendable {
     // MARK: - Response parser (internal for tests)
 
     static func parse(data: Data) throws -> String {
+        try parseResponse(data: data).text
+    }
+
+    static func parseResponse(data: Data) throws -> ChatResponse {
         struct Response: Decodable {
             struct ContentBlock: Decodable {
                 let type: String
                 let text: String?
+                let id: String?
+                let name: String?
+                let input: JSONValue?
             }
             let content: [ContentBlock]
+            let stopReason: String?
+
+            private enum CodingKeys: String, CodingKey {
+                case content
+                case stopReason = "stop_reason"
+            }
         }
 
         let response: Response
@@ -137,16 +159,47 @@ public final class AnthropicProvider: AIProvider, Sendable {
             throw AIError.decodingFailed(message: error.localizedDescription)
         }
 
-        // Concatenate all text-type blocks in order.
-        let text = response.content
-            .filter { $0.type == "text" }
-            .compactMap { $0.text }
-            .joined()
+        let parts: [ChatMessage.Part] = response.content.compactMap { block in
+            switch block.type {
+            case "text":
+                guard let text = block.text else { return nil }
+                return .text(text)
+            case "tool_use":
+                guard let id = block.id, let name = block.name else { return nil }
+                return .toolUse(.init(
+                    id: id,
+                    name: name,
+                    arguments: block.input ?? .object([:])
+                ))
+            default:
+                return nil
+            }
+        }
 
-        return text
+        return ChatResponse(
+            parts: parts,
+            stopReason: Self.stopReason(from: response.stopReason)
+        )
     }
 
     // MARK: - Private: part serialization
+
+    private static func serializeTool(_ tool: ToolSpec) -> [String: Any] {
+        [
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.parameters.anyValue,
+        ]
+    }
+
+    private static func stopReason(from raw: String?) -> StopReason {
+        switch raw {
+        case "end_turn", "stop_sequence": return .endTurn
+        case "tool_use": return .toolUse
+        case "max_tokens": return .maxTokens
+        default: return .unknown
+        }
+    }
 
     /// Convert structured message parts to Anthropic content-block JSON objects.
     /// text → {"type":"text","text":"..."}
@@ -168,6 +221,20 @@ public final class AnthropicProvider: AIProvider, Sendable {
                         "media_type": mimeType,
                         "data": jpegData.base64EncodedString(),
                     ] as [String: Any],
+                ]
+            case .toolUse(let call):
+                return [
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments.anyValue,
+                ]
+            case .toolResult(let id, let content, let isError):
+                return [
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": content,
+                    "is_error": isError,
                 ]
             }
         }

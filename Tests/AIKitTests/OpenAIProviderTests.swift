@@ -108,6 +108,38 @@ struct OpenAIProviderRequestTests {
         let expectedURL = "data:image/jpeg;base64,\(jpegData.base64EncodedString())"
         #expect(imageUrl["url"] as? String == expectedURL)
     }
+
+    @Test("Tool specs are serialized as OpenAI function tools")
+    func toolSpecsSerializedAsFunctionTools() throws {
+        let request = try OpenAIProvider.buildRequest(
+            endpoint: OpenAIProvider.defaultEndpoint,
+            apiKey: "sk-x",
+            messages: [ChatMessage(role: .user, content: "Search")],
+            tools: [
+                ToolSpec(
+                    name: "search_live_transcript",
+                    description: "Search the active transcript",
+                    parameters: .object([
+                        "type": .string("object"),
+                        "properties": .object([
+                            "query": .object(["type": .string("string")]),
+                        ]),
+                    ])
+                ),
+            ],
+            config: baseConfig
+        )
+
+        let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as! [String: Any]
+        let tools = body["tools"] as! [[String: Any]]
+        #expect(tools.count == 1)
+        #expect(tools[0]["type"] as? String == "function")
+        let function = tools[0]["function"] as! [String: Any]
+        #expect(function["name"] as? String == "search_live_transcript")
+        #expect(function["description"] as? String == "Search the active transcript")
+        let parameters = function["parameters"] as! [String: Any]
+        #expect(parameters["type"] as? String == "object")
+    }
 }
 
 // MARK: - Response parser
@@ -150,6 +182,47 @@ struct OpenAIProviderParserTests {
         #expect(throws: AIError.self) {
             try OpenAIProvider.parse(data: Data(json.utf8))
         }
+    }
+
+    @Test("Parses tool calls when assistant content is null")
+    func parsesToolCallsWithNullContent() throws {
+        let json = """
+        {
+          "id": "chatcmpl-tool",
+          "object": "chat.completion",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {
+                      "name": "search_live_transcript",
+                      "arguments": "{\\"query\\":\\"budget\\"}"
+                    }
+                  }
+                ]
+              },
+              "finish_reason": "tool_calls"
+            }
+          ]
+        }
+        """
+
+        let response = try OpenAIProvider.parseResponse(data: Data(json.utf8))
+
+        #expect(response.stopReason == .toolUse)
+        #expect(response.parts == [
+            .toolUse(.init(
+                id: "call_abc",
+                name: "search_live_transcript",
+                arguments: .object(["query": .string("budget")])
+            )),
+        ])
     }
 }
 

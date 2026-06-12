@@ -43,10 +43,15 @@ public final class OpenAIProvider: AIProvider, Sendable {
     // MARK: AIProvider
 
     public func chat(messages: [ChatMessage], config: AIConfig) async throws -> String {
+        try await chat(messages: messages, tools: [], config: config).text
+    }
+
+    public func chat(messages: [ChatMessage], tools: [ToolSpec], config: AIConfig) async throws -> ChatResponse {
         let request = try Self.buildRequest(
             endpoint: endpoint,
             apiKey: apiKey,
             messages: messages,
+            tools: tools,
             config: config
         )
 
@@ -63,7 +68,7 @@ public final class OpenAIProvider: AIProvider, Sendable {
 
         switch httpResponse.statusCode {
         case 200:
-            return try Self.parse(data: data)
+            return try Self.parseResponse(data: data)
         case 401:
             throw AIError.authenticationFailed
         case 429:
@@ -80,6 +85,7 @@ public final class OpenAIProvider: AIProvider, Sendable {
         endpoint: URL,
         apiKey: String,
         messages: [ChatMessage],
+        tools: [ToolSpec] = [],
         config: AIConfig
     ) throws -> URLRequest {
         var request = URLRequest(url: endpoint)
@@ -94,14 +100,15 @@ public final class OpenAIProvider: AIProvider, Sendable {
             allMessages.insert(ChatMessage(role: .system, content: systemPrompt), at: 0)
         }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": config.model,
             "max_completion_tokens": config.maxTokens,
             "temperature": config.temperature,
-            "messages": allMessages.map { msg -> [String: Any] in
-                ["role": msg.role.rawValue, "content": Self.serializeParts(msg.parts)]
-            },
+            "messages": try allMessages.map(Self.serializeMessage),
         ]
+        if !tools.isEmpty {
+            body["tools"] = tools.map(Self.serializeTool)
+        }
 
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -114,13 +121,41 @@ public final class OpenAIProvider: AIProvider, Sendable {
     // MARK: - Response parser (internal for tests)
 
     static func parse(data: Data) throws -> String {
+        try parseResponse(data: data).text
+    }
+
+    static func parseResponse(data: Data) throws -> ChatResponse {
         struct Response: Decodable {
             struct Choice: Decodable {
                 struct Message: Decodable {
+                    struct ToolCallPayload: Decodable {
+                        struct FunctionPayload: Decodable {
+                            let name: String
+                            let arguments: String
+                        }
+
+                        let id: String
+                        let type: String
+                        let function: FunctionPayload
+                    }
+
                     let role: String
-                    let content: String
+                    let content: String?
+                    let toolCalls: [ToolCallPayload]?
+
+                    private enum CodingKeys: String, CodingKey {
+                        case role
+                        case content
+                        case toolCalls = "tool_calls"
+                    }
                 }
                 let message: Message
+                let finishReason: String?
+
+                private enum CodingKeys: String, CodingKey {
+                    case message
+                    case finishReason = "finish_reason"
+                }
             }
             let choices: [Choice]
         }
@@ -135,10 +170,79 @@ public final class OpenAIProvider: AIProvider, Sendable {
         guard let first = response.choices.first else {
             throw AIError.decodingFailed(message: "No choices in response")
         }
-        return first.message.content
+
+        var parts: [ChatMessage.Part] = []
+        if let content = first.message.content, !content.isEmpty {
+            parts.append(.text(content))
+        }
+        for call in first.message.toolCalls ?? [] where call.type == "function" {
+            parts.append(.toolUse(.init(
+                id: call.id,
+                name: call.function.name,
+                arguments: try JSONValue.parseJSONString(call.function.arguments)
+            )))
+        }
+
+        return ChatResponse(
+            parts: parts,
+            stopReason: Self.stopReason(from: first.finishReason)
+        )
     }
 
     // MARK: - Private: part serialization
+
+    private static func serializeTool(_ tool: ToolSpec) -> [String: Any] {
+        [
+            "type": "function",
+            "function": [
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters.anyValue,
+            ] as [String: Any],
+        ]
+    }
+
+    private static func serializeMessage(_ message: ChatMessage) throws -> [String: Any] {
+        if case .toolResult(let id, let content, _) = message.parts.first, message.parts.count == 1 {
+            return [
+                "role": ChatMessage.Role.tool.rawValue,
+                "tool_call_id": id,
+                "content": content,
+            ]
+        }
+
+        var serialized: [String: Any] = [
+            "role": message.role.rawValue,
+            "content": serializeParts(message.parts),
+        ]
+        let toolCalls = try message.parts.compactMap { part -> [String: Any]? in
+            guard case .toolUse(let call) = part else { return nil }
+            return [
+                "id": call.id,
+                "type": "function",
+                "function": [
+                    "name": call.name,
+                    "arguments": try call.arguments.jsonString(),
+                ] as [String: Any],
+            ]
+        }
+        if !toolCalls.isEmpty {
+            serialized["tool_calls"] = toolCalls
+            if !message.parts.contains(where: { if case .text = $0 { true } else { false } }) {
+                serialized["content"] = NSNull()
+            }
+        }
+        return serialized
+    }
+
+    private static func stopReason(from raw: String?) -> StopReason {
+        switch raw {
+        case "stop": return .endTurn
+        case "tool_calls", "function_call": return .toolUse
+        case "length": return .maxTokens
+        default: return .unknown
+        }
+    }
 
     /// Convert structured message parts to OpenAI content-part JSON objects.
     /// text → {"type":"text","text":"..."}
@@ -158,7 +262,11 @@ public final class OpenAIProvider: AIProvider, Sendable {
                     "type": "image_url",
                     "image_url": ["url": dataURL] as [String: Any],
                 ]
+            case .toolUse:
+                return [:]
+            case .toolResult(_, let content, _):
+                return ["type": "text", "text": content]
             }
-        }
+        }.filter { !$0.isEmpty }
     }
 }

@@ -67,4 +67,19 @@ struct ChatStateBehaviorTests {
     func emptyLiveTranscriptContextIsOmitted() {
         #expect(ChatState.liveTranscriptPromptSection(from: .empty, maxCharacters: 1_000) == nil)
     }
+
+    @Test("context prompt can be reused by normal chat and live snapshots")
+    func contextPromptCanBeReusedByNormalChatAndLiveSnapshots() {
+        let prompt = ChatState.contextPrompt(
+            liveSection: "== Active recording live transcript ==\ncurrent point",
+            attachedSessionSections: [
+                "[2026-06-12T20:00:00Z · meeting · 90s · en]\nfinished context",
+            ]
+        )
+
+        #expect(prompt?.contains("access to the user's audio recording transcripts") == true)
+        #expect(prompt?.contains("== Active recording live transcript ==") == true)
+        #expect(prompt?.contains("== Attached sessions ==") == true)
+        #expect(prompt?.contains("finished context") == true)
+    }
 }

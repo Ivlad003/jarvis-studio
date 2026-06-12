@@ -369,7 +369,8 @@ final class ChatState {
             messages.append(userMessage)
             snapshotQuestion = ""
 
-            let reply = try await runProvider(messages: messages, systemPrompt: nil)
+            let systemPrompt = await buildSystemPrompt()
+            let reply = try await runProvider(messages: messages, systemPrompt: systemPrompt)
             messages.append(ChatMessage(role: .assistant, content: reply))
         } catch {
             if let rollbackTarget {
@@ -625,6 +626,30 @@ final class ChatState {
         """
     }
 
+    static func contextPrompt(
+        liveSection: String?,
+        attachedSessionSections: [String]
+    ) -> String? {
+        guard liveSection != nil || !attachedSessionSections.isEmpty else { return nil }
+
+        var prompt = """
+        You are a helpful assistant that has access to the user's audio recording transcripts.
+        Reference these recordings when relevant; cite by recorded_at if you do.
+        """
+
+        if let liveSection {
+            prompt += "\n\n\(liveSection)"
+        }
+
+        if !attachedSessionSections.isEmpty {
+            prompt += "\n\n== Attached sessions ==\n\n"
+            prompt += attachedSessionSections.joined(separator: "\n")
+            prompt += "\n"
+        }
+
+        return prompt
+    }
+
     private static func substring(_ text: String, range: NSRange) -> String {
         guard let r = Range(range, in: text) else { return "" }
         return String(text[r])
@@ -704,33 +729,27 @@ final class ChatState {
             liveSection = nil
         }
 
-        guard liveSection != nil || !attachedSessions.isEmpty else { return nil }
-
-        var prompt = """
-        You are a helpful assistant that has access to the user's audio recording transcripts.
-        Reference these recordings when relevant; cite by recorded_at if you do.
-        """
-
-        if let liveSection {
-            prompt += "\n\n\(liveSection)"
-        }
-
-        if !attachedSessions.isEmpty {
-            prompt += "\n\n== Attached sessions ==\n"
+        let attachedSections: [String]
+        if attachedSessions.isEmpty {
+            attachedSections = []
+        } else {
             let isoFormatter = ISO8601DateFormatter()
+            var sections: [String] = []
             for attachment in attachedSessions {
                 let record = attachment.record
                 let transcriptText = await loadTranscript(for: record)
                 let dateStr = isoFormatter.string(from: record.recordedAt)
                 let durStr = String(format: "%.0f", record.durationSecs)
                 let langStr = record.language ?? "auto"
-                prompt += "\n[\(dateStr) · \(record.mode.rawValue) · \(durStr)s · \(langStr)]\n"
-                prompt += transcriptText
-                prompt += "\n"
+                sections.append("""
+                [\(dateStr) · \(record.mode.rawValue) · \(durStr)s · \(langStr)]
+                \(transcriptText)
+                """)
             }
+            attachedSections = sections
         }
 
-        return prompt
+        return Self.contextPrompt(liveSection: liveSection, attachedSessionSections: attachedSections)
     }
 
     /// Reads `transcript.txt` from the session directory; falls back to
