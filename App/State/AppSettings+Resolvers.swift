@@ -67,7 +67,25 @@ extension AppSettings {
         }
     }
 
+    /// Returns a streaming live source for providers that can consume the
+    /// recorder's live PCM tee directly.
+    func makeStreamingLiveSource(hub: LiveTranscriptHub = LiveTranscriptHub()) -> StreamingLiveSource? {
+        switch transcriptionProvider {
+        case .deepgram:
+            let key = deepgramApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { return nil }
+            return StreamingLiveSource.deepgram(apiKey: key, language: liveTranscriptionLanguage, hub: hub)
+        case .openaiWhisper, .whisperKit, .gemini, .openrouterAudio:
+            return nil
+        }
+    }
+
     // MARK: - Enum bridges
+
+    private var liveTranscriptionLanguage: String? {
+        let trimmed = summaryLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (trimmed.isEmpty || trimmed == "auto") ? nil : trimmed
+    }
 
     private var aiResolverKind: AIProviderResolver.Kind {
         switch llmProvider {

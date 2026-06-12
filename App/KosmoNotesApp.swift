@@ -879,15 +879,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             agentSession: agentSessionHolder as? AgentSessionState,
             onOpenAgentConsole: { [weak self] in
                 self?.openAgentConsole()
+            },
+            liveContextProvider: { [weak recorder] in
+                guard let recorder else { return nil }
+                return await recorder.liveTranscriptSnapshot()
             }
         )
         self.chatHolder = chatState
 
         let view = ChatView(chat: chatState, settings: settings)
         let hosting = NSHostingController(rootView: view)
-        let window = NSWindow(contentViewController: hosting)
-        window.title = "KosmoNotes Chat"
-        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        let isLiveRecording: Bool
+        if case .recording = recorder.status {
+            isLiveRecording = true
+        } else {
+            isLiveRecording = false
+        }
+        let window: NSWindow
+        if isLiveRecording {
+            let panel = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 540, height: 700),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .utilityWindow],
+                backing: .buffered,
+                defer: false
+            )
+            panel.isFloatingPanel = true
+            panel.hidesOnDeactivate = false
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.contentViewController = hosting
+            window = panel
+        } else {
+            window = NSWindow(contentViewController: hosting)
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        }
+        window.title = isLiveRecording ? "KosmoNotes Live Chat" : "KosmoNotes Chat"
         window.isReleasedWhenClosed = false
         window.setContentSize(NSSize(width: 540, height: 700))
         window.minSize = NSSize(width: 540, height: 600)

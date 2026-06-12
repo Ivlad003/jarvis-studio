@@ -25,6 +25,7 @@ import TranscriptionKit
 final class ChatState {
 
     static let defaultChatMaxTokens = 4_096
+    typealias LiveContextProvider = @MainActor @Sendable () async -> LiveTranscriptState?
 
     // MARK: - Attached session discriminant
 
@@ -78,6 +79,7 @@ final class ChatState {
     // (preview / unit tests) — the "Run as agent" button is hidden when unset.
     private let agentSession: AgentSessionState?
     private let onOpenAgentConsole: (@MainActor () -> Void)?
+    private let liveContextProvider: LiveContextProvider?
 
     // MARK: - Computed state exposed to the View
 
@@ -96,7 +98,8 @@ final class ChatState {
         recorder: RecorderState,
         whisperProviderFactory: (@Sendable (String) -> WhisperProvider)? = nil,
         agentSession: AgentSessionState? = nil,
-        onOpenAgentConsole: (@MainActor () -> Void)? = nil
+        onOpenAgentConsole: (@MainActor () -> Void)? = nil,
+        liveContextProvider: LiveContextProvider? = nil
     ) {
         self.settings = settings
         self.database = database
@@ -104,6 +107,7 @@ final class ChatState {
         self.recorder = recorder
         self.agentSession = agentSession
         self.onOpenAgentConsole = onOpenAgentConsole
+        self.liveContextProvider = liveContextProvider
         // Default factory captures the user-selected OpenAI model
         // (whisper-1 / gpt-4o-transcribe / gpt-4o-mini-transcribe) at
         // init time, so chat-side audio snapshots use the same upgrade
@@ -592,9 +596,53 @@ final class ChatState {
         messages.remove(at: index)
     }
 
+    static func liveTranscriptPromptSection(
+        from state: LiveTranscriptState,
+        maxCharacters: Int
+    ) -> String? {
+        var lines: [String] = []
+        for unit in state.stableUnits {
+            let text = unit.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            lines.append("[\(formatLiveTimestamp(unit.start))-\(formatLiveTimestamp(unit.end))] \(text)")
+        }
+
+        let draft = state.draftUnits
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        if !draft.isEmpty {
+            lines.append("[draft] \(draft)")
+        }
+
+        guard !lines.isEmpty else { return nil }
+        let body = cappedLiveTranscriptBody(lines.joined(separator: "\n"), maxCharacters: maxCharacters)
+        return """
+        == Active recording live transcript ==
+        This transcript is from the recording currently in progress. Draft text may still change.
+
+        \(body)
+        """
+    }
+
     private static func substring(_ text: String, range: NSRange) -> String {
         guard let r = Range(range, in: text) else { return "" }
         return String(text[r])
+    }
+
+    private static func cappedLiveTranscriptBody(_ text: String, maxCharacters: Int) -> String {
+        guard maxCharacters > 0, text.count > maxCharacters else { return text }
+        let suffix = String(text.suffix(maxCharacters))
+        return "[earlier live transcript omitted]\n\(suffix)"
+    }
+
+    private static func formatLiveTimestamp(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded(.down)))
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%02d:%02d", m, s)
     }
 
     private func formatTimestamp(_ seconds: TimeInterval) -> String {
@@ -649,26 +697,37 @@ final class ChatState {
     /// Builds the session-context system prompt from all attached sessions.
     /// Returns nil when there are no attached sessions.
     private func buildSystemPrompt() async -> String? {
-        guard !attachedSessions.isEmpty else { return nil }
+        let liveSection: String?
+        if let liveContextProvider, let liveState = await liveContextProvider() {
+            liveSection = Self.liveTranscriptPromptSection(from: liveState, maxCharacters: 12_000)
+        } else {
+            liveSection = nil
+        }
+
+        guard liveSection != nil || !attachedSessions.isEmpty else { return nil }
 
         var prompt = """
         You are a helpful assistant that has access to the user's audio recording transcripts.
         Reference these recordings when relevant; cite by recorded_at if you do.
-
-        == Attached sessions ==
-
         """
 
-        let isoFormatter = ISO8601DateFormatter()
-        for attachment in attachedSessions {
-            let record = attachment.record
-            let transcriptText = await loadTranscript(for: record)
-            let dateStr = isoFormatter.string(from: record.recordedAt)
-            let durStr = String(format: "%.0f", record.durationSecs)
-            let langStr = record.language ?? "auto"
-            prompt += "\n[\(dateStr) · \(record.mode.rawValue) · \(durStr)s · \(langStr)]\n"
-            prompt += transcriptText
-            prompt += "\n"
+        if let liveSection {
+            prompt += "\n\n\(liveSection)"
+        }
+
+        if !attachedSessions.isEmpty {
+            prompt += "\n\n== Attached sessions ==\n"
+            let isoFormatter = ISO8601DateFormatter()
+            for attachment in attachedSessions {
+                let record = attachment.record
+                let transcriptText = await loadTranscript(for: record)
+                let dateStr = isoFormatter.string(from: record.recordedAt)
+                let durStr = String(format: "%.0f", record.durationSecs)
+                let langStr = record.language ?? "auto"
+                prompt += "\n[\(dateStr) · \(record.mode.rawValue) · \(durStr)s · \(langStr)]\n"
+                prompt += transcriptText
+                prompt += "\n"
+            }
         }
 
         return prompt

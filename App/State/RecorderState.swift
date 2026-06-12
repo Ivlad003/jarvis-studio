@@ -29,17 +29,10 @@ private extension AppSettings.AudioCodec {
 /// Wires together CaptureKit (audio in — mic, optional system audio via
 /// Core Audio Tap on 14.4+ or ScreenCaptureKit mixdown, optional screen
 /// capture), StorageKit (sessions on disk + DB), and TranscriptionKit
-/// (batch transcription via the user-selected provider — Whisper /
-/// AssemblyAI / Deepgram batch). The popover / menu observe `status` and
-/// `micLevel` to render UI. Errors are surfaced via
+/// (batch transcription via the user-selected provider). The popover / menu
+/// observe `status`, `micLevel`, and the optional live transcript surface to
+/// render UI. Errors are surfaced via
 /// `status = .failed(message:)` so the UI can show the user a single line.
-///
-/// Transcription is **batch** in v1.0 (per design-doc Decision Log D15):
-/// the recorded `audio.m4a` is submitted to the provider's batch endpoint
-/// once `stop()` finishes. Deepgram streaming infrastructure exists
-/// (`DeepgramProvider.openResilientSession`) and is unit-tested, but is
-/// not wired into the recorder UI — that lands in v1.1 alongside a
-/// CaptureSession PCM tee and a live-transcript surface.
 @available(macOS 14.0, *)
 @Observable
 @MainActor
@@ -76,6 +69,11 @@ final class RecorderState {
         case skipped
         case mixed
         case failed(String)
+    }
+
+    struct FinishedLiveTranscript: Sendable {
+        let finalSegments: [TranscriptSegment]
+        let persistedIncrementally: Bool
     }
 
     typealias ScreenAudioMixerFunction = @Sendable (_ screenURL: URL, _ audioFile: URL) async throws -> Void
@@ -173,6 +171,9 @@ final class RecorderState {
     private let cameraBubbleController = CameraBubbleWindowController()
     private var liveTranscriptAdapter = RecorderLiveAdapter()
     private var liveTranscriptTee: RecorderLiveTee?
+    private var streamingLiveSource: StreamingLiveSource?
+    private var liveTranscriptHub: LiveTranscriptHub?
+    private var liveTranscriptStore: TranscriptStore?
     private var liveTranscriptRefreshTask: Task<Void, Never>?
 
     // MARK: - Init
@@ -375,21 +376,57 @@ final class RecorderState {
                 }
             }
 
-            // Optional live transcript engine: only when a Whisper-class live
-            // provider is configured. Failure to arm is non-fatal — recorder
-            // proceeds in batch-only mode (existing post-stop transcript path).
-            let liveTee: RecorderLiveTee?
+            // Optional live transcript engines. Windowed Whisper/WhisperKit and
+            // Deepgram streaming both consume the same mic-only live PCM tee.
+            // Failure to arm is non-fatal — recorder proceeds in batch-only mode.
             let liveSink: (any LivePCMSink)?
+            var liveSinks: [any LivePCMSink] = []
+            self.liveTranscriptTee = nil
+            self.streamingLiveSource = nil
+            self.liveTranscriptHub = nil
+            self.liveTranscriptStore = nil
             if let liveProvider = settings.makeLiveProvider() {
                 let engine = LiveTranscriptEngine(provider: liveProvider, exporter: LiveWindowExporter())
                 let tee = RecorderLiveTee(engine: engine)
-                liveTee = tee
-                liveSink = SourceFilteredPCMSink(tee, allowedSources: [.mic])
+                await tee.start()
+                self.liveTranscriptTee = tee
+                liveSinks.append(tee)
                 Self.recorderLog.info("RecorderState.start: live transcript engine armed")
-            } else {
-                liveTee = nil
-                liveSink = nil
             }
+            let sessionStore = self.sessionStore
+            let streamingSessionID = session.id
+            let liveStore: TranscriptStore?
+            do {
+                liveStore = try TranscriptStore(sessionDir: dir)
+            } catch {
+                liveStore = nil
+                Self.recorderLog.error("RecorderState.start: live transcript store failed to open — \(error.localizedDescription, privacy: .public)")
+            }
+            let hub = LiveTranscriptHub(onFinalSegment: { segment in
+                guard let liveStore else { return }
+                try await liveStore.append(segment)
+                try await liveStore.flushTxt()
+
+                let segments = await liveStore.segments()
+                let text = Self.liveTranscriptText(from: segments)
+                guard !text.isEmpty else { return }
+                try? await sessionStore.indexTranscript(sid: streamingSessionID, text: text)
+            })
+            if let streamingSource = settings.makeStreamingLiveSource(hub: hub) {
+                do {
+                    try await streamingSource.start()
+                    self.streamingLiveSource = streamingSource
+                    self.liveTranscriptHub = hub
+                    self.liveTranscriptStore = liveStore
+                    liveSinks.append(streamingSource)
+                    Self.recorderLog.info("RecorderState.start: streaming live transcript source armed")
+                } catch {
+                    Self.recorderLog.error("RecorderState.start: streaming live transcript source failed to arm — \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            liveSink = liveSinks.isEmpty
+                ? nil
+                : SourceFilteredPCMSink(FanOutPCMSink(liveSinks), allowedSources: [.mic])
 
             let capture = CaptureSession(config: config, liveSink: liveSink)
             try await capture.start()
@@ -421,9 +458,6 @@ final class RecorderState {
             } else {
                 self.screenRecordingWarning = speakerEchoWarning
             }
-
-            await liveTee?.start()
-            self.liveTranscriptTee = liveTee
 
             // / invariant I3: when SCStream owns the mic HAL
             // we must NOT start a second AVAudioEngine just to drive the UI
@@ -592,7 +626,7 @@ final class RecorderState {
         micHealth = .idle
         sleepAssertion.release()
         await cameraBubbleController.hide()
-        clearLiveTranscript()
+        let liveTranscript = await finishLiveTranscript()
 
         if tier2Demoted {
             self.screenDemotedDuringRecording = true
@@ -664,44 +698,53 @@ final class RecorderState {
             let cmDuration = try await asset.load(.duration)
             let duration = CMTimeGetSeconds(cmDuration)
 
-            // Pick the configured transcription provider. Whisper uses OpenAI's
-            // batch endpoint; Deepgram uses its REST batch (`/v1/listen`) since
-            // we don't yet expose a PCM tee for streaming. The streaming
-            // DeepgramProvider remains for v1.1.
             let language: String? = {
                 let s = settings.summaryLanguage
                 return (s == "auto" || s.isEmpty) ? nil : s
             }()
-            let resolvedTx = TranscriptionResolver.resolve(settings.transcriptionConfig)
-            let provider = resolvedTx.provider
+            let result: BatchTranscriptResult
+            let usedLiveTranscript: Bool
+            if let liveResult = Self.liveTranscriptResult(
+                from: liveTranscript.finalSegments,
+                duration: duration,
+                language: language
+            ) {
+                result = liveResult
+                usedLiveTranscript = true
+                Self.recorderLog.info("RecorderState.stop: using finalized live transcript; skipping batch transcription")
+            } else {
+                let resolvedTx = TranscriptionResolver.resolve(settings.transcriptionConfig)
+                let provider = resolvedTx.provider
 
-            // Pre-flight cost gate. Long recordings + a per-minute pricing
-            // model can push past the user's cap silently — surface the same
-            // "increase cap or cancel" modal we already use for summary /
-            // cleanup. Providers without a known per-minute price (Gemini,
-            // OpenRouter) return nil pricing and skip the gate.
-            let txPricing = resolvedTx.pricing
-            if let pricing = txPricing {
-                let estimated = CostEstimator.estimateTranscription(durationSec: duration, pricing: pricing)
-                if estimated > settings.costCapUSD {
-                    let proceed = await Self.confirmCostOverage(
-                        kind: "Transcription",
-                        estimated: estimated,
-                        cap: settings.costCapUSD,
-                        onIncrease: { [weak self] newCap in self?.settings.costCapUSD = newCap }
-                    )
-                    if !proceed {
-                        status = .failed(message: "Transcription cancelled — estimated cost exceeded the cap.")
-                        await teardown()
-                        return
+                // Pre-flight cost gate. Long recordings + a per-minute pricing
+                // model can push past the user's cap silently — surface the same
+                // "increase cap or cancel" modal we already use for summary /
+                // cleanup. Providers without a known per-minute price (Gemini,
+                // OpenRouter) return nil pricing and skip the gate.
+                let txPricing = resolvedTx.pricing
+                if let pricing = txPricing {
+                    let estimated = CostEstimator.estimateTranscription(durationSec: duration, pricing: pricing)
+                    if estimated > settings.costCapUSD {
+                        let proceed = await Self.confirmCostOverage(
+                            kind: "Transcription",
+                            estimated: estimated,
+                            cap: settings.costCapUSD,
+                            onIncrease: { [weak self] newCap in self?.settings.costCapUSD = newCap }
+                        )
+                        if !proceed {
+                            status = .failed(message: "Transcription cancelled — estimated cost exceeded the cap.")
+                            await teardown()
+                            return
+                        }
                     }
                 }
-            }
 
-            let result = try await provider.transcribe(
-                audioFile: audioFile,
-                config: TranscriptionConfig(language: language)
-            )
+                result = try await provider.transcribe(
+                    audioFile: audioFile,
+                    config: TranscriptionConfig(language: language)
+                )
+                usedLiveTranscript = false
+            }
 
             // Optional LLM cleanup pass — fixes ASR mistakes (numbers, names,
             // double-words, missing punctuation) without touching segment
@@ -718,20 +761,25 @@ final class RecorderState {
                 cleanedText = result.text
             }
 
-            // Persist transcript.jsonl (segments with timing — always raw) +
-            // transcript.txt (the cleaned full text users actually read).
-            // When cleanup is enabled we also save transcript.raw.txt so the
-            // raw ASR output is available for audit / re-cleanup.
-            let store = try TranscriptStore(sessionDir: dir)
-            for segment in result.segments {
-                try await store.append(segment)
+            if usedLiveTranscript, liveTranscript.persistedIncrementally {
+                try AtomicWriter.write(Data(cleanedText.utf8), to: dir.appendingPathComponent("transcript.txt"))
+            } else {
+                if usedLiveTranscript {
+                    Self.removeTranscriptSidecars(in: dir)
+                }
+                // Persist transcript.jsonl (segments with timing — always raw) +
+                // transcript.txt (the cleaned full text users actually read).
+                let store = try TranscriptStore(sessionDir: dir)
+                for segment in result.segments {
+                    try await store.append(segment)
+                }
+                try await store.close(overrideText: cleanedText)
+                // Always emit a timestamped sidecar alongside the cleaned text.
+                // `transcript.txt` may be LLM-rewritten and lose segment timing;
+                // `transcript.timestamped.txt` preserves [HH:MM:SS] anchors per
+                // raw segment so the Library player / chat can scrub by moment.
+                try? await store.writeTimestamped()
             }
-            try await store.close(overrideText: cleanedText)
-            // Always emit a timestamped sidecar alongside the cleaned text.
-            // `transcript.txt` may be LLM-rewritten and lose segment timing;
-            // `transcript.timestamped.txt` preserves [HH:MM:SS] anchors per
-            // raw segment so the Library player / chat can scrub by moment.
-            try? await store.writeTimestamped()
             // Track whether any opt-in enhancement step degraded silently —
             // `partial` surfaces that in the Library row. Also seed `partial`
             // when tier-2 fallback demoted screen recording mid-session: the
@@ -884,6 +932,40 @@ final class RecorderState {
         }
     }
 
+    nonisolated static func liveTranscriptResult(
+        from segments: [TranscriptSegment],
+        duration: TimeInterval,
+        language: String?
+    ) -> BatchTranscriptResult? {
+        let finalSegments = segments.filter(\.isFinal)
+        let text = liveTranscriptText(from: finalSegments)
+        guard !text.isEmpty else { return nil }
+        return BatchTranscriptResult(
+            language: language,
+            duration: duration,
+            segments: finalSegments,
+            text: text
+        )
+    }
+
+    nonisolated static func liveTranscriptText(from segments: [TranscriptSegment]) -> String {
+        segments
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    nonisolated static func removeTranscriptSidecars(in sessionDir: URL) {
+        for fileName in [
+            "transcript.jsonl",
+            "transcript.txt",
+            "transcript.timestamped.txt",
+            "transcript.raw.txt",
+        ] {
+            try? FileManager.default.removeItem(at: sessionDir.appendingPathComponent(fileName))
+        }
+    }
+
     // MARK: - Helpers
 
     private func teardown() async {
@@ -903,7 +985,7 @@ final class RecorderState {
         micHealth = .idle
         sleepAssertion.release()
         await cameraBubbleController.hide()
-        clearLiveTranscript()
+        await clearLiveTranscript()
     }
 
     private func previewText(_ text: String) -> String {
@@ -923,8 +1005,28 @@ final class RecorderState {
         applyLiveTranscript(await liveTranscriptAdapter.displayState())
     }
 
-    private func configureLiveTranscriptForRecording() async {
+    func liveTranscriptSnapshot() async -> LiveTranscriptState? {
+        if let hub = liveTranscriptHub {
+            return await hub.snapshot()
+        }
         if let tee = liveTranscriptTee {
+            return await tee.snapshot()
+        }
+        return nil
+    }
+
+    private func configureLiveTranscriptForRecording() async {
+        if let hub = liveTranscriptHub {
+            liveTranscriptAdapter = RecorderLiveAdapter(snapshotSource: { await hub.snapshot() })
+            liveTranscriptRefreshTask?.cancel()
+            liveTranscriptRefreshTask = Task { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    if Task.isCancelled { return }
+                    await self?.refreshLiveTranscript()
+                }
+            }
+        } else if let tee = liveTranscriptTee {
             liveTranscriptAdapter = RecorderLiveAdapter(snapshotSource: { await tee.snapshot() })
             liveTranscriptRefreshTask?.cancel()
             liveTranscriptRefreshTask = Task { @MainActor [weak self] in
@@ -940,15 +1042,40 @@ final class RecorderState {
         await refreshLiveTranscript()
     }
 
-    private func clearLiveTranscript() {
+    private func clearLiveTranscript() async {
+        _ = await finishLiveTranscript()
+    }
+
+    private func finishLiveTranscript() async -> FinishedLiveTranscript {
         liveTranscriptRefreshTask?.cancel()
         liveTranscriptRefreshTask = nil
         if let tee = liveTranscriptTee {
-            Task.detached { await tee.stop() }
+            await tee.stop()
+        }
+        if let source = streamingLiveSource {
+            await source.stop()
+        }
+        let finalSegments = await liveTranscriptHub?.finalSegments() ?? []
+        var persistedIncrementally = false
+        if let store = liveTranscriptStore {
+            do {
+                try await store.close()
+                persistedIncrementally = await store.segments() == finalSegments
+                try await store.writeTimestamped()
+            } catch {
+                Self.recorderLog.error("RecorderState: live transcript store failed to close — \(error.localizedDescription, privacy: .public)")
+            }
         }
         liveTranscriptTee = nil
+        streamingLiveSource = nil
+        liveTranscriptHub = nil
+        liveTranscriptStore = nil
         liveTranscriptAdapter = RecorderLiveAdapter()
         applyLiveTranscript(.empty)
+        return FinishedLiveTranscript(
+            finalSegments: finalSegments,
+            persistedIncrementally: persistedIncrementally
+        )
     }
 
     private func applyLiveTranscript(_ display: RecorderLiveAdapter.DisplayState) {

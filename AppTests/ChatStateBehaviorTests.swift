@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import AIKit
+import TranscriptionKit
 @testable import KosmoNotes
 
 @MainActor
@@ -41,5 +42,29 @@ struct ChatStateBehaviorTests {
         ChatState.rollbackUserMessage(at: 1, matching: failedUser, from: &messages)
 
         #expect(messages == [oldAssistant, laterSystem])
+    }
+
+    @Test("live transcript context includes stable and draft text")
+    func liveTranscriptContextIncludesStableAndDraftText() {
+        let state = LiveTranscriptState(
+            stableUnits: [
+                .init(start: 1, end: 2, text: "first committed point", state: .stable),
+            ],
+            draftUnits: [
+                .init(start: 2, end: 3, text: "mutable tail", state: .draft),
+            ],
+            status: .healthy
+        )
+
+        let section = ChatState.liveTranscriptPromptSection(from: state, maxCharacters: 1_000)
+
+        #expect(section?.contains("== Active recording live transcript ==") == true)
+        #expect(section?.contains("first committed point") == true)
+        #expect(section?.contains("[draft] mutable tail") == true)
+    }
+
+    @Test("empty live transcript context is omitted")
+    func emptyLiveTranscriptContextIsOmitted() {
+        #expect(ChatState.liveTranscriptPromptSection(from: .empty, maxCharacters: 1_000) == nil)
     }
 }
