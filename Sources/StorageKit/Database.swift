@@ -103,6 +103,54 @@ public struct SearchHit: Sendable, Equatable {
     }
 }
 
+public enum KnowledgeBaseSourceKind: String, Sendable, Codable, Equatable {
+    case document
+    case codeFolder = "code_folder"
+}
+
+public struct KnowledgeBaseSource: Sendable, Codable, Equatable, Identifiable {
+    public let id: String
+    public let kind: KnowledgeBaseSourceKind
+    public let path: String
+    public let createdAt: Date
+
+    public init(id: String, kind: KnowledgeBaseSourceKind, path: String, createdAt: Date) {
+        self.id = id
+        self.kind = kind
+        self.path = path
+        self.createdAt = createdAt
+    }
+}
+
+public struct KnowledgeBaseHit: Sendable, Equatable {
+    public let sourceID: String
+    public let documentID: String
+    public let relPath: String
+    public let chunkIndex: Int
+    public let snippet: String
+
+    public init(
+        sourceID: String,
+        documentID: String,
+        relPath: String,
+        chunkIndex: Int,
+        snippet: String
+    ) {
+        self.sourceID = sourceID
+        self.documentID = documentID
+        self.relPath = relPath
+        self.chunkIndex = chunkIndex
+        self.snippet = snippet
+    }
+}
+
+struct KnowledgeBaseIndexedDocument: Sendable, Equatable {
+    let relPath: String
+    let mtime: Date
+    let size: Int64
+    let chunks: [String]
+}
+
 // MARK: - AppDatabase
 
 // Named AppDatabase rather than Database to avoid shadowing GRDB.Database,
@@ -168,6 +216,40 @@ public actor AppDatabase {
             try db.execute(sql: """
                 ALTER TABLE sessions
                 ADD COLUMN enhancement_status TEXT NOT NULL DEFAULT 'ok';
+                """)
+        }
+        migrator.registerMigration("v4_knowledge_base") { db in
+            try db.execute(sql: """
+                CREATE TABLE kb_sources (
+                    id         TEXT PRIMARY KEY,
+                    kind       TEXT NOT NULL,
+                    path       TEXT NOT NULL UNIQUE,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE kb_documents (
+                    id        TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES kb_sources(id) ON DELETE CASCADE,
+                    rel_path  TEXT NOT NULL,
+                    mtime     REAL NOT NULL,
+                    size      INTEGER NOT NULL,
+                    UNIQUE(source_id, rel_path)
+                );
+                CREATE VIRTUAL TABLE kb_chunks_fts USING fts5(
+                    source_id UNINDEXED,
+                    doc_id UNINDEXED,
+                    rel_path UNINDEXED,
+                    chunk_index UNINDEXED,
+                    text,
+                    tokenize = 'unicode61 tokenchars ''_'''
+                );
+                CREATE TABLE kb_embeddings (
+                    doc_id      TEXT NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+                    chunk_index INTEGER NOT NULL,
+                    vector      BLOB NOT NULL,
+                    model       TEXT NOT NULL,
+                    indexed_at  REAL NOT NULL,
+                    PRIMARY KEY(doc_id, chunk_index)
+                );
                 """)
         }
         try migrator.migrate(pool)
@@ -321,7 +403,141 @@ public actor AppDatabase {
         }
     }
 
+    // MARK: - Knowledge base
+
+    func addKnowledgeBaseSource(kind: KnowledgeBaseSourceKind, path: String) async throws -> KnowledgeBaseSource {
+        if let existing = try await knowledgeBaseSource(path: path) {
+            return existing
+        }
+
+        let source = KnowledgeBaseSource(
+            id: UUID().uuidString.lowercased(),
+            kind: kind,
+            path: path,
+            createdAt: Date()
+        )
+        try await pool.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO kb_sources (id, kind, path, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                arguments: [source.id, source.kind.rawValue, source.path, source.createdAt.timeIntervalSince1970]
+            )
+        }
+        return source
+    }
+
+    func listKnowledgeBaseSources() async throws -> [KnowledgeBaseSource] {
+        try await pool.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT * FROM kb_sources ORDER BY created_at ASC"
+            )
+            return rows.map(Self.rowToKnowledgeBaseSource)
+        }
+    }
+
+    func deleteKnowledgeBaseSource(id: String) async throws {
+        try await pool.write { db in
+            try db.execute(sql: "DELETE FROM kb_chunks_fts WHERE source_id = ?", arguments: [id])
+            try db.execute(
+                sql: """
+                    DELETE FROM kb_embeddings
+                    WHERE doc_id IN (SELECT id FROM kb_documents WHERE source_id = ?)
+                    """,
+                arguments: [id]
+            )
+            try db.execute(sql: "DELETE FROM kb_documents WHERE source_id = ?", arguments: [id])
+            try db.execute(sql: "DELETE FROM kb_sources WHERE id = ?", arguments: [id])
+        }
+    }
+
+    func replaceKnowledgeBaseIndex(
+        sourceID: String,
+        documents: [KnowledgeBaseIndexedDocument]
+    ) async throws {
+        try await pool.write { db in
+            try db.execute(sql: "DELETE FROM kb_chunks_fts WHERE source_id = ?", arguments: [sourceID])
+            try db.execute(
+                sql: """
+                    DELETE FROM kb_embeddings
+                    WHERE doc_id IN (SELECT id FROM kb_documents WHERE source_id = ?)
+                    """,
+                arguments: [sourceID]
+            )
+            try db.execute(sql: "DELETE FROM kb_documents WHERE source_id = ?", arguments: [sourceID])
+
+            for document in documents {
+                let documentID = Self.knowledgeBaseDocumentID(sourceID: sourceID, relPath: document.relPath)
+                try db.execute(
+                    sql: """
+                        INSERT INTO kb_documents (id, source_id, rel_path, mtime, size)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        documentID,
+                        sourceID,
+                        document.relPath,
+                        document.mtime.timeIntervalSince1970,
+                        document.size,
+                    ]
+                )
+                for (index, chunk) in document.chunks.enumerated() {
+                    try db.execute(
+                        sql: """
+                            INSERT INTO kb_chunks_fts (source_id, doc_id, rel_path, chunk_index, text)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                        arguments: [sourceID, documentID, document.relPath, index, chunk]
+                    )
+                }
+            }
+        }
+    }
+
+    func searchKnowledgeBase(query: String, limit: Int = 20) async throws -> [KnowledgeBaseHit] {
+        guard let pattern = Self.knowledgeBaseSearchPattern(matchingAllTokensIn: query) else { return [] }
+        return try await pool.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT source_id,
+                           doc_id,
+                           rel_path,
+                           chunk_index,
+                           snippet(kb_chunks_fts, 4, '<b>', '</b>', '…', 16) AS snip
+                    FROM kb_chunks_fts
+                    WHERE kb_chunks_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                arguments: [pattern, limit]
+            )
+            return rows.map { row in
+                KnowledgeBaseHit(
+                    sourceID: row["source_id"],
+                    documentID: row["doc_id"],
+                    relPath: row["rel_path"],
+                    chunkIndex: row["chunk_index"],
+                    snippet: row["snip"]
+                )
+            }
+        }
+    }
+
     // MARK: - Helpers
+
+    private func knowledgeBaseSource(path: String) async throws -> KnowledgeBaseSource? {
+        try await pool.read { db in
+            let row = try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM kb_sources WHERE path = ? LIMIT 1",
+                arguments: [path]
+            )
+            return row.map(Self.rowToKnowledgeBaseSource)
+        }
+    }
 
     private static func rowToRecord(_ row: Row) -> SessionRecord {
         // recorded_at is stored as Unix epoch (REAL). Convert at the boundary.
@@ -340,5 +556,30 @@ public actor AppDatabase {
             status: SessionStatus(rawValue: row["status"]) ?? .failed,
             enhancementStatus: enhancement
         )
+    }
+
+    private static func rowToKnowledgeBaseSource(_ row: Row) -> KnowledgeBaseSource {
+        let epoch: Double = row["created_at"]
+        let kindRaw: String = row["kind"]
+        return KnowledgeBaseSource(
+            id: row["id"],
+            kind: KnowledgeBaseSourceKind(rawValue: kindRaw) ?? .document,
+            path: row["path"],
+            createdAt: Date(timeIntervalSince1970: epoch)
+        )
+    }
+
+    private static func knowledgeBaseDocumentID(sourceID: String, relPath: String) -> String {
+        "\(sourceID):\(relPath)"
+    }
+
+    private static func knowledgeBaseSearchPattern(matchingAllTokensIn query: String) -> String? {
+        let tokenScalars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_"))
+        let tokens = query.unicodeScalars
+            .split { !tokenScalars.contains($0) }
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { return nil }
+        return tokens.map { "\"\($0)\"" }.joined(separator: " ")
     }
 }

@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import os
+import StorageKit
 
 private let agentSessionLog = Logger(subsystem: "dev.kosmonotes.studio", category: "AgentSession")
 
@@ -43,6 +44,7 @@ final class AgentSessionState {
     // MARK: - Dependencies
 
     private let settings: AppSettings
+    private let knowledgeBaseStore: KnowledgeBaseStore?
     /// One of these is non-nil while a session runs. Built-in backend uses
     /// AgentRunner; CLI backends use ExternalAgentRunner. Polymorphism via
     /// helpers below to avoid an extra protocol layer.
@@ -65,8 +67,9 @@ final class AgentSessionState {
         return e
     }()
 
-    init(settings: AppSettings) {
+    init(settings: AppSettings, knowledgeBaseStore: KnowledgeBaseStore? = nil) {
         self.settings = settings
+        self.knowledgeBaseStore = knowledgeBaseStore
     }
 
     // MARK: - Public API
@@ -175,11 +178,21 @@ final class AgentSessionState {
             return
         }
 
-        let tools: [AgentTool] = [
+        var tools: [AgentTool] = [
             BashTool(workspace: workspace),
             ReadFileTool(workspace: workspace),
             WriteFileTool(workspace: workspace),
         ]
+        if let knowledgeBaseStore {
+            tools.append(SearchKnowledgeBaseTool(store: knowledgeBaseStore))
+            let codeRoots = (try? await knowledgeBaseStore.listSources())
+                .map { sources in
+                    sources
+                        .filter { $0.kind == .codeFolder }
+                        .map { URL(fileURLWithPath: $0.path, isDirectory: true) }
+                } ?? []
+            tools.append(SearchCodeTool(roots: codeRoots))
+        }
         let systemPrompt = settings.agentSystemPrompt.isEmpty
             ? AppSettings.defaultAgentSystemPrompt
             : settings.agentSystemPrompt

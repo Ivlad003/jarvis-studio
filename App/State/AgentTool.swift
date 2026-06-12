@@ -1,5 +1,6 @@
 import Foundation
 import os
+import StorageKit
 
 private let agentToolLog = Logger(subsystem: "dev.kosmonotes.studio", category: "AgentTool")
 
@@ -317,7 +318,7 @@ public struct BashTool: AgentTool {
 
     /// Drain a pipe synchronously into a String, capped at `capBytes`.
     /// Runs on a detached Task — never on the actor that owns the spawn.
-    private static func readAll(_ handle: FileHandle, capBytes: Int) -> String {
+    static func readAll(_ handle: FileHandle, capBytes: Int) -> String {
         var buf = Data()
         while true {
             let chunk: Data
@@ -345,7 +346,7 @@ public struct BashTool: AgentTool {
     /// Minimal env: PATH covering the standard system bins + workspace as
     /// HOME/PWD analogues. Nothing inherited from the parent so the child
     /// can't see KOSMONOTES_API_KEY-style secrets the host might have set.
-    private static func minimalEnvironment(cwd: URL) -> [String: String] {
+    static func minimalEnvironment(cwd: URL) -> [String: String] {
         return [
             "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin:/usr/sbin:/sbin",
             "HOME": cwd.path,
@@ -353,6 +354,193 @@ public struct BashTool: AgentTool {
             "LANG": "en_US.UTF-8",
             "TERM": "dumb",
         ]
+    }
+}
+
+public struct SearchKnowledgeBaseTool: AgentTool {
+    public let name = "search_knowledge_base"
+    public let description = "Search user-added local knowledge-base documents and code chunks. Returns matching file paths and snippets."
+    public let inputSchema: [String: Any] = [
+        "type": "object",
+        "properties": [
+            "query": ["type": "string", "description": "Words or code identifier to search for."],
+            "limit": ["type": "integer", "description": "Maximum hits to return, from 1 to 20."],
+        ],
+        "required": ["query"],
+    ]
+
+    private let store: KnowledgeBaseStore
+
+    public init(store: KnowledgeBaseStore) {
+        self.store = store
+    }
+
+    public func execute(input: [String: Any]) async throws -> String {
+        guard let query = input["query"] as? String else {
+            throw AgentToolError.badInput("search_knowledge_base: missing 'query'")
+        }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw AgentToolError.badInput("search_knowledge_base: empty query")
+        }
+
+        let limit = Self.clampedLimit(from: input["limit"], defaultValue: 8, upperBound: 20)
+        let hits = try await store.search(query: trimmed, limit: limit)
+        guard !hits.isEmpty else {
+            return "No knowledge-base matches for `\(trimmed)`."
+        }
+
+        return hits.enumerated().map { index, hit in
+            "[\(index + 1)] \(hit.relPath)#chunk-\(hit.chunkIndex)\n\(hit.snippet)"
+        }.joined(separator: "\n\n")
+    }
+
+    private static func clampedLimit(from value: Any?, defaultValue: Int, upperBound: Int) -> Int {
+        let raw: Int
+        if let value = value as? Int {
+            raw = value
+        } else if let value = value as? Double {
+            raw = Int(value)
+        } else if let value = value as? NSNumber {
+            raw = value.intValue
+        } else {
+            raw = defaultValue
+        }
+        return max(1, min(raw, upperBound))
+    }
+}
+
+public struct SearchCodeTool: AgentTool {
+    public let name = "search_code"
+    public let description = "Search configured code-folder roots with ripgrep. Runs argv-direct, fixed-string rg; optional path must stay inside a configured code root."
+    public let inputSchema: [String: Any] = [
+        "type": "object",
+        "properties": [
+            "query": ["type": "string", "description": "Literal string or identifier to search for."],
+            "path": ["type": "string", "description": "Optional absolute file or folder path inside a configured code-folder source."],
+            "limit": ["type": "integer", "description": "Maximum matches per file, from 1 to 50."],
+        ],
+        "required": ["query"],
+    ]
+
+    private let roots: [URL]
+
+    public init(roots: [URL]) {
+        self.roots = roots.map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+    }
+
+    public func execute(input: [String: Any]) async throws -> String {
+        guard let query = input["query"] as? String else {
+            throw AgentToolError.badInput("search_code: missing 'query'")
+        }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw AgentToolError.badInput("search_code: empty query")
+        }
+        guard !roots.isEmpty else {
+            return "No code-folder sources are configured."
+        }
+
+        let targets: [URL]
+        if let path = input["path"] as? String, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let target = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+            _ = try matchingRoot(for: target)
+            targets = [target]
+        } else {
+            targets = roots
+        }
+
+        let limit = Self.clampedLimit(from: input["limit"], defaultValue: 20, upperBound: 50)
+        let executable = try BashTool.resolveBinary("rg")
+        let args = [
+            "--line-number",
+            "--no-heading",
+            "--color",
+            "never",
+            "--fixed-strings",
+            "--max-count",
+            "\(limit)",
+            "--",
+            trimmed,
+        ] + targets.map(\.path)
+
+        return try await runRipgrep(executable: executable, args: args, query: trimmed, cwd: targets[0])
+    }
+
+    private func matchingRoot(for target: URL) throws -> URL {
+        for root in roots {
+            do {
+                try AgentToolGuard.requireInsideWorkspace(target, workspace: root, tool: "search_code")
+                return root
+            } catch AgentToolError.notAllowed {
+                continue
+            }
+        }
+        throw AgentToolError.notAllowed("search_code: path outside workspace (\(roots.map(\.path).joined(separator: ", ")))")
+    }
+
+    private func runRipgrep(executable: String, args: [String], query: String, cwd: URL) async throws -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = args
+        proc.currentDirectoryURL = cwd
+        proc.environment = BashTool.minimalEnvironment(cwd: cwd)
+        proc.standardInput = FileHandle.nullDevice
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        proc.standardOutput = stdoutPipe
+        proc.standardError = stderrPipe
+
+        let exit = AgentProcessSignal()
+        proc.terminationHandler = { _ in exit.fire() }
+
+        do {
+            try proc.run()
+        } catch {
+            throw AgentToolError.runtime("search_code launch failed: \(error.localizedDescription)")
+        }
+
+        let stdoutTask = Task.detached { BashTool.readAll(stdoutPipe.fileHandleForReading, capBytes: 32_000) }
+        let stderrTask = Task.detached { BashTool.readAll(stderrPipe.fileHandleForReading, capBytes: 16_000) }
+        let timeoutTask = Task.detached {
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            if proc.isRunning {
+                proc.terminate()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if proc.isRunning {
+                    kill(proc.processIdentifier, SIGKILL)
+                }
+            }
+        }
+
+        await exit.wait()
+        timeoutTask.cancel()
+        let stdout = await stdoutTask.value
+        let stderr = await stderrTask.value
+
+        switch proc.terminationStatus {
+        case 0:
+            return "$ rg --fixed-strings \(query)\n\(stdout)"
+        case 1:
+            return "No code matches for `\(query)`."
+        default:
+            throw AgentToolError.runtime("search_code: rg exited \(proc.terminationStatus): \(stderr)")
+        }
+    }
+
+    private static func clampedLimit(from value: Any?, defaultValue: Int, upperBound: Int) -> Int {
+        let raw: Int
+        if let value = value as? Int {
+            raw = value
+        } else if let value = value as? Double {
+            raw = Int(value)
+        } else if let value = value as? NSNumber {
+            raw = value.intValue
+        } else {
+            raw = defaultValue
+        }
+        return max(1, min(raw, upperBound))
     }
 }
 

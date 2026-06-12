@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recorderHolder: AnyObject?       // RecorderState (macOS 14+)
     private var databaseHolder: AnyObject?       // AppDatabase
     private var sessionStoreHolder: AnyObject?   // SessionStore
+    private var knowledgeBaseStoreHolder: AnyObject? // KnowledgeBaseStore
     private var chatHolder: AnyObject?           // ChatState (macOS 14+)
     private var dictationHolder: AnyObject?      // DictationState (macOS 14+)
     private var pushToMarkdownHolder: AnyObject? // PushToMarkdownState (macOS 14+)
@@ -594,7 +595,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // restricted to the workspace folder. Hotkey installs even when
             // disabled (it bails inside handlePress on the toggle), so a
             // future enable doesn't require relaunch.
-            let agentSession = AgentSessionState(settings: settings)
+            let knowledgeBaseStore = KnowledgeBaseStore(database: database)
+            self.knowledgeBaseStoreHolder = knowledgeBaseStore
+
+            let agentSession = AgentSessionState(settings: settings, knowledgeBaseStore: knowledgeBaseStore)
             self.agentSessionHolder = agentSession
             let agentHotkey = AgentHotkeyState(
                 settings: settings,
