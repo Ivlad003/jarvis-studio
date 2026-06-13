@@ -63,6 +63,20 @@ private func makeSession(
     return session
 }
 
+private func repoFile(_ relativePath: String) throws -> String {
+    let testFile = URL(fileURLWithPath: #filePath)
+    let repoRoot = testFile
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let fileURL = relativePath
+        .split(separator: "/")
+        .reduce(repoRoot) { partial, component in
+            partial.appendingPathComponent(String(component))
+        }
+    return try String(contentsOf: fileURL, encoding: .utf8)
+}
+
 // MARK: - Tests
 
 @Suite("ReconnectingSession — reconnect on disconnect", .serialized)
@@ -310,6 +324,30 @@ struct BackoffScheduleTests {
         let sleeps = clock.recordedSleeps
         #expect(sleeps.count == ReconnectingSession.maxRetries)
         #expect(sleeps == ReconnectingSession.backoffSchedule)
+    }
+}
+
+@Suite("ReconnectingSession — KeepAlive", .serialized)
+struct KeepAliveTests {
+
+    @Test("Sends KeepAlive after about five seconds without audio")
+    func sendsKeepAliveAfterAboutFiveSecondsWithoutAudio() async throws {
+        let transport = MockWebSocketTransport()
+        let session = await makeSession(factory: { transport })
+
+        try await Task.sleep(nanoseconds: 6_200_000_000)
+
+        #expect(transport.recordedSends.contains(.text(DeepgramProvider.keepAliveMessage)))
+        await session.cancel()
+    }
+
+    @Test("KeepAlive loop uses injectable clock instead of hardcoded Task.sleep")
+    func keepAliveLoopUsesInjectableClock() throws {
+        let source = try repoFile("Sources/TranscriptionKit/ReconnectingSession.swift")
+
+        #expect(source.contains("keepAliveIntervalSeconds: Double = 5.0"))
+        #expect(source.contains("keepAliveClock.sleep(seconds: keepAliveIntervalSeconds)"))
+        #expect(!source.contains("keepAliveIntervalNanoseconds: UInt64 = 8_000_000_000"))
     }
 }
 

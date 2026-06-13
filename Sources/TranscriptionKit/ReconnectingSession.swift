@@ -49,6 +49,7 @@ public actor ReconnectingSession {
     private let transportFactory: @Sendable () -> any WebSocketTransport
     private let parserFactory: @Sendable (TimeInterval) -> TranscriptionEventParser
     private let clock: any ReconnectClock
+    private let keepAliveClock: any ReconnectClock
     private let audioBytesPerSecond: Double?
     private let defaultCloseMessage: String?
     private let finishDrainTimeoutNanoseconds: UInt64
@@ -68,7 +69,7 @@ public actor ReconnectingSession {
     private var closed = false
     private var receiveLoopFinished = false
     private static let keepAliveMessage = #"{"type":"KeepAlive"}"#
-    private static let keepAliveIntervalNanoseconds: UInt64 = 8_000_000_000
+    private static let keepAliveIntervalSeconds: Double = 5.0
 
     // MARK: Init
 
@@ -76,6 +77,7 @@ public actor ReconnectingSession {
         transportFactory: @escaping @Sendable () -> any WebSocketTransport,
         parser: TranscriptionEventParser,
         clock: any ReconnectClock = SystemClock(),
+        keepAliveClock: any ReconnectClock = SystemClock(),
         defaultCloseMessage: String? = nil,
         finishDrainTimeoutNanoseconds: UInt64 = 2_500_000_000
     ) {
@@ -86,6 +88,7 @@ public actor ReconnectingSession {
         self.transportFactory = transportFactory
         self.parserFactory = { _ in parser }
         self.clock = clock
+        self.keepAliveClock = keepAliveClock
         self.audioBytesPerSecond = nil
         self.defaultCloseMessage = defaultCloseMessage
         self.finishDrainTimeoutNanoseconds = finishDrainTimeoutNanoseconds
@@ -96,6 +99,7 @@ public actor ReconnectingSession {
         transportFactory: @escaping @Sendable () -> any WebSocketTransport,
         parserFactory: @escaping @Sendable (TimeInterval) -> TranscriptionEventParser,
         clock: any ReconnectClock = SystemClock(),
+        keepAliveClock: any ReconnectClock = SystemClock(),
         audioBytesPerSecond: Double,
         defaultCloseMessage: String? = nil,
         finishDrainTimeoutNanoseconds: UInt64 = 2_500_000_000
@@ -107,6 +111,7 @@ public actor ReconnectingSession {
         self.transportFactory = transportFactory
         self.parserFactory = parserFactory
         self.clock = clock
+        self.keepAliveClock = keepAliveClock
         self.audioBytesPerSecond = audioBytesPerSecond > 0 ? audioBytesPerSecond : nil
         self.defaultCloseMessage = defaultCloseMessage
         self.finishDrainTimeoutNanoseconds = finishDrainTimeoutNanoseconds
@@ -308,9 +313,11 @@ public actor ReconnectingSession {
 
     private func startKeepAlive() {
         guard keepAliveTask == nil else { return }
+        let keepAliveClock = self.keepAliveClock
+        let keepAliveIntervalSeconds = Self.keepAliveIntervalSeconds
         let task = Task.detached { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: Self.keepAliveIntervalNanoseconds)
+                await keepAliveClock.sleep(seconds: keepAliveIntervalSeconds)
                 if Task.isCancelled { return }
                 await self?.sendKeepAliveIfOpen()
             }

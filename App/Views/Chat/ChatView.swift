@@ -560,7 +560,7 @@ private struct MessageBubble: View {
     private var toolActivityBody: some View {
         HStack {
             VStack(alignment: .leading, spacing: 8) {
-                ForEach(Array(toolRows.enumerated()), id: \.offset) { _, row in
+                ForEach(toolRows) { row in
                     VStack(alignment: .leading, spacing: 4) {
                         Label(row.title, systemImage: row.icon)
                             .font(.caption.weight(.semibold))
@@ -594,18 +594,28 @@ private struct MessageBubble: View {
         }
     }
 
-    private var toolRows: [(title: String, detail: String, icon: String, color: Color)] {
+    private struct ToolActivityRow: Identifiable {
+        let id: String
+        let title: String
+        let detail: String
+        let icon: String
+        let color: Color
+    }
+
+    private var toolRows: [ToolActivityRow] {
         message.parts.compactMap { part in
             switch part {
             case .toolUse(let call):
-                return (
+                return ToolActivityRow(
+                    id: "\(message.id.uuidString)-tool-use-\(call.id)",
                     title: "Calling \(call.name)",
                     detail: (try? call.arguments.jsonString()) ?? "",
                     icon: "wrench.and.screwdriver",
                     color: Color.accentColor
                 )
-            case .toolResult(_, let content, let isError):
-                return (
+            case .toolResult(let id, let content, let isError):
+                return ToolActivityRow(
+                    id: "\(message.id.uuidString)-tool-result-\(id)",
                     title: isError ? "Tool error" : "Tool result",
                     detail: content,
                     icon: isError ? "exclamationmark.triangle" : "checkmark.circle",

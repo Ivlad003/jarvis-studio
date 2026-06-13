@@ -268,6 +268,21 @@ struct DeepgramProviderSessionTests {
         #expect(mock.closeCode == .abnormalClosure)
     }
 
+    @Test("openSession sends KeepAlive after about five seconds without audio")
+    func openSessionSendsKeepAliveAfterAboutFiveSecondsWithoutAudio() async throws {
+        let mock = MockWebSocketTransport()
+        let provider = DeepgramProvider(
+            apiKey: "test-key",
+            transportFactory: { _, _ in mock }
+        )
+
+        let session = try await provider.openSession(config: TranscriptionConfig())
+        try await Task.sleep(nanoseconds: 6_200_000_000)
+
+        #expect(mock.recordedSends.contains(.text(DeepgramProvider.keepAliveMessage)))
+        await session.cancel()
+    }
+
     @Test("send() after finish() throws alreadyClosed")
     func sendAfterFinishThrows() async throws {
         let mock = MockWebSocketTransport()

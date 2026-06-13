@@ -51,7 +51,7 @@ public actor TranscriptionSession {
     private var receiveLoopFinished = false
 
     private static let keepAliveMessage = #"{"type":"KeepAlive"}"#
-    private static let keepAliveIntervalNanoseconds: UInt64 = 8_000_000_000
+    private static let keepAliveIntervalSeconds: Double = 5.0
 
     // MARK: Init
 
@@ -185,7 +185,7 @@ public actor TranscriptionSession {
         let transport = self.transport
         let task = Task.detached {
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: Self.keepAliveIntervalNanoseconds)
+                try? await Task.sleep(nanoseconds: UInt64(Self.keepAliveIntervalSeconds * 1_000_000_000))
                 if Task.isCancelled { return }
                 try? await transport.send(.text(Self.keepAliveMessage))
             }

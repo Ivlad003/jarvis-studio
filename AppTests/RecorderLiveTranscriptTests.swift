@@ -1,9 +1,24 @@
+import Foundation
 import Testing
 import TranscriptionKit
 @testable import KosmoNotes
 
 @Suite("Recorder live transcript")
 struct RecorderLiveTranscriptTests {
+
+    private func repoFile(_ relativePath: String) throws -> String {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repoRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let fileURL = relativePath
+            .split(separator: "/")
+            .reduce(repoRoot) { partial, component in
+                partial.appendingPathComponent(String(component))
+            }
+        return try String(contentsOf: fileURL, encoding: .utf8)
+    }
+
     @Test("live finals build a batch-equivalent result")
     func liveFinalsBuildBatchEquivalentResult() {
         let result = RecorderState.liveTranscriptResult(
@@ -32,5 +47,15 @@ struct RecorderLiveTranscriptTests {
         )
 
         #expect(result == nil)
+    }
+
+    @Test("live FTS indexing uses a coarse cadence gate")
+    func liveFTSIndexingUsesCoarseCadenceGate() throws {
+        let source = try repoFile("App/State/RecorderState.swift")
+
+        #expect(source.contains("LiveTranscriptIndexCadence"))
+        #expect(source.contains("minimumInterval: 30"))
+        #expect(source.contains("liveIndexCadence.shouldIndex"))
+        #expect(!source.contains("try? await sessionStore.indexTranscript(sid: streamingSessionID, text: text)"))
     }
 }

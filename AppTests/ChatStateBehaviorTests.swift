@@ -139,6 +139,15 @@ struct ChatStateBehaviorTests {
         #expect(chatStateSource.contains("runLiveTranscriptPreviewLoop"))
     }
 
+    @Test("tool activity rows are keyed by stable tool identity")
+    func toolActivityRowsAreKeyedByStableToolIdentity() throws {
+        let chatViewSource = try repoFile("App/Views/Chat/ChatView.swift")
+
+        #expect(!chatViewSource.contains("ForEach(Array(toolRows.enumerated()), id: \\.offset)"))
+        #expect(chatViewSource.contains("ToolActivityRow"))
+        #expect(chatViewSource.contains("ForEach(toolRows)"))
+    }
+
     @Test("send executes live transcript tools through the shared tool loop")
     func sendExecutesLiveTranscriptToolsThroughSharedToolLoop() async throws {
         let calls = ToolLoopChatProviderCalls()

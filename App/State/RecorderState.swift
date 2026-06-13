@@ -22,6 +22,26 @@ private extension AppSettings.AudioCodec {
     }
 }
 
+@available(macOS 14.0, *)
+actor LiveTranscriptIndexCadence {
+    private let minimumInterval: TimeInterval
+    private var lastIndexedAt: Date?
+
+    init(minimumInterval: TimeInterval) {
+        self.minimumInterval = minimumInterval
+    }
+
+    func shouldIndex(now: Date = Date()) -> Bool {
+        guard let lastIndexedAt else {
+            self.lastIndexedAt = now
+            return true
+        }
+        guard now.timeIntervalSince(lastIndexedAt) >= minimumInterval else { return false }
+        self.lastIndexedAt = now
+        return true
+    }
+}
+
 // MARK: - RecorderState
 
 /// The single mutable record-time state object for the app.
@@ -411,6 +431,7 @@ final class RecorderState {
             }
             let sessionStore = self.sessionStore
             let streamingSessionID = session.id
+            let liveIndexCadence = LiveTranscriptIndexCadence(minimumInterval: 30)
             let liveStore: TranscriptStore?
             do {
                 liveStore = try TranscriptStore(sessionDir: dir)
@@ -426,7 +447,11 @@ final class RecorderState {
                 let segments = await liveStore.segments()
                 let text = Self.liveTranscriptText(from: segments)
                 guard !text.isEmpty else { return }
-                try? await sessionStore.indexTranscript(sid: streamingSessionID, text: text)
+                guard await liveIndexCadence.shouldIndex() else { return }
+                try? await sessionStore.indexTranscript(
+                    sid: streamingSessionID,
+                    text: text
+                )
             })
             if let streamingSource = settings.makeStreamingLiveSource(hub: hub) {
                 do {
