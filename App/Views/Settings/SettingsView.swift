@@ -231,8 +231,9 @@ private struct TranscriptionTab: View {
 
             Section("System audio source") {
                 SystemAudioSourcePicker(settings: settings)
-                Toggle("Echo cancellation (recommended with speakers)", isOn: $settings.echoCancellationEnabled)
-                Text("Removes meeting audio picked up by the microphone when playing through speakers. Uses Apple voice processing; slight mic-tone change is normal. Turn off for high-fidelity ambient recording.")
+                Toggle("Echo cancellation (temporarily unavailable — under repair)", isOn: $settings.echoCancellationEnabled)
+                    .disabled(true)
+                Text("Apple voice processing currently prevents the microphone from delivering audio on this build, so echo cancellation is disabled. Recording the meeting works without it; the other party is captured cleanly from the system-audio (\u{201C}Them\u{201D}) stream.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

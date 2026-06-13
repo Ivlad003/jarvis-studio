@@ -40,7 +40,6 @@ final class AppSettings {
         static let ollamaBearer = "ollamaBearer"
         static let systemAudioEnabled = "systemAudioEnabled"
         static let echoCancellationEnabled = "echoCancellationEnabled"
-        static let echoCancellationMigratedOff = "echoCancellationMigratedOff_v1"
         static let dictationLLMCleanup = "dictationLLMCleanup"
         // Three insertion strategies for the cleaned dictation transcript:
         //   - axapiThenClipboard (faster, less reliable in Electron)
@@ -618,20 +617,16 @@ final class AppSettings {
         self.ollamaModel = UserDefaults.standard.string(forKey: Defaults.ollamaModel) ?? "qwen2.5:14b"
 
         self.systemAudioEnabled = UserDefaults.standard.bool(forKey: Defaults.systemAudioEnabled)
-        // Echo cancellation (VoiceProcessingIO) defaults OFF. The duplex VPIO
-        // unit only delivers audio while the engine renders an output path,
-        // which this input-tap-only engine doesn't provide — so turning it on
-        // makes the mic tap never fire and recording fails. (Adding that output
-        // path throws an uncatchable CoreAudio -10868 on real AUHAL/aggregate
-        // formats; see the NOTE in AudioEngine.applyVoiceProcessingIfNeeded.)
-        // One-time migration flips any previously-persisted `true` (the old D21
-        // default) to false so existing installs record again. The user can
-        // still re-enable it afterwards.
-        if UserDefaults.standard.object(forKey: Defaults.echoCancellationMigratedOff) == nil {
-            UserDefaults.standard.set(false, forKey: Defaults.echoCancellationEnabled)
-            UserDefaults.standard.set(true, forKey: Defaults.echoCancellationMigratedOff)
-        }
-        self.echoCancellationEnabled = (UserDefaults.standard.object(forKey: Defaults.echoCancellationEnabled) as? Bool) ?? false
+        // Echo cancellation (VoiceProcessingIO) is FORCED OFF and its Settings
+        // toggle is disabled. VPIO is a duplex unit that only feeds the mic tap
+        // while an output render path renders; this input-tap-only engine has
+        // none, so enabling it makes the mic tap never fire → zero captured
+        // audio (confirmed on-device 2026-06-13). Adding the output path throws
+        // an uncatchable CoreAudio -10868. Ignoring any stored value keeps every
+        // consumer (capture, MicPathPlan, warnings) consistent. Re-enable here
+        // AND in SettingsView once a real VPIO fix is verified on a device.
+        // See the NOTE in AudioEngine.applyVoiceProcessingIfNeeded.
+        self.echoCancellationEnabled = false
         // Default true for cleanup; UserDefaults.bool returns false for missing keys, so check object presence.
         self.dictationLLMCleanup = (UserDefaults.standard.object(forKey: Defaults.dictationLLMCleanup) as? Bool) ?? true
         // Default `clipboardSimulatedV` — universal compatibility. The
