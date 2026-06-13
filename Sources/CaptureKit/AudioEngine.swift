@@ -340,9 +340,9 @@ public actor AudioEngine {
         // no nodes are in use yet. Just reading the property is enough.
         let inputNode = engine.inputNode
 
-        // VoiceProcessingIO is useful for speaker echo cancellation only when
-        // AGC is disabled and ducking is minimized; the tap converts its mono
-        // source format back into the pipeline's configured format.
+        // Keep this disabled for app-level echo cancellation. VoiceProcessingIO
+        // is a duplex output-render unit; speaker AEC is handled after capture
+        // by CaptureSession's DSP processor.
         applyVoiceProcessingIfNeeded(on: inputNode, context: "start")
 
         // (BT swap already happened above, before AVAudioEngine() — no need
@@ -903,14 +903,15 @@ public actor AudioEngine {
             audioEngineLog.error("AudioEngine.\(context, privacy: .public): voice processing unavailable — \(error.localizedDescription, privacy: .public)")
         }
     }
-    // NOTE (D21): VoiceProcessingIO is a *duplex* unit — it only delivers the
+    // NOTE (D21/D22): VoiceProcessingIO is a *duplex* unit — it only delivers the
     // echo-cancelled mic to our tap while the engine renders its OUTPUT side.
     // This engine is input-tap-only (no output graph), so enabling voice
     // processing makes the input callback never fire ("tap did not fire within
     // 8 s" → zero captured audio). Attempts to add the output render path
     // (connect input→mainMixer, muted) throw an uncatchable CoreAudio -10868
-    // on this AUHAL/aggregate format. Until that is solved + verified on a real
-    // device, echo cancellation defaults OFF (AppSettings.echoCancellationEnabled).
+    // on this AUHAL/aggregate format. App-level echo cancellation now uses
+    // CaptureSession's pure DSP EchoCancellationProcessor and must not enable
+    // this VoiceProcessingIO path.
 
     // MARK: - Buffer-flow supervisor (private)
 

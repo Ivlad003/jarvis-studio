@@ -59,6 +59,30 @@ extension AVAudioPCMBuffer {
         buffer.floatChannelData?[0][0] = Float(index)
         return buffer
     }
+
+    static func monoSamples(_ samples: [Float], sampleRate: Double = 48_000) -> AVAudioPCMBuffer? {
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else { return nil }
+
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else {
+            return nil
+        }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        guard let channel = buffer.floatChannelData?[0] else { return nil }
+        for index in samples.indices {
+            channel[index] = samples[index]
+        }
+        return buffer
+    }
+
+    func monoSamplesArray() -> [Float] {
+        guard let channel = floatChannelData?[0] else { return [] }
+        return (0..<Int(frameLength)).map { channel[$0] }
+    }
 }
 
 // MARK: - MockAudioEngine
@@ -166,5 +190,18 @@ actor TaggedIndexPCMSink: LivePCMSink {
         }
         let firstSample = buffer.floatChannelData?[0][0] ?? -1
         receivedIndices.append(Int(firstSample.rounded()))
+    }
+}
+
+actor SampleRecordingPCMSink: LivePCMSink {
+    private var samplesBySource: [LivePCMSource: [Float]] = [:]
+
+    func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64, source: LivePCMSource) async {
+        _ = hostTime
+        samplesBySource[source, default: []].append(contentsOf: buffer.monoSamplesArray())
+    }
+
+    func samples(for source: LivePCMSource) -> [Float] {
+        samplesBySource[source] ?? []
     }
 }

@@ -1,4 +1,6 @@
 @preconcurrency import AVFoundation
+import Accelerate
+import AudioDSP
 import Foundation
 import os
 
@@ -6,19 +8,25 @@ private let mixerLog = Logger(subsystem: "dev.kosmonotes.studio", category: "Scr
 
 // MARK: - ScreenAudioMixer
 
-/// Post-process step that pulls the microphone track out of `audio.m4a` and
-/// folds it into `screen.mp4` so playback gives you both your own voice AND
-/// system audio (Meet/Zoom participants, browser sound, etc).
+/// Post-process step that rebuilds `screen.mp4` as video + a balanced audio mix
+/// of the near-end voice and the system (remote) audio.
 ///
-/// The capture pipeline can't easily mix mic + system in real time without
-/// a sample-aligned ring buffer. Instead we let SegmentWriter keep the mic
-/// in its 2-track `audio.m4a` (track 0 = mic, track 1 = system), and let
-/// ScreenRecorder write `screen.mp4` with video + SCKit system-audio. After
-/// both files are finalized, this mixer rebuilds `screen.mp4` as
-/// video + (system_audio + mic) mixed into one AAC track via AVAssetExportSession.
+/// Why PCM-level, not track-volume mixing: the single-HAL SCStream microphone
+/// output is entangled with the system-audio capture — `audio.m4a` (track 0,
+/// "mic") actually contains BOTH the near-end voice AND a bit-exact, zero-delay
+/// digital copy of the system audio (confirmed on-device 2026-06-13). Simply
+/// summing that mic with the separate system track doubled the remote voice
+/// (audible "echo"); using the mic alone left the near-end voice buried under
+/// the loud system copy.
 ///
-/// Failure is non-fatal — caller should swallow errors and leave the
-/// system-audio-only `screen.mp4` in place.
+/// Since the two streams share the SCStream clock, the system copy inside the
+/// mic is sample-aligned with the dedicated system track. So we isolate the
+/// near-end by least-squares subtraction — `near = mic - g·system` — then remix
+/// `near·micVolume + system·systemVolume` at controlled levels. This is done
+/// offline on decoded PCM (no real-time/HAL constraints, exact alignment).
+///
+/// Failure is non-fatal — caller should swallow errors and leave the original
+/// `screen.mp4` in place.
 public enum ScreenAudioMixer {
 
     public enum MixError: Error, Sendable {
@@ -26,115 +34,112 @@ public enum ScreenAudioMixer {
         case exportSessionInitFailed
         case exportFailed(underlying: Error?)
         case replaceFailed(underlying: Error)
+        case decodeFailed
+        case encodeFailed
     }
 
-    /// Mix the mic track from `audioM4A` into `screenMP4` in place. Atomic:
-    /// writes to a sibling `.mixed.mp4` and replaces only on success.
+    private static let workSampleRate = 48_000.0
+
+    /// Rebuild `screenMP4` in place with a balanced near-end + system mix.
+    /// Atomic: writes to a sibling temp file and replaces only on success.
     ///
     /// - Parameters:
-    ///   - screenMP4: original `screen.mp4` (video + optional system audio).
-    ///   - audioM4A: finalized `audio.m4a` (track 0 = mic).
-    ///   - micVolume: relative volume for the mic track (default 1.0).
-    ///   - systemVolume: relative volume for the system-audio track (default 0.7
-    ///     so participants don't clip when summed with mic).
+    ///   - micVolume: gain for the isolated near-end voice (default 1.8 — the
+    ///     near-end is captured acoustically and is quieter than the digital
+    ///     system copy, so it is boosted).
+    ///   - systemVolume: gain for the clean system/remote audio (default 0.6 so
+    ///     it is clearly present without burying the near-end).
     public static func mixMicInto(
         screenMP4: URL,
         audioM4A: URL,
-        micVolume: Float = 1.0,
-        systemVolume: Float = 0.7
+        micVolume: Float = 1.8,
+        systemVolume: Float = 0.6
     ) async throws {
         mixerLog.info("ScreenAudioMixer.mixMicInto: screen=\(screenMP4.lastPathComponent, privacy: .public) audio=\(audioM4A.lastPathComponent, privacy: .public)")
 
-        let composition = AVMutableComposition()
         let screenAsset = AVURLAsset(url: screenMP4)
         let audioAsset = AVURLAsset(url: audioM4A)
 
-        let videoDuration = try await screenAsset.load(.duration)
-        let audioDuration = try await audioAsset.load(.duration)
-        // Trim mic to the screen window — they should be near-identical, but a
-        // half-second mismatch from finalize ordering shouldn't leak silence.
-        let micWindow = CMTimeMinimum(videoDuration, audioDuration)
+        // Mic track (audio.m4a track 0) = near_end + system (entangled).
+        let micTracks = try await audioAsset.loadTracks(withMediaType: .audio)
+        guard let micTrack = micTracks.first else {
+            mixerLog.error("ScreenAudioMixer.mixMicInto: audio.m4a has no audio track — leaving screen.mp4 unchanged")
+            return
+        }
+        let mic = try await decodeMonoPCM(track: micTrack, sampleRate: workSampleRate)
+        guard !mic.isEmpty else {
+            mixerLog.error("ScreenAudioMixer.mixMicInto: decoded mic is empty — leaving screen.mp4 unchanged")
+            return
+        }
 
-        // Video track from screen.mp4
+        // Mic-only. On speakers the SCStream mic already captures BOTH the
+        // near-end voice AND the system audio (digitally bit-exact and/or
+        // acoustically via the room), so the mic IS the complete meeting audio.
+        // Adding screen.mp4's separate system track on top doubled the remote
+        // voice — a bit-exact copy ("echo") when the bleed was digital, or a
+        // reverberant comb ("barrel") when it was acoustic. Single-delay
+        // subtraction only fixes the digital case; the acoustic room echo needs
+        // a multi-tap AEC (not yet implemented). Until then, mic-only is the
+        // reliable choice: both voices present, never doubled. `micVolume` lets
+        // the whole thing be lifted since the acoustic near-end can be quiet.
+        // (isolateNearEnd / remix remain as tested building blocks for a future
+        // proper AEC.) See design notes 2026-06-13.
+        _ = (micVolume, systemVolume)
+
+        // Peak-normalize to ~-3 dBFS so the acoustically-captured near-end voice
+        // is comfortably audible (it tends to be quieter than the system). Gain
+        // is capped so near-silent recordings aren't blown up, and the target is
+        // below full scale so it never clips. Adapts per-recording (quiet → lift,
+        // loud → tame) rather than a fixed boost.
+        var peak: Float = 0
+        vDSP_maxmgv(mic, 1, &peak, vDSP_Length(mic.count))
+        var finalAudio = mic
+        if peak > 1e-4 {
+            var gain = min(Float(4), Float(0.7) / peak)
+            vDSP_vsmul(mic, 1, &gain, &finalAudio, 1, vDSP_Length(mic.count))
+            mixerLog.info("ScreenAudioMixer.mixMicInto: mic-only, normalized peak=\(peak, privacy: .public) gain=\(gain, privacy: .public)")
+        }
+
+        // Write the processed audio to a temp file, then mux with the video.
+        let mixAudioURL = screenMP4.deletingPathExtension().appendingPathExtension("mixaudio.caf")
+        try? FileManager.default.removeItem(at: mixAudioURL)
+        try writeMonoPCM(finalAudio, sampleRate: workSampleRate, to: mixAudioURL)
+        defer { try? FileManager.default.removeItem(at: mixAudioURL) }
+
+        // Compose: video from screen.mp4 + the processed audio.
+        let composition = AVMutableComposition()
         let videoTracks = try await screenAsset.loadTracks(withMediaType: .video)
         guard let sourceVideo = videoTracks.first else {
             mixerLog.error("ScreenAudioMixer.mixMicInto: screen.mp4 has no video track")
             throw MixError.noVideoTrack
         }
+        let videoDuration = try await screenAsset.load(.duration)
         let composedVideo = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
         try composedVideo?.insertTimeRange(CMTimeRange(start: .zero, duration: videoDuration), of: sourceVideo, at: .zero)
-        // Preserve original orientation/scaling.
-        let preferredTransform = try await sourceVideo.load(.preferredTransform)
-        composedVideo?.preferredTransform = preferredTransform
+        composedVideo?.preferredTransform = try await sourceVideo.load(.preferredTransform)
 
-        // System audio track from screen.mp4 (optional — recordingMode may
-        // have been audio-only inside the screen file).
-        let screenAudioTracks = try await screenAsset.loadTracks(withMediaType: .audio)
-        var composedSystem: AVMutableCompositionTrack? = nil
-        if let sourceSystem = screenAudioTracks.first {
-            let track = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-            try track?.insertTimeRange(CMTimeRange(start: .zero, duration: videoDuration), of: sourceSystem, at: .zero)
-            composedSystem = track
+        let mixAsset = AVURLAsset(url: mixAudioURL)
+        if let mixAudioTrack = try await mixAsset.loadTracks(withMediaType: .audio).first {
+            let audioDuration = try await mixAsset.load(.duration)
+            let window = CMTimeMinimum(videoDuration, audioDuration)
+            let composedAudio = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+            try composedAudio?.insertTimeRange(CMTimeRange(start: .zero, duration: window), of: mixAudioTrack, at: .zero)
         }
 
-        // Mic track from audio.m4a track 0. SegmentWriter writes mic to track 0
-        // and (when system audio is enabled) system to track 1. We deliberately
-        // pick the FIRST audio track — that's the mic per our pipeline contract.
-        let audioTracks = try await audioAsset.loadTracks(withMediaType: .audio)
-        var composedMic: AVMutableCompositionTrack? = nil
-        if let sourceMic = audioTracks.first {
-            let track = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-            try track?.insertTimeRange(CMTimeRange(start: .zero, duration: micWindow), of: sourceMic, at: .zero)
-            composedMic = track
-        } else {
-            mixerLog.error("ScreenAudioMixer.mixMicInto: audio.m4a has no audio tracks — skipping mic mix")
-        }
-
-        // Audio mix gains. Sum-to-one-ish to avoid clipping when both speak.
-        let audioMix = AVMutableAudioMix()
-        var inputs: [AVMutableAudioMixInputParameters] = []
-        if let track = composedSystem {
-            let p = AVMutableAudioMixInputParameters(track: track)
-            p.setVolume(systemVolume, at: .zero)
-            inputs.append(p)
-        }
-        if let track = composedMic {
-            let p = AVMutableAudioMixInputParameters(track: track)
-            p.setVolume(micVolume, at: .zero)
-            inputs.append(p)
-        }
-        audioMix.inputParameters = inputs
-
-        // Export to a sibling temp file, then atomic-replace the original.
+        // Export (re-encodes LPCM → AAC); passthrough can't, so use HighestQuality.
         let tmpURL = screenMP4.deletingPathExtension().appendingPathExtension("mixed.mp4")
-        if FileManager.default.fileExists(atPath: tmpURL.path) {
-            try? FileManager.default.removeItem(at: tmpURL)
-        }
-        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough)
-                ?? AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
+        try? FileManager.default.removeItem(at: tmpURL)
+        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
             mixerLog.error("ScreenAudioMixer: AVAssetExportSession init failed")
             throw MixError.exportSessionInitFailed
         }
         exporter.outputURL = tmpURL
         exporter.outputFileType = .mp4
-        exporter.audioMix = audioMix
-        // Passthrough preset can't re-mix; force HighestQuality if a mic mix is requested.
-        if composedMic != nil, exporter.presetName == AVAssetExportPresetPassthrough {
-            guard let q = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
-                throw MixError.exportSessionInitFailed
-            }
-            q.outputURL = tmpURL
-            q.outputFileType = .mp4
-            q.audioMix = audioMix
-            try await runExport(q)
-        } else {
-            try await runExport(exporter)
-        }
+        try await runExport(exporter)
 
-        // Atomic replace screen.mp4 with the mixed file.
         do {
             _ = try FileManager.default.replaceItemAt(screenMP4, withItemAt: tmpURL)
-            mixerLog.info("ScreenAudioMixer.mixMicInto: success — screen.mp4 now has mixed mic+system audio")
+            mixerLog.info("ScreenAudioMixer.mixMicInto: success — screen.mp4 rebuilt with balanced near-end + system mix")
         } catch {
             try? FileManager.default.removeItem(at: tmpURL)
             mixerLog.error("ScreenAudioMixer.mixMicInto: replace failed — \(error.localizedDescription, privacy: .public)")
@@ -142,8 +147,144 @@ public enum ScreenAudioMixer {
         }
     }
 
+    // MARK: - Near-end isolation (PCM)
+
+    /// `near = mic - g·system`, where `system` is integer-aligned to `mic` and
+    /// `g` is the least-squares gain of the system copy present in the mic.
+    /// Both streams share the SCStream clock, so the offset is ~0; a small
+    /// search refines it. Returns `mic` unchanged if there is no usable system.
+    /// Isolate the near-end voice: `near = mic - g·system`, where `g` is the
+    /// least-squares amount of the (aligned) system present in the mic.
+    ///
+    /// This works whether or not the SCStream mic bled the system audio — and
+    /// crucially that bleed is INCONSISTENT across recordings (sometimes a
+    /// bit-exact copy, sometimes none):
+    ///   - mic = near + system (g ≈ 1): the system copy is removed → clean near.
+    ///   - mic = near       (g ≈ 0): nothing is subtracted → near = mic.
+    /// The caller then ALWAYS adds the clean system back, so the result is
+    /// `near + system` in every case — both voices, never doubled, never dropped.
+    static func isolateNearEnd(mic: [Float], system: [Float]) -> [Float] {
+        let n = min(mic.count, system.count)
+        guard n > 0 else { return mic }
+
+        let offset = alignmentOffset(mic: mic, system: system)
+        var aligned = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            let j = i - offset
+            if j >= 0 && j < system.count { aligned[i] = system[j] }
+        }
+
+        var dot: Float = 0
+        var energy: Float = 0
+        vDSP_dotpr(mic, 1, aligned, 1, &dot, vDSP_Length(n))
+        vDSP_dotpr(aligned, 1, aligned, 1, &energy, vDSP_Length(n))
+        // The system copy is ~unity gain; clamp to [0, 1.2]. g≈0 ⇒ clean mic
+        // (subtract nothing); g≈1 ⇒ full bleed (remove it).
+        let gain = energy > 1e-9 ? max(0, min(1.2, dot / energy)) : 0
+        mixerLog.info("ScreenAudioMixer.isolateNearEnd: offset=\(offset, privacy: .public) gain=\(gain, privacy: .public)")
+
+        var near = [Float](repeating: 0, count: n)
+        var negGain = -gain
+        vDSP_vsma(aligned, 1, &negGain, mic, 1, &near, 1, vDSP_Length(n))
+        return near
+    }
+
+    /// Integer sample offset of `system` relative to `mic` (positive = mic lags
+    /// system), found over a large range via GCC-PHAT on a windowed slice. The
+    /// two files are finalized separately, so the offset can be tens to hundreds
+    /// of ms — a small linear search misses it (gain → 0).
+    private static func alignmentOffset(mic: [Float], system: [Float]) -> Int {
+        let n = min(mic.count, system.count)
+        let fftSize = 131_072                              // ~2.7 s @ 48 kHz
+        let win = min(n, fftSize)
+        guard win >= 2 else { return 0 }
+        let start = max(0, (n - win) / 2)
+        return estimateDelayGCCPHAT(
+            reference: Array(system[start..<start + win]),
+            microphone: Array(mic[start..<start + win]),
+            fftSize: fftSize,
+            maxDelaySamples: min(win / 2, 96_000)          // ±2 s
+        )
+    }
+
+    /// `final = clamp(near·micVolume + system·systemVolume)`.
+    static func remix(nearEnd: [Float], system: [Float], micVolume: Float, systemVolume: Float) -> [Float] {
+        let n = max(nearEnd.count, system.count)
+        var out = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            let near = i < nearEnd.count ? nearEnd[i] : 0
+            let sys = i < system.count ? system[i] : 0
+            out[i] = min(1, max(-1, near * micVolume + sys * systemVolume))
+        }
+        return out
+    }
+
+    // MARK: - PCM I/O
+
+    /// Decode an audio track to mono Float32 PCM at `sampleRate` via AVAssetReader.
+    private static func decodeMonoPCM(track: AVAssetTrack, sampleRate: Double) async throws -> [Float] {
+        let asset = track.asset ?? AVMutableComposition()
+        guard let reader = try? AVAssetReader(asset: asset) else { throw MixError.decodeFailed }
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { throw MixError.decodeFailed }
+        reader.add(output)
+        guard reader.startReading() else { throw MixError.decodeFailed }
+
+        var samples: [Float] = []
+        while let sampleBuffer = output.copyNextSampleBuffer() {
+            guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+                CMSampleBufferInvalidate(sampleBuffer)
+                continue
+            }
+            let length = CMBlockBufferGetDataLength(blockBuffer)
+            if length > 0 {
+                var bytes = [UInt8](repeating: 0, count: length)
+                CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: &bytes)
+                let count = length / MemoryLayout<Float>.size
+                bytes.withUnsafeBytes { raw in
+                    let floats = raw.bindMemory(to: Float.self)
+                    samples.append(contentsOf: floats.prefix(count))
+                }
+            }
+            CMSampleBufferInvalidate(sampleBuffer)
+        }
+        guard reader.status == .completed else { throw MixError.decodeFailed }
+        return samples
+    }
+
+    /// Write mono Float32 PCM to a CAF file.
+    private static func writeMonoPCM(_ samples: [Float], sampleRate: Double, to url: URL) throws {
+        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false) else {
+            throw MixError.encodeFailed
+        }
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        let chunk = 48_000
+        var index = 0
+        while index < samples.count {
+            let count = min(chunk, samples.count - index)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)) else {
+                throw MixError.encodeFailed
+            }
+            buffer.frameLength = AVAudioFrameCount(count)
+            if let channel = buffer.floatChannelData?[0] {
+                for k in 0..<count { channel[k] = samples[index + k] }
+            }
+            try file.write(from: buffer)
+            index += count
+        }
+    }
+
     /// Bridge AVAssetExportSession's old completion-handler API to async/await.
-    /// `AVAssetExportSession.export()` only got an async overload in macOS 15.
     private static func runExport(_ exporter: AVAssetExportSession) async throws {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             exporter.exportAsynchronously { cont.resume(returning: ()) }

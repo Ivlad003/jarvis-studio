@@ -353,7 +353,7 @@ public actor CaptureSession {
         AudioEngine.Config(
             sampleRate: Double(config.audioSampleRate),
             channels: 1,
-            voiceProcessing: config.echoCancellationEnabled
+            voiceProcessing: false
         )
     }
 
@@ -384,6 +384,7 @@ public actor CaptureSession {
     private var segmentWriter: SegmentWriter?
     private var micTask: Task<Void, Never>?
     private var systemTask: Task<Void, Never>?
+    private var scStreamSystemTaskRunning: Bool = false
     private var scKitBox: SCKitBox?
     private var screenRecorder: ScreenRecorder?
     /// Tracks which mic source is feeding the writer. Updated by start /
@@ -423,6 +424,9 @@ public actor CaptureSession {
     /// Mutually exclusive with `scKitBox` / `tapBoxAny` — when set, system
     /// audio comes from this device instead of SCKit's whole-system mixdown.
     private var deviceAudioCapture: DeviceAudioCapture?
+    /// Pure Swift/vDSP post-capture echo canceller. This replaces the old
+    /// VoiceProcessingIO attempt; it never mutates the AVAudioEngine graph.
+    private var echoCancellationProcessor: EchoCancellationProcessor?
     /// Set when the user had a `systemAudioDeviceUID` configured but the
     /// device couldn't be resolved at start (e.g. a stale aggregate UID like
     /// `CADefaultDeviceAggregate-22634-0` that macOS recycled). Callers may
@@ -436,6 +440,9 @@ public actor CaptureSession {
     /// Test seam: when set, this stream is used instead of starting a real mic.
     /// Internal for testing only; never exposed to public API.
     private let testMicStream: AsyncStream<AVAudioPCMBuffer>?
+    /// Test seam: when set, this stream is used instead of SCKit/device/tap
+    /// system audio. Lets tests verify DSP-AEC wiring without TCC.
+    private let testSystemStream: AsyncStream<AVAudioPCMBuffer>?
     /// Test seam: when set, start() throws at the real-mic bootstrap point
     /// without touching AVAudioEngine. Lets tests cover partial-start teardown
     /// deterministically without requiring microphone hardware or TCC.
@@ -456,6 +463,7 @@ public actor CaptureSession {
     /// cleanup. Not part of the public API.
     internal var hasAllocatedCaptureResourcesForTesting: Bool {
         liveDelivery != nil ||
+            echoCancellationProcessor != nil ||
             audioEngine != nil ||
             segmentWriter != nil ||
             micTask != nil ||
@@ -501,6 +509,7 @@ public actor CaptureSession {
         self.config = config
         self.liveSink = liveSink
         self.testMicStream = nil
+        self.testSystemStream = nil
         self.testMicStartupError = nil
         self.testTier2MicStartupError = nil
     }
@@ -510,6 +519,22 @@ public actor CaptureSession {
         self.config = config
         self.liveSink = liveSink
         self.testMicStream = testMicStream
+        self.testSystemStream = nil
+        self.testMicStartupError = nil
+        self.testTier2MicStartupError = nil
+    }
+
+    /// Internal test init that accepts mock mic and system streams.
+    internal init(
+        config: Config,
+        liveSink: (any LivePCMSink)?,
+        testMicStream: AsyncStream<AVAudioPCMBuffer>,
+        testSystemStream: AsyncStream<AVAudioPCMBuffer>
+    ) {
+        self.config = config
+        self.liveSink = liveSink
+        self.testMicStream = testMicStream
+        self.testSystemStream = testSystemStream
         self.testMicStartupError = nil
         self.testTier2MicStartupError = nil
     }
@@ -525,6 +550,7 @@ public actor CaptureSession {
         self.config = config
         self.liveSink = liveSink
         self.testMicStream = testMicStream
+        self.testSystemStream = nil
         self.testMicStartupError = nil
         self.testTier2MicStartupError = testTier2MicStartupError
     }
@@ -535,6 +561,7 @@ public actor CaptureSession {
         self.config = config
         self.liveSink = liveSink
         self.testMicStream = nil
+        self.testSystemStream = nil
         self.testMicStartupError = testMicStartupError
         self.testTier2MicStartupError = nil
     }
@@ -554,10 +581,15 @@ public actor CaptureSession {
         micWriterTotalFrames = 0
         _micLevel = 0
         scStreamMicTaskRunning = false
+        scStreamSystemTaskRunning = false
+        echoCancellationProcessor = nil
 
         // Set up serial delivery for live sink if configured
         if let sink = liveSink {
             liveDelivery = LiveSinkDelivery(sink: sink)
+        }
+        if config.echoCancellationEnabled, config.micEnabled {
+            echoCancellationProcessor = EchoCancellationProcessor()
         }
 
         let writer = try SegmentWriter(
@@ -600,6 +632,7 @@ public actor CaptureSession {
             // sessions. The AVAudioEngine path remains the fallback for macOS 14
             // and for audio-only sessions.
             var screenMicStream: AsyncStream<AVAudioPCMBuffer>? = nil
+            var screenSystemAudioStream: AsyncStream<AVAudioPCMBuffer>? = nil
             let isMacOS15OrNewer: Bool
             if #available(macOS 15.0, *) {
                 isMacOS15OrNewer = true
@@ -613,7 +646,7 @@ public actor CaptureSession {
                 isMacOS15OrNewer: isMacOS15OrNewer
             )
             if config.screenRecordingEnabled, config.micEnabled, config.echoCancellationEnabled, isMacOS15OrNewer {
-                captureSessionLog.info("CaptureSession.start: echo cancellation enabled — using AVAudioEngine mic because SCStream exposes no AEC.")
+                captureSessionLog.info("CaptureSession.start: DSP echo cancellation enabled — preserving SCStream mic route when available.")
             }
             if config.screenRecordingEnabled, let outputURL = config.screenOutputURL {
                 if #available(macOS 12.3, *) {
@@ -630,10 +663,11 @@ public actor CaptureSession {
                         audioSampleRate: config.audioSampleRate
                     )
                     do {
-                        let micStream = try await recorder.start(config: srConfig)
+                        let startResult = try await recorder.startWithAudioStreams(config: srConfig)
                         self.screenRecorder = recorder
-                        screenMicStream = micStream
-                        if micStream != nil {
+                        screenMicStream = startResult.microphone
+                        screenSystemAudioStream = startResult.systemAudio
+                        if startResult.microphone != nil {
                             captureSessionLog.info("CaptureSession.start: SCStream mic path active — skipping AVAudioEngine to avoid HAL contention.")
                         }
                     } catch {
@@ -657,23 +691,36 @@ public actor CaptureSession {
             // us two clients reading the same HAL — exactly the multi-client
             // problem the design forbids.
             //
-            // Trade-off: when only the SCKit fallback would have run (no custom
-            // loopback device, no per-process Tap configured), the standalone
-            // audio.m4a — and therefore the transcript pipeline — won't see
-            // system audio while screen mode is on. The user still has the
-            // participants' voices in screen.mp4 for playback. Custom Device
-            // (BlackHole) and per-process Core Audio Tap target distinct devices
-            // / pids, so they do NOT race the SCStream system-audio HAL client
-            // and can still run alongside SCStream.
+            // When no explicit custom device/process tap/test stream has taken
+            // ownership, we reuse ScreenRecorder's already-running SCStream
+            // `.audio` callback as the `.system` source. That gives the writer,
+            // transcript pipeline, and DSP AEC a far-end reference without a
+            // second HAL client. Custom Device (BlackHole) and per-process Core
+            // Audio Tap remain higher-priority explicit routes.
             let screenOwnsSystemAudio = (self.screenRecorder != nil)
             if config.systemAudioEnabled {
                 var systemStarted = false
 
-                if let deviceUID = config.systemAudioDeviceUID, !deviceUID.isEmpty {
+                if let testSystemStream {
+                    systemTask = makeTestSystemTask(
+                        stream: testSystemStream,
+                        writer: writer,
+                        delivery: liveDelivery,
+                        echoProcessor: echoCancellationProcessor
+                    )
+                    systemStarted = true
+                }
+
+                if !systemStarted, let deviceUID = config.systemAudioDeviceUID, !deviceUID.isEmpty {
                     do {
                         let capture = DeviceAudioCapture(config: .init(deviceUID: deviceUID))
                         self.deviceAudioCapture = capture
-                        systemTask = try await makeDeviceCaptureTask(capture: capture, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+                        systemTask = try await makeDeviceCaptureTask(
+                            capture: capture,
+                            writer: writer,
+                            delivery: liveDelivery,
+                            echoProcessor: echoCancellationProcessor
+                        )
                         systemStarted = true
                         captureSessionLog.info("CaptureSession.start: system audio via custom device UID=\(deviceUID, privacy: .public)")
                     } catch {
@@ -692,20 +739,37 @@ public actor CaptureSession {
                     do {
                         let box = TapBox()
                         self.tapBoxAny = box
-                        systemTask = try await makeTapTask(box: box, bundleIDs: config.processTapBundleIDs, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+                        systemTask = try await makeTapTask(
+                            box: box,
+                            bundleIDs: config.processTapBundleIDs,
+                            writer: writer,
+                            delivery: liveDelivery,
+                            echoProcessor: echoCancellationProcessor
+                        )
                         systemStarted = true
                     } catch {
                         self.tapBoxAny = nil
                     }
+                }
+                if !systemStarted, let screenSystemAudioStream {
+                    systemTask = makeScreenRecorderSystemTask(stream: screenSystemAudioStream)
+                    scStreamSystemTaskRunning = true
+                    systemStarted = true
+                    captureSessionLog.info("CaptureSession.start: system audio via ScreenRecorder SCStream reference (single-HAL path).")
                 }
                 // SCKit fallback runs ONLY when ScreenRecorder isn't already
                 // capturing system audio via SCStream. See header comment.
                 if !systemStarted, !screenOwnsSystemAudio, #available(macOS 12.3, *) {
                     let box = SCKitBox()
                     self.scKitBox = box
-                    systemTask = try await makeSystemTask(box: box, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+                    systemTask = try await makeSystemTask(
+                        box: box,
+                        writer: writer,
+                        delivery: liveDelivery,
+                        echoProcessor: echoCancellationProcessor
+                    )
                 } else if !systemStarted, screenOwnsSystemAudio {
-                    captureSessionLog.info("CaptureSession.start: skipped SCKit system-audio fallback because ScreenRecorder already owns the system-audio HAL (single-HAL invariant).")
+                    captureSessionLog.info("CaptureSession.start: skipped SCKit system-audio fallback because ScreenRecorder already owns the system-audio HAL but no PCM reference stream was available.")
                 }
             }
 
@@ -943,8 +1007,8 @@ public actor CaptureSession {
                 systemTask = try await makeSystemTask(
                     box: box,
                     writer: writer,
-                    liveSink: liveSink,
-                    delivery: liveDelivery
+                    delivery: liveDelivery,
+                    echoProcessor: echoCancellationProcessor
                 )
                 captureSessionLog.info("CaptureSession.tier2: SCKit system-audio fallback started after ScreenRecorder demotion")
             } catch {
@@ -978,20 +1042,32 @@ public actor CaptureSession {
     ///     single place instead of standing up a second AVAudioEngine
     ///     tap just to drive the popover meter.
     func enqueueMicBuffer(_ buffer: AVAudioPCMBuffer, hostTime: UInt64) async {
-        updateMicLevelEMA(buffer)
+        let micBuffer: AVAudioPCMBuffer
+        if let echoCancellationProcessor {
+            do {
+                micBuffer = try await echoCancellationProcessor.processMicrophoneBuffer(buffer, hostTime: hostTime).buffer
+            } catch {
+                captureSessionLog.error("CaptureSession.mic: DSP echo cancellation failed — using raw mic buffer. \(error.localizedDescription, privacy: .public)")
+                micBuffer = buffer
+            }
+        } else {
+            micBuffer = buffer
+        }
+
+        updateMicLevelEMA(micBuffer)
         guard let writer = segmentWriter else {
             // pause() cleared the writer. Drop the buffer; SCStream may keep
             // yielding while we're paused and that's fine — buffers between
             // pause and resume are intentionally lost.
             if let delivery = liveDelivery {
-                await delivery.enqueue(buffer, hostTime: hostTime, source: .mic)
+                await delivery.enqueue(micBuffer, hostTime: hostTime, source: .mic)
             }
             return
         }
         do {
-            try await writer.append(buffer, source: .mic)
+            try await writer.append(micBuffer, source: .mic)
             micWriterAppendCount &+= 1
-            micWriterTotalFrames &+= Int(buffer.frameLength)
+            micWriterTotalFrames &+= Int(micBuffer.frameLength)
             if micWriterAppendCount == 1 || micWriterAppendCount % 200 == 0 {
                 captureSessionLog.info("CaptureSession.mic: writer append #\(self.micWriterAppendCount, privacy: .public) totalFrames=\(self.micWriterTotalFrames, privacy: .public)")
             }
@@ -999,7 +1075,34 @@ public actor CaptureSession {
             captureSessionLog.error("CaptureSession.mic: writer.append threw — \(error.localizedDescription, privacy: .public). Health counter will not advance; supervisor will mark degraded.")
         }
         if let delivery = liveDelivery {
-            await delivery.enqueue(buffer, hostTime: hostTime, source: .mic)
+            await delivery.enqueue(micBuffer, hostTime: hostTime, source: .mic)
+        }
+    }
+
+    /// Actor-routed system-audio enqueue for the ScreenRecorder SCStream path.
+    ///
+    /// Unlike SCKit/device/tap tasks, this stream cannot be restarted on resume:
+    /// AsyncStream has a single iterator and ScreenRecorder owns the only
+    /// SCStream instance. Keep the task alive across pause; when `segmentWriter`
+    /// is nil, disk writes are intentionally skipped while AEC can keep its
+    /// latest far-end reference warm for the next mic buffer.
+    func enqueueScreenRecorderSystemBuffer(_ buffer: AVAudioPCMBuffer, hostTime: UInt64) async {
+        if let writer = segmentWriter {
+            do {
+                try await writer.append(buffer, source: .system)
+            } catch {
+                captureSessionLog.error("CaptureSession.system(SCStream): writer.append threw — \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        if let echoCancellationProcessor {
+            do {
+                try await echoCancellationProcessor.receiveSystemBuffer(buffer, hostTime: hostTime)
+            } catch {
+                captureSessionLog.error("CaptureSession.system(SCStream): echo reference ingest failed — \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        if let delivery = liveDelivery {
+            await delivery.enqueue(buffer, hostTime: hostTime, source: .system)
         }
     }
 
@@ -1039,8 +1142,10 @@ public actor CaptureSession {
             micTask = nil
             await audioEngine?.stop()
         }
-        systemTask?.cancel()
-        systemTask = nil
+        if !scStreamSystemTaskRunning {
+            systemTask?.cancel()
+            systemTask = nil
+        }
         await deviceAudioCapture?.stop()
         if #available(macOS 12.3, *) {
             await scKitBox?.capture.stop()
@@ -1048,6 +1153,7 @@ public actor CaptureSession {
         if #available(macOS 14.4, *), let box = tapBoxAny as? TapBox {
             await box.tap.stop()
         }
+        await echoCancellationProcessor?.reset()
         _ = try await segmentWriter?.close()
         segmentWriter = nil
 
@@ -1102,12 +1208,32 @@ public actor CaptureSession {
 
         if config.systemAudioEnabled {
             // Restart whichever system-audio path was originally chosen.
-            if let capture = deviceAudioCapture {
-                systemTask = try await makeDeviceCaptureTask(capture: capture, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+            if scStreamSystemTaskRunning {
+                // The ScreenRecorder system stream task stayed alive across
+                // pause and will append into the fresh writer above on the
+                // next buffer.
+            } else if let capture = deviceAudioCapture {
+                systemTask = try await makeDeviceCaptureTask(
+                    capture: capture,
+                    writer: writer,
+                    delivery: liveDelivery,
+                    echoProcessor: echoCancellationProcessor
+                )
             } else if #available(macOS 14.4, *), let box = tapBoxAny as? TapBox {
-                systemTask = try await makeTapTask(box: box, bundleIDs: config.processTapBundleIDs, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+                systemTask = try await makeTapTask(
+                    box: box,
+                    bundleIDs: config.processTapBundleIDs,
+                    writer: writer,
+                    delivery: liveDelivery,
+                    echoProcessor: echoCancellationProcessor
+                )
             } else if let box = scKitBox, #available(macOS 12.3, *) {
-                systemTask = try await makeSystemTask(box: box, writer: writer, liveSink: liveSink, delivery: liveDelivery)
+                systemTask = try await makeSystemTask(
+                    box: box,
+                    writer: writer,
+                    delivery: liveDelivery,
+                    echoProcessor: echoCancellationProcessor
+                )
             }
         }
 
@@ -1191,7 +1317,8 @@ public actor CaptureSession {
         await deviceAudioCapture?.stop()
 
         // Unlike pause(), teardown always cancels every feed task — including
-        // the SCStream mic feed that pause() deliberately leaves running.
+        // the SCStream mic/system feeds that pause() deliberately leaves
+        // running.
         cancelFeedTasks()
 
         if #available(macOS 12.3, *) {
@@ -1211,10 +1338,12 @@ public actor CaptureSession {
             scKitBox = nil
             tapBoxAny = nil
             deviceAudioCapture = nil
+            echoCancellationProcessor = nil
             screenRecorder = nil
             segmentWriter = nil
             liveDelivery = nil
             scStreamMicTaskRunning = false
+            scStreamSystemTaskRunning = false
             activeMicSource = .none
             _micLevel = 0
         }
@@ -1249,9 +1378,11 @@ public actor CaptureSession {
         let box = UncheckedSendableBox(stream)
         return Task.detached { [weak self] in
             var bufferIndex = 0
+            var frameCursor: UInt64 = 0
             for await buffer in box.value {
                 bufferIndex += 1
-                let hostTime = mach_absolute_time()
+                let hostTime = frameCursor
+                frameCursor &+= UInt64(buffer.frameLength)
                 await self?.enqueueMicBuffer(buffer, hostTime: hostTime)
             }
             captureSessionLog.info("CaptureSession.testMic: stream ended after \(bufferIndex, privacy: .public) buffers")
@@ -1309,12 +1440,70 @@ public actor CaptureSession {
         scStreamMicTaskRunning = false
     }
 
+    private func markScStreamSystemTaskFinished() {
+        scStreamSystemTaskRunning = false
+    }
+
+    /// Drain ScreenRecorder.startWithAudioStreams' system-audio stream into the
+    /// actor-routed `.system` path. This task mirrors the SCStream mic task: it
+    /// stays alive across pause/resume because the underlying AsyncStream cannot
+    /// be consumed a second time.
+    private nonisolated func makeScreenRecorderSystemTask(
+        stream: AsyncStream<AVAudioPCMBuffer>
+    ) -> Task<Void, Never> {
+        let streamBox = UncheckedSendableBox(stream)
+        return Task.detached { [weak self] in
+            var bufferIndex = 0
+            for await buffer in streamBox.value {
+                bufferIndex += 1
+                let hostTime = mach_absolute_time()
+                await self?.enqueueScreenRecorderSystemBuffer(buffer, hostTime: hostTime)
+            }
+            captureSessionLog.info("CaptureSession.system(SCStream): stream ended after \(bufferIndex, privacy: .public) buffers")
+            await self?.markScStreamSystemTaskFinished()
+        }
+    }
+
+    private nonisolated func makeTestSystemTask(
+        stream: AsyncStream<AVAudioPCMBuffer>,
+        writer: SegmentWriter,
+        delivery: LiveSinkDelivery?,
+        echoProcessor: EchoCancellationProcessor?
+    ) -> Task<Void, Never> {
+        let streamBox = UncheckedSendableBox(stream)
+        return Task.detached {
+            var bufferIndex = 0
+            var frameCursor: UInt64 = 0
+            for await buffer in streamBox.value {
+                bufferIndex += 1
+                let hostTime = frameCursor
+                frameCursor &+= UInt64(buffer.frameLength)
+                do {
+                    try await writer.append(buffer, source: .system)
+                } catch {
+                    captureSessionLog.error("CaptureSession.system(test): writer.append threw — \(error.localizedDescription, privacy: .public)")
+                }
+                if let echoProcessor {
+                    do {
+                        try await echoProcessor.receiveSystemBuffer(buffer, hostTime: hostTime)
+                    } catch {
+                        captureSessionLog.error("CaptureSession.system(test): echo reference ingest failed — \(error.localizedDescription, privacy: .public)")
+                    }
+                }
+                if let delivery {
+                    await delivery.enqueue(buffer, hostTime: hostTime, source: .system)
+                }
+            }
+            captureSessionLog.info("CaptureSession.system(test): stream ended after \(bufferIndex, privacy: .public) buffers")
+        }
+    }
+
     @available(macOS 12.3, *)
     private nonisolated func makeSystemTask(
         box: SCKitBox,
         writer: SegmentWriter,
-        liveSink: (any LivePCMSink)?,
-        delivery: LiveSinkDelivery?
+        delivery: LiveSinkDelivery?,
+        echoProcessor: EchoCancellationProcessor?
     ) async throws -> Task<Void, Never> {
         let stream = try await box.capture.start()
         let streamBox = UncheckedSendableBox(stream)
@@ -1327,6 +1516,13 @@ public actor CaptureSession {
                     try await writer.append(buffer, source: .system)
                 } catch {
                     captureSessionLog.error("CaptureSession.system(SCKit): writer.append threw — \(error.localizedDescription, privacy: .public)")
+                }
+                if let echoProcessor {
+                    do {
+                        try await echoProcessor.receiveSystemBuffer(buffer, hostTime: hostTime)
+                    } catch {
+                        captureSessionLog.error("CaptureSession.system(SCKit): echo reference ingest failed — \(error.localizedDescription, privacy: .public)")
+                    }
                 }
                 // Forward to live sink via serial delivery (best-effort)
                 if let delivery {
@@ -1346,8 +1542,8 @@ public actor CaptureSession {
     private nonisolated func makeDeviceCaptureTask(
         capture: DeviceAudioCapture,
         writer: SegmentWriter,
-        liveSink: (any LivePCMSink)?,
-        delivery: LiveSinkDelivery?
+        delivery: LiveSinkDelivery?,
+        echoProcessor: EchoCancellationProcessor?
     ) async throws -> Task<Void, Never> {
         let stream = try await capture.start()
         let streamBox = UncheckedSendableBox(stream)
@@ -1364,6 +1560,13 @@ public actor CaptureSession {
                 } catch {
                     captureSessionLog.error("CaptureSession.system(Device): writer.append threw — \(error.localizedDescription, privacy: .public)")
                 }
+                if let echoProcessor {
+                    do {
+                        try await echoProcessor.receiveSystemBuffer(buffer, hostTime: hostTime)
+                    } catch {
+                        captureSessionLog.error("CaptureSession.system(Device): echo reference ingest failed — \(error.localizedDescription, privacy: .public)")
+                    }
+                }
                 // Forward to live sink via serial delivery (best-effort)
                 if let delivery {
                     await delivery.enqueue(buffer, hostTime: hostTime, source: .system)
@@ -1378,8 +1581,8 @@ public actor CaptureSession {
         box: TapBox,
         bundleIDs: [String],
         writer: SegmentWriter,
-        liveSink: (any LivePCMSink)?,
-        delivery: LiveSinkDelivery?
+        delivery: LiveSinkDelivery?,
+        echoProcessor: EchoCancellationProcessor?
     ) async throws -> Task<Void, Never> {
         let stream = try await box.tap.start(bundleIDs: bundleIDs)
         let streamBox = UncheckedSendableBox(stream)
@@ -1392,6 +1595,13 @@ public actor CaptureSession {
                     try await writer.append(buffer, source: .system)
                 } catch {
                     captureSessionLog.error("CaptureSession.system(Tap): writer.append threw — \(error.localizedDescription, privacy: .public)")
+                }
+                if let echoProcessor {
+                    do {
+                        try await echoProcessor.receiveSystemBuffer(buffer, hostTime: hostTime)
+                    } catch {
+                        captureSessionLog.error("CaptureSession.system(Tap): echo reference ingest failed — \(error.localizedDescription, privacy: .public)")
+                    }
                 }
                 // Forward to live sink via serial delivery (best-effort)
                 if let delivery {

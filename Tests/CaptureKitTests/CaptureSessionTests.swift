@@ -86,8 +86,8 @@ struct CaptureSessionTests {
         #expect(engineConfig.voiceProcessing == false)
     }
 
-    @Test("CaptureSession forwards echo cancellation to mic AudioEngine config")
-    func micAudioEngineConfigUsesEchoCancellationFlag() throws {
+    @Test("CaptureSession does not route DSP echo cancellation through VoiceProcessingIO")
+    func micAudioEngineConfigDoesNotUseVoiceProcessingForDSPCancellation() throws {
         let dir = try makeTempDir()
         defer { cleanup(dir) }
 
@@ -99,7 +99,7 @@ struct CaptureSessionTests {
         )
 
         let engineConfig = CaptureSession.micAudioEngineConfig(for: config)
-        #expect(engineConfig.voiceProcessing == true)
+        #expect(engineConfig.voiceProcessing == false)
     }
 
     // MARK: - Direct SegmentWriter-based integration (feeds synthetic buffers)
@@ -293,16 +293,82 @@ struct CaptureSessionTests {
         let count = await sink.count()
         #expect(count == 3, "Expected sink to receive 3 buffers, got \(count)")
         
-        // Verify host times are non-zero
+        // Verify deterministic test-stream host times
         let buffers = await sink.receivedBuffers
         for (index, recorded) in buffers.enumerated() {
-            #expect(recorded.hostTime > 0, "Buffer \(index) has zero host time")
+            #expect(recorded.hostTime == UInt64(index * 4_800), "Buffer \(index) has wrong host time")
             #expect(recorded.frameLength == 4800, "Buffer \(index) has wrong frameLength: \(recorded.frameLength)")
         }
         
         // Clean stop
         continuation.finish()
         _ = try await session.stop()
+    }
+
+    @Test("CaptureSession sends cleaned mic buffers to live sink when DSP echo cancellation is enabled")
+    func echoCancellationCleansLiveMicSink() async throws {
+        let sessionDir = try makeTempDir()
+        defer { cleanup(sessionDir) }
+
+        let sampleRate = 16_000.0
+        let blockSize = 480
+        let totalSamples = 48_000
+        let reference = Self.noise(count: totalSamples)
+        let echo = Self.convolve(reference, impulse: [0.68, 0, 0, -0.22, 0, 0.12])
+
+        let sink = SampleRecordingPCMSink()
+        let (micStream, micContinuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (systemStream, systemContinuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let config = CaptureSession.Config(
+            micEnabled: true,
+            systemAudioEnabled: true,
+            echoCancellationEnabled: true,
+            sessionDir: sessionDir,
+            segmentDurationSeconds: 1,
+            audioSampleRate: Int(sampleRate)
+        )
+        let session = CaptureSession(
+            config: config,
+            liveSink: sink,
+            testMicStream: micStream,
+            testSystemStream: systemStream
+        )
+
+        try await session.start()
+
+        var expectedSamples = 0
+        for start in stride(from: 0, to: totalSamples, by: blockSize) {
+            let end = min(start + blockSize, totalSamples)
+            guard let systemBuffer = AVAudioPCMBuffer.monoSamples(Array(reference[start..<end]), sampleRate: sampleRate),
+                  let micBuffer = AVAudioPCMBuffer.monoSamples(Array(echo[start..<end]), sampleRate: sampleRate)
+            else {
+                Issue.record("Failed to create synthetic AEC buffers")
+                continue
+            }
+            let blockSamples = end - start
+            systemContinuation.yield(systemBuffer)
+            expectedSamples += blockSamples
+            try await Self.waitForSamples(sink, source: .system, atLeast: expectedSamples)
+
+            micContinuation.yield(micBuffer)
+            try await Self.waitForSamples(sink, source: .mic, atLeast: expectedSamples)
+        }
+
+        systemContinuation.finish()
+        micContinuation.finish()
+        _ = try await session.stop()
+
+        let cleaned = await sink.samples(for: .mic)
+        let tailEnd = min(cleaned.count, 46_000)
+        #expect(tailEnd > 32_000, "Expected enough cleaned mic samples, got \(cleaned.count)")
+        guard tailEnd > 32_000 else { return }
+        let tailRange = 32_000..<tailEnd
+        let erle = Self.erle(
+            microphone: Array(echo[tailRange]),
+            cleaned: Array(cleaned[tailRange])
+        )
+
+        #expect(erle >= 18)
     }
 
     @Test("CaptureSession does not await live sink inline")
@@ -759,5 +825,53 @@ struct CaptureSessionTests {
         case .dead: break
         default: Issue.record("30 s of stall must be .dead — RecorderState stops on first .dead so total budget == this threshold")
         }
+    }
+
+    private static func noise(count: Int, seed: UInt64 = 0xC0DA) -> [Float] {
+        var state = seed
+        return (0..<count).map { _ in
+            state = state &* 6_364_136_223_846_793_005 &+ 1
+            let raw = UInt32((state >> 32) & 0xFFFF_FFFF)
+            return (Float(raw) / Float(UInt32.max) * 2) - 1
+        }
+    }
+
+    private static func convolve(_ source: [Float], impulse: [Float]) -> [Float] {
+        var out = Array(repeating: Float.zero, count: source.count)
+        for index in source.indices {
+            var sample = Float.zero
+            for tap in impulse.indices where index >= tap {
+                sample += source[index - tap] * impulse[tap]
+            }
+            out[index] = sample
+        }
+        return out
+    }
+
+    private static func erle(microphone: [Float], cleaned: [Float]) -> Float {
+        let micEnergy = microphone.reduce(Float.zero) { $0 + $1 * $1 }
+        let cleanedEnergy = max(cleaned.reduce(Float.zero) { $0 + $1 * $1 }, 1e-12)
+        return 10 * log10f(micEnergy / cleanedEnergy)
+    }
+
+    private static func waitForSamples(
+        _ sink: SampleRecordingPCMSink,
+        source: LivePCMSource,
+        atLeast expected: Int,
+        fileID: String = #fileID,
+        line: Int = #line
+    ) async throws {
+        for _ in 0..<200 {
+            if await sink.samples(for: source).count >= expected {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        let actual = await sink.samples(for: source).count
+        Issue.record(
+            "Timed out waiting for \(source) samples: expected at least \(expected), got \(actual)",
+            sourceLocation: SourceLocation(fileID: fileID, filePath: #filePath, line: line, column: #column)
+        )
     }
 }

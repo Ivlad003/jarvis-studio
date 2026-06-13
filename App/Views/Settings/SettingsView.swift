@@ -231,9 +231,8 @@ private struct TranscriptionTab: View {
 
             Section("System audio source") {
                 SystemAudioSourcePicker(settings: settings)
-                Toggle("Echo cancellation (temporarily unavailable — under repair)", isOn: $settings.echoCancellationEnabled)
-                    .disabled(true)
-                Text("Apple voice processing currently prevents the microphone from delivering audio on this build, so echo cancellation is disabled. Recording the meeting works without it; the other party is captured cleanly from the system-audio (\u{201C}Them\u{201D}) stream.")
+                Toggle("Echo cancellation", isOn: $settings.echoCancellationEnabled)
+                Text("Uses the clean system-audio track as a reference to remove speaker bleed from the mic track. Headphone and no-echo paths bypass automatically.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1473,7 +1472,7 @@ private struct ScreenDisplayPicker: View {
 /// Picking a virtual loopback device (BlackHole 2ch / Loopback) lets the user
 /// route system audio through a software cable that the mic doesn't hear.
 /// Echo cancellation is the first-line fix; loopback devices remain useful
-/// when users deliberately disable voice processing.
+/// when users deliberately disable DSP cancellation.
 /// Setup: install BlackHole (`brew install blackhole-2ch`), in Audio MIDI Setup
 /// create a Multi-Output Device (BlackHole + headphones), set system output
 /// to it, then pick BlackHole here. Echo gone.

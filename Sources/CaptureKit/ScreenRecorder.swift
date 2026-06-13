@@ -79,6 +79,11 @@ public actor ScreenRecorder: NSObject {
         }
     }
 
+    public struct StartResult: @unchecked Sendable {
+        public let microphone: AsyncStream<AVAudioPCMBuffer>?
+        public let systemAudio: AsyncStream<AVAudioPCMBuffer>?
+    }
+
     // MARK: - Private state
 
     private var config: Config?
@@ -90,6 +95,12 @@ public actor ScreenRecorder: NSObject {
     private var streamOutput: ScreenStreamOutput?
     private var streamDelegate: SCStreamStopDelegate?
     private var firstSampleTime: CMTime?
+    /// SCStream's system-audio output, converted to PCM so CaptureSession can
+    /// reuse the already-running screen stream as the AEC far-end reference and
+    /// standalone `.system` audio source without starting a second HAL client.
+    private var systemAudioContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+    private var systemAudioTargetFormat: AVAudioFormat?
+    private var systemAudioConverterCache: MicConverterCache?
 
     /// macOS 15+ SCStream microphone path. Non-nil only when `config.captureMicrophone`
     /// is true AND the OS supports the API. The recorder yields AVAudioPCMBuffer
@@ -158,6 +169,15 @@ public actor ScreenRecorder: NSObject {
     /// AVAudioEngine.
     @discardableResult
     public func start(config: Config) async throws -> sending AsyncStream<AVAudioPCMBuffer>? {
+        try await startWithAudioStreams(config: config).microphone
+    }
+
+    /// Start screen capture and return any PCM streams that SCStream already
+    /// owns. `systemAudio` is the same SCStream `.audio` output that is written
+    /// into `screen.mp4`; consumers use it for AEC/reference and `audio.m4a`
+    /// without creating another system-audio capture client.
+    @discardableResult
+    public func startWithAudioStreams(config: Config) async throws -> sending StartResult {
         self.config = config
         isStopping = false
         streamGeneration &+= 1
@@ -165,6 +185,9 @@ public actor ScreenRecorder: NSObject {
         micRecoveryAttempts = 0
         micRecoveryGaveUp = false
         streamStopError = nil
+        systemAudioContinuation = nil
+        systemAudioTargetFormat = nil
+        systemAudioConverterCache = nil
         screenRecorderLog.info("ScreenRecorder.start: outputURL=\(config.outputURL.path, privacy: .public) hevc=\(config.useHEVC, privacy: .public) videoBitrate=\(config.videoBitrate, privacy: .public) audio=\(config.captureSystemAudio, privacy: .public) mic=\(config.captureMicrophone, privacy: .public) fps=\(config.frameRate, privacy: .public)")
 
         let content: SCShareableContent
@@ -197,6 +220,20 @@ public actor ScreenRecorder: NSObject {
         streamConfig.excludesCurrentProcessAudio = true  // may be ignored on macOS 26+
         streamConfig.sampleRate = config.audioSampleRate
         streamConfig.channelCount = 1
+
+        var systemAudioStreamReturn: AsyncStream<AVAudioPCMBuffer>? = nil
+        if config.captureSystemAudio {
+            let (s, cont) = AudioPCMBufferStream.makeStream()
+            self.systemAudioContinuation = cont
+            self.systemAudioTargetFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: Double(config.audioSampleRate),
+                channels: 1,
+                interleaved: false
+            )
+            self.systemAudioConverterCache = MicConverterCache()
+            systemAudioStreamReturn = s
+        }
 
         // Microphone capture via SCStream — macOS 15+ only. When enabled, SCStream
         // becomes the single client of the audio HAL for both system audio AND
@@ -318,6 +355,10 @@ public actor ScreenRecorder: NSObject {
             micContinuation = nil
             micTargetFormat = nil
             micConverterCache = nil
+            systemAudioContinuation?.finish()
+            systemAudioContinuation = nil
+            systemAudioTargetFormat = nil
+            systemAudioConverterCache = nil
             streamOutput = nil
             streamDelegate = nil
             throw error
@@ -332,7 +373,7 @@ public actor ScreenRecorder: NSObject {
         if micCaptureWillRun {
             startMicRecoverySupervisor()
         }
-        return micStreamReturn
+        return StartResult(microphone: micStreamReturn, systemAudio: systemAudioStreamReturn)
     }
 
     private static func selectDisplay(from displays: [SCDisplay], preferredID: UInt32) -> SCDisplay? {
@@ -389,6 +430,10 @@ public actor ScreenRecorder: NSObject {
         // Finish the mic AsyncStream so consumers' for-await loops exit cleanly.
         micContinuation?.finish()
         micContinuation = nil
+        systemAudioContinuation?.finish()
+        systemAudioContinuation = nil
+        systemAudioTargetFormat = nil
+        systemAudioConverterCache = nil
 
         guard let w = writer, let cfg = config else { throw ScreenRecorderError.notStarted }
 
@@ -446,6 +491,10 @@ public actor ScreenRecorder: NSObject {
         streamDelegate = nil
         micContinuation?.finish()
         micContinuation = nil
+        systemAudioContinuation?.finish()
+        systemAudioContinuation = nil
+        systemAudioTargetFormat = nil
+        systemAudioConverterCache = nil
         screenRecorderLog.error("ScreenRecorder: SCStream stopped externally — \(failure.message, privacy: .public)")
     }
 
@@ -519,6 +568,19 @@ public actor ScreenRecorder: NSObject {
                 let appended = aInput.append(adjusted)
                 if !appended {
                     screenRecorderLog.error("ScreenRecorder: audio append returned false — writerStatus=\(w.status.rawValue, privacy: .public) error=\(w.error?.localizedDescription ?? "nil", privacy: .public)")
+                }
+            }
+            if let cont = systemAudioContinuation,
+               let target = systemAudioTargetFormat,
+               let cache = systemAudioConverterCache {
+                if let reference = ScreenRecorder.systemAudioReferenceBuffer(
+                    from: sampleBuffer,
+                    target: target,
+                    cache: cache
+                ) {
+                    cont.yield(reference)
+                } else {
+                    screenRecorderLog.error("ScreenRecorder: system-audio CMSampleBuffer→AEC reference PCM conversion failed")
                 }
             }
 
@@ -875,6 +937,21 @@ extension ScreenRecorder {
         }
         return converted
     }
+
+    /// Convert an SCStream `.audio` sample into the PCM shape consumed by
+    /// CaptureSession's system-audio path. This is the bridge that lets the
+    /// screen recorder's existing system-audio callback also serve as the AEC
+    /// far-end reference.
+    nonisolated static func systemAudioReferenceBuffer(
+        from sampleBuffer: CMSampleBuffer,
+        target: AVAudioFormat,
+        cache: MicConverterCache
+    ) -> AVAudioPCMBuffer? {
+        guard let pcm = sampleBuffer.toAVAudioPCMBuffer() else {
+            return nil
+        }
+        return convertToTargetFormat(buffer: pcm, target: target, cache: cache)
+    }
 }
 
 // MARK: - SBBox
@@ -1079,10 +1156,16 @@ public actor ScreenRecorder: NSObject {
             self.frameRate = frameRate; self.scaleFactor = scaleFactor
         }
     }
+    public struct StartResult: @unchecked Sendable {
+        public let microphone: AsyncStream<AVAudioPCMBuffer>?
+        public let systemAudio: AsyncStream<AVAudioPCMBuffer>?
+    }
     public private(set) var micRecoveryGaveUp: Bool = false
     public override init() {}
     @discardableResult
     public func start(config: Config) async throws -> AsyncStream<AVAudioPCMBuffer>? { throw ScreenRecorderError.noDisplayAvailable }
+    @discardableResult
+    public func startWithAudioStreams(config: Config) async throws -> StartResult { throw ScreenRecorderError.noDisplayAvailable }
     public func stop() async throws -> URL { throw ScreenRecorderError.noDisplayAvailable }
     public func setMicMuted(_ muted: Bool) {}
     public var isMicMuted: Bool { false }

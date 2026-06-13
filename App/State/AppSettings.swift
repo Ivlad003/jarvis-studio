@@ -617,15 +617,15 @@ final class AppSettings {
         self.ollamaModel = UserDefaults.standard.string(forKey: Defaults.ollamaModel) ?? "qwen2.5:14b"
 
         self.systemAudioEnabled = UserDefaults.standard.bool(forKey: Defaults.systemAudioEnabled)
-        // Echo cancellation (VoiceProcessingIO) is FORCED OFF and its Settings
-        // toggle is disabled. VPIO is a duplex unit that only feeds the mic tap
-        // while an output render path renders; this input-tap-only engine has
-        // none, so enabling it makes the mic tap never fire → zero captured
-        // audio (confirmed on-device 2026-06-13). Adding the output path throws
-        // an uncatchable CoreAudio -10868. Ignoring any stored value keeps every
-        // consumer (capture, MicPathPlan, warnings) consistent. Re-enable here
-        // AND in SettingsView once a real VPIO fix is verified on a device.
-        // See the NOTE in AudioEngine.applyVoiceProcessingIfNeeded.
+        // Echo cancellation is FORCED OFF and unused. The "echo" was the remote
+        // voice being doubled in the final mix: the single-HAL SCStream mic
+        // already contains the system audio, and ScreenAudioMixer was adding the
+        // system track on top. Fixed in ScreenAudioMixer (mic is the sole audio
+        // track — it already has both voices). The NLMS canceller must stay off:
+        // it would strip the system audio back out of the mic that the mic-only
+        // mix now relies on (and it was fragile — divergence → robotic artifact).
+        // Ignore any stored value so existing installs (which may have it on) are
+        // not left cancelling. Re-enable only alongside a different mix strategy.
         self.echoCancellationEnabled = false
         // Default true for cleanup; UserDefaults.bool returns false for missing keys, so check object presence.
         self.dictationLLMCleanup = (UserDefaults.standard.object(forKey: Defaults.dictationLLMCleanup) as? Bool) ?? true

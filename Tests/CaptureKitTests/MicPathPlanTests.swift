@@ -3,8 +3,12 @@ import Testing
 
 @Suite("Mic path plan")
 struct MicPathPlanTests {
-    @Test("Uses SCStream mic on macOS 15 screen+mic when echo cancellation is off")
-    func usesSCStreamMicForMacOS15ScreenMicWithoutEchoCancellation() {
+    // The single-HAL SCStream mic is used on macOS 15 screen+mic (avoids the
+    // AVAudioEngine HAL-contention dead-mic). The system-audio doubling it would
+    // otherwise cause is removed in ScreenAudioMixer (mic-only mix), not here.
+
+    @Test("Uses SCStream mic on macOS 15 screen+mic")
+    func usesSCStreamMicForMacOS15ScreenMic() {
         #expect(MicPathPlan.shouldUseSCStreamMic(
             screenRecordingEnabled: true,
             micEnabled: true,
@@ -13,9 +17,9 @@ struct MicPathPlanTests {
         ))
     }
 
-    @Test("Uses AVAudioEngine mic when echo cancellation is on")
-    func usesAudioEngineMicWhenEchoCancellationIsOn() {
-        #expect(!MicPathPlan.shouldUseSCStreamMic(
+    @Test("Uses SCStream mic regardless of echo cancellation setting")
+    func usesSCStreamMicRegardlessOfEchoCancellation() {
+        #expect(MicPathPlan.shouldUseSCStreamMic(
             screenRecordingEnabled: true,
             micEnabled: true,
             echoCancellationEnabled: true,

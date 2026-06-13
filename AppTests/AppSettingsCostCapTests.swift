@@ -30,12 +30,23 @@ struct AppSettingsCostCapTests {
         #expect(settings.costCapUSD == 0.0)
     }
 
-    // Echo cancellation (VoiceProcessingIO) is forced OFF regardless of any
-    // stored value — the VPIO path never delivers audio on this input-tap-only
-    // engine (confirmed on-device 2026-06-13). Re-enable when a real fix lands.
+    // Echo cancellation is forced OFF: the echo (remote voice doubled in the
+    // mix) is fixed in ScreenAudioMixer (mic-only mix), and the NLMS canceller
+    // would strip the system audio back out of the mic that mix relies on.
+
+    @Test("echo cancellation is forced off when preference is missing")
+    func echoCancellationForcedOffWhenMissing() {
+        let prior = UserDefaults.standard.object(forKey: echoCancellationEnabledKey)
+        UserDefaults.standard.removeObject(forKey: echoCancellationEnabledKey)
+        defer { restore(prior, forKey: echoCancellationEnabledKey) }
+
+        let settings = AppSettings()
+
+        #expect(settings.echoCancellationEnabled == false)
+    }
 
     @Test("echo cancellation is forced off even when stored on")
-    func echoCancellationIsForcedOff() {
+    func echoCancellationForcedOffWhenStoredOn() {
         let prior = UserDefaults.standard.object(forKey: echoCancellationEnabledKey)
         UserDefaults.standard.set(true, forKey: echoCancellationEnabledKey)
         defer { restore(prior, forKey: echoCancellationEnabledKey) }

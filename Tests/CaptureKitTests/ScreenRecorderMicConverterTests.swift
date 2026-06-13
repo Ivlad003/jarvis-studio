@@ -68,6 +68,31 @@ struct ScreenRecorderMicConverterTests {
         #expect(hasNonZero)
     }
 
+    @Test("Builds a system-audio reference PCM buffer from an SCStream sample buffer")
+    func buildsSystemAudioReferenceBufferFromSampleBuffer() throws {
+        let cache = MicConverterCache()
+        let target = Self.format(sampleRate: 48_000)
+        let source = try #require(AVAudioPCMBuffer.sineWave(frameCount: 240, sampleRate: 24_000))
+        let sampleBuffer = try #require(source.toCMSampleBuffer(sampleOffset: 0, sampleRate: 24_000))
+
+        let result = try #require(ScreenRecorder.systemAudioReferenceBuffer(
+            from: sampleBuffer,
+            target: target,
+            cache: cache
+        ))
+
+        #expect(result.format.sampleRate == 48_000)
+        #expect(result.format.channelCount == 1)
+        #expect((478...482).contains(result.frameLength))
+
+        guard let data = result.floatChannelData?[0] else {
+            Issue.record("Reference buffer missing channel data")
+            return
+        }
+        let hasNonZero = (0..<Int(result.frameLength)).contains { abs(data[$0]) > 1e-6 }
+        #expect(hasNonZero)
+    }
+
     @Test("Reuses the same AVAudioConverter across consecutive same-format buffers")
     func cachesConverterAcrossBuffers() throws {
         let cache = MicConverterCache()
