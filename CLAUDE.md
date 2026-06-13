@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**v1.0 feature-complete UNVERIFIED — manual smoke pending.** All 18 acceptance criteria are wired in code; release path checklist is in `docs/release/v1.0-checklist.md`. The Swift Package exists, the menu-bar app records → transcribes live (Deepgram WebSocket) or batch → AI-summarizes → indexes (FTS5 + optional embeddings) → opens for chat (vision-capable with screen.mp4) → exports → shares to S3. Local validation via `make test` exits 0 (280 tests). Read `docs/plans/2026-05-02-jarvis-note-design.md` first — it is the canonical source of truth for all architectural decisions, and `.omc/plans/2026-05-02-jarvis-note-v1-implementation.md` for the phase-by-phase plan.
+**v1.0 feature-complete UNVERIFIED — manual smoke pending.** All 18 acceptance criteria are wired in code; release path checklist is in `docs/release/v1.0-checklist.md`. The Swift Package exists, the menu-bar app records → transcribes live (Deepgram WebSocket) or batch → AI-summarizes → indexes (FTS5 + optional embeddings) → opens for chat (vision-capable with screen.mp4) → exports → shares to S3. Local validation via `make test` exits 0 (375 tests in 78 suites). Read `docs/plans/2026-05-02-jarvis-note-design.md` first — it is the canonical source of truth for all architectural decisions, and `.omc/plans/2026-05-02-jarvis-note-v1-implementation.md` for the phase-by-phase plan.
 
 **Features added (latest session — 2026-06-12):**
 - **Speaker echo cancellation.** Settings → Transcription now defaults Echo cancellation ON for speaker-based meetings. `AudioEngine` enables Apple VoiceProcessingIO with AGC disabled and minimum other-audio ducking; `CaptureSession` routes screen-mode mic capture through AVAudioEngine when AEC is on because SCStream has no AEC knob. See design decision D21.
@@ -154,7 +154,14 @@ The `Makefile` at repo root handles the full pipeline. `make install` signs the 
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ```
 
-280 tests pass in ~60 s. FTS5 perf benchmark is gated behind `JN_RUN_PERF=1`.
+375 tests in 78 suites pass in ~60 s. FTS5 perf benchmark is gated behind `JN_RUN_PERF=1`.
+
+**`make test` scope caveat:** `make test` (= `swift test`) only runs the SwiftPM `Tests/`
+targets (the kit libraries). It does **not** compile the App target or run `AppTests/` (e.g.
+`ChatStateBehaviorTests`) — those depend on the App target and run via the Xcode
+`KosmoNotesTests` scheme. Use **`make test-app`** for the App-layer behavior tests, or
+**`make test-all`** to run both. (`test-app` disables signing because the app is signed
+post-build by `make sign`, not by xcodebuild.)
 
 Other commands:
 - `xed .` — open in Xcode
