@@ -8,6 +8,22 @@ import KeyboardShortcuts
 import StorageKit
 import TranscriptionKit
 
+enum SettingsCopy {
+    static let costCapDescription = "AI summaries, cleanup, embeddings, and known transcription estimates above this per-session limit are blocked or skipped. Deepgram live transcription is checked before recording starts using the first-hour estimate. Default $1.00."
+
+    static let audioHandling = """
+    Recordings stay on your Mac at:
+
+    ~/Library/Application Support/KosmoNotes/recordings/
+
+    Deepgram live streaming sends microphone audio during recording. Batch cloud transcription uploads audio after Stop. WhisperKit keeps transcription on this Mac.
+
+    AI summaries and cleanup are sent to the AI provider you configure unless you use Ollama for local AI.
+
+    If you need a local-only recording, use WhisperKit for transcription and Ollama for AI before you start.
+    """
+}
+
 // MARK: - SettingsView
 
 /// Top-level Settings window content. Embedded in the @main App's `Settings`
@@ -573,7 +589,7 @@ private struct AIProvidersTab: View {
                         .frame(width: 100)
                         .textFieldStyle(.roundedBorder)
                 }
-                Text("AI summary requests above this estimate are silently skipped. Default $1.00.")
+                Text(SettingsCopy.costCapDescription)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1186,18 +1202,7 @@ private struct PrivacyTab: View {
             }
 
             Section("How KosmoNotes handles your audio") {
-                Text("""
-                Recordings stay on your Mac at:
-
-                ~/Library/Application Support/KosmoNotes/recordings/
-
-                Transcription and AI summarisation are cloud-only — every recorded \
-                second of audio is uploaded to the provider you configure on the \
-                Transcription / AI Providers tabs. There is no on-device transcription \
-                in v1.0.
-
-                If you do not want a recording leaving your machine, do not start it.
-                """)
+                Text(SettingsCopy.audioHandling)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.leading)

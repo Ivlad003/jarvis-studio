@@ -59,6 +59,26 @@ struct AppSettingsCostCapTests {
         #expect(AppSettings.keychainCommitAction(trimmedValue: "abc", readFailed: true) == .set("abc"))
     }
 
+    @Test("privacy copy distinguishes live streaming, batch upload, and local transcription")
+    func privacyCopyDistinguishesProviderDataFlow() throws {
+        let copy = SettingsCopy.audioHandling
+
+        #expect(copy.contains("Deepgram live streaming sends microphone audio during recording."))
+        #expect(copy.contains("Batch cloud transcription uploads audio after Stop."))
+        #expect(copy.contains("WhisperKit keeps transcription on this Mac."))
+        #expect(!copy.contains("every recorded second of audio is uploaded"))
+        #expect(!copy.contains("There is no on-device transcription"))
+    }
+
+    @Test("cost cap copy includes live transcription preflight")
+    func costCapCopyIncludesLiveTranscriptionPreflight() throws {
+        let copy = SettingsCopy.costCapDescription
+
+        #expect(copy.contains("known transcription estimates"))
+        #expect(copy.contains("Deepgram live transcription is checked before recording starts"))
+        #expect(!copy.contains("AI summary requests above this estimate are silently skipped"))
+    }
+
     private func restore(_ value: Any?, forKey key: String) {
         if let value {
             UserDefaults.standard.set(value, forKey: key)
