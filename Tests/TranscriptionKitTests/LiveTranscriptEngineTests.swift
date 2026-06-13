@@ -608,3 +608,84 @@ private func createAudioFixture(duration: TimeInterval) async throws -> URL {
     
     return fixturePath
 }
+
+// MARK: - Speaker-merge tests (You/Them dual-source live transcript)
+
+private func stableUnit(_ start: TimeInterval, _ end: TimeInterval, _ text: String) -> LiveTranscriptUnit {
+    LiveTranscriptUnit(start: start, end: end, text: text, state: .stable)
+}
+
+@Test func mergingYouThemInterleavesStableUnitsByStartTime() {
+    let you = LiveTranscriptState(
+        stableUnits: [stableUnit(1, 2, "hi there"), stableUnit(5, 6, "sounds good")],
+        draftUnits: [],
+        status: .healthy
+    )
+    let them = LiveTranscriptState(
+        stableUnits: [stableUnit(3, 4, "lets discuss budget")],
+        draftUnits: [],
+        status: .healthy
+    )
+
+    let merged = LiveTranscriptState.merging(you: you, them: them)
+
+    #expect(merged.stableUnits.map(\.speaker) == [.you, .them, .you])
+    #expect(merged.stableUnits.map(\.start) == [1, 3, 5])
+}
+
+@Test func labeledStableTextPrefixesAndGroupsBySpeaker() {
+    let you = LiveTranscriptState(stableUnits: [stableUnit(1, 2, "hi there")], draftUnits: [], status: .healthy)
+    let them = LiveTranscriptState(stableUnits: [stableUnit(3, 4, "lets discuss budget")], draftUnits: [], status: .healthy)
+
+    let merged = LiveTranscriptState.merging(you: you, them: them)
+
+    #expect(merged.labeledStableText == "You: hi there\nThem: lets discuss budget")
+}
+
+@Test func labeledStableTextCollapsesConsecutiveSameSpeaker() {
+    let you = LiveTranscriptState(
+        stableUnits: [stableUnit(1, 2, "first"), stableUnit(2, 3, "second")],
+        draftUnits: [],
+        status: .healthy
+    )
+
+    let merged = LiveTranscriptState.merging(you: you, them: .empty)
+
+    #expect(merged.labeledStableText == "You: first second")
+}
+
+@Test func mergingKeepsBothSpeakerDrafts() {
+    let you = LiveTranscriptState(
+        stableUnits: [],
+        draftUnits: [LiveTranscriptUnit(start: 5, end: 6, text: "typing", state: .draft)],
+        status: .healthy
+    )
+    let them = LiveTranscriptState(
+        stableUnits: [],
+        draftUnits: [LiveTranscriptUnit(start: 5, end: 6, text: "talking", state: .draft)],
+        status: .healthy
+    )
+
+    let merged = LiveTranscriptState.merging(you: you, them: them)
+
+    #expect(merged.draftUnits.count == 2)
+    #expect(merged.draftUnits.contains { $0.speaker == .you && $0.text == "typing" })
+    #expect(merged.draftUnits.contains { $0.speaker == .them && $0.text == "talking" })
+}
+
+@Test func mergingStatusSurfacesFailure() {
+    let you = LiveTranscriptState(stableUnits: [], draftUnits: [], status: .healthy)
+    let them = LiveTranscriptState(stableUnits: [], draftUnits: [], status: .failed(lastError: "them stream died"))
+
+    let merged = LiveTranscriptState.merging(you: you, them: them)
+
+    #expect(merged.status == .failed(lastError: "them stream died"))
+}
+
+@Test func labeledStableTextRendersUnlabeledForSingleSource() {
+    // Units with no speaker (the common single-source case) render unlabeled,
+    // so labeledStableText is a safe drop-in for stableText.
+    let state = LiveTranscriptState(stableUnits: [stableUnit(0, 1, "plain text")], draftUnits: [], status: .healthy)
+
+    #expect(state.labeledStableText == "plain text")
+}

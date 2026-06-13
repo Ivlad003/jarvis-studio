@@ -5,17 +5,35 @@ public enum LiveTranscriptUnitState: Sendable, Equatable {
     case stable
 }
 
+/// Which capture source produced a unit, when the live transcript is merged
+/// from two source-attributed streams (mic = `you`, system audio = `them`).
+/// `nil` on units from a single-source transcript (the common case).
+public enum LiveTranscriptSpeaker: Sendable, Equatable {
+    case you
+    case them
+
+    /// Short prefix rendered in the UI / chat context ("You:" / "Them:").
+    public var label: String {
+        switch self {
+        case .you:  return "You"
+        case .them: return "Them"
+        }
+    }
+}
+
 public struct LiveTranscriptUnit: Sendable, Equatable {
     public let start: TimeInterval
     public let end: TimeInterval
     public let text: String
     public let state: LiveTranscriptUnitState
+    public let speaker: LiveTranscriptSpeaker?
 
-    public init(start: TimeInterval, end: TimeInterval, text: String, state: LiveTranscriptUnitState) {
+    public init(start: TimeInterval, end: TimeInterval, text: String, state: LiveTranscriptUnitState, speaker: LiveTranscriptSpeaker? = nil) {
         self.start = start
         self.end = end
         self.text = text
         self.state = state
+        self.speaker = speaker
     }
 }
 
@@ -54,9 +72,72 @@ public struct LiveTranscriptState: Sendable, Equatable {
 
     public var stableText: String { stableUnits.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines) }
     public var mutableText: String { draftUnits.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    /// Stable transcript rendered as speaker-labeled lines ("You: …\nThem: …").
+    /// Consecutive units from the same speaker collapse into one line; units
+    /// with no speaker (single-source transcripts) render unlabeled, so this is
+    /// safe to use everywhere `stableText` is used.
+    public var labeledStableText: String { Self.labeledLines(from: stableUnits) }
+
+    /// Draft (in-flight) transcript rendered as speaker-labeled lines.
+    public var labeledMutableText: String { Self.labeledLines(from: draftUnits) }
+
+    static func labeledLines(from units: [LiveTranscriptUnit]) -> String {
+        var lines: [String] = []
+        var groupSpeaker: LiveTranscriptSpeaker?
+        var groupStarted = false
+        var buffer: [String] = []
+
+        func flush() {
+            let text = buffer.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            buffer.removeAll()
+            guard !text.isEmpty else { return }
+            if let speaker = groupSpeaker {
+                lines.append("\(speaker.label): \(text)")
+            } else {
+                lines.append(text)
+            }
+        }
+
+        for unit in units {
+            let trimmed = unit.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if groupStarted && unit.speaker != groupSpeaker { flush() }
+            groupSpeaker = unit.speaker
+            groupStarted = true
+            buffer.append(trimmed)
+        }
+        flush()
+        return lines.joined(separator: "\n")
+    }
 }
 
 extension LiveTranscriptState {
+    /// Merge two single-speaker live transcripts into one speaker-labeled
+    /// timeline: stable units from both interleaved by start time, draft units
+    /// kept per speaker. Combines the mic ("you") and system-audio ("them")
+    /// live streams into the single state the UI and chat context bind to.
+    public static func merging(you: LiveTranscriptState, them: LiveTranscriptState) -> LiveTranscriptState {
+        func labeled(_ units: [LiveTranscriptUnit], _ speaker: LiveTranscriptSpeaker) -> [LiveTranscriptUnit] {
+            units.map {
+                LiveTranscriptUnit(start: $0.start, end: $0.end, text: $0.text, state: $0.state, speaker: speaker)
+            }
+        }
+        let stable = (labeled(you.stableUnits, .you) + labeled(them.stableUnits, .them))
+            .sorted { $0.start < $1.start }
+        let draft = labeled(you.draftUnits, .you) + labeled(them.draftUnits, .them)
+        return LiveTranscriptState(stableUnits: stable, draftUnits: draft, status: mergeStatus(you.status, them.status))
+    }
+
+    /// A failure on either stream surfaces; otherwise delayed if either is
+    /// delayed; otherwise healthy.
+    static func mergeStatus(_ lhs: LiveTranscriptHealth, _ rhs: LiveTranscriptHealth) -> LiveTranscriptHealth {
+        if case .failed(let error) = lhs { return .failed(lastError: error) }
+        if case .failed(let error) = rhs { return .failed(lastError: error) }
+        if lhs == .delayed || rhs == .delayed { return .delayed }
+        return .healthy
+    }
+
     public func merging(_ result: LiveTranscriptWindowResult, mutableHorizon: TimeInterval) -> LiveTranscriptState {
         let lockBefore = max(0, result.emittedAt - mutableHorizon)
 
