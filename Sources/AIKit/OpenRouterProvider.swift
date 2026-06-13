@@ -48,12 +48,17 @@ public final class OpenRouterProvider: AIProvider, Sendable {
     // MARK: AIProvider
 
     public func chat(messages: [ChatMessage], config: AIConfig) async throws -> String {
+        try await chat(messages: messages, tools: [], config: config).text
+    }
+
+    public func chat(messages: [ChatMessage], tools: [ToolSpec], config: AIConfig) async throws -> ChatResponse {
         let request = try Self.buildRequest(
             endpoint: endpoint,
             apiKey: apiKey,
             referer: referer,
             title: title,
             messages: messages,
+            tools: tools,
             config: config
         )
 
@@ -71,7 +76,7 @@ public final class OpenRouterProvider: AIProvider, Sendable {
         switch httpResponse.statusCode {
         case 200:
             // Same response shape as OpenAI — reuse its parser.
-            return try OpenAIProvider.parse(data: data)
+            return try OpenAIProvider.parseResponse(data: data)
         case 401:
             throw AIError.authenticationFailed
         case 429:
@@ -90,6 +95,7 @@ public final class OpenRouterProvider: AIProvider, Sendable {
         referer: String,
         title: String,
         messages: [ChatMessage],
+        tools: [ToolSpec] = [],
         config: AIConfig
     ) throws -> URLRequest {
         var request = URLRequest(url: endpoint)
@@ -104,14 +110,15 @@ public final class OpenRouterProvider: AIProvider, Sendable {
             allMessages.insert(ChatMessage(role: .system, content: systemPrompt), at: 0)
         }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": config.model,
             "max_completion_tokens": config.maxTokens,
             "temperature": config.temperature,
-            "messages": allMessages.map { msg -> [String: Any] in
-                ["role": msg.role.rawValue, "content": serializeParts(msg.parts)]
-            },
+            "messages": try allMessages.map(Self.serializeMessage),
         ]
+        if !tools.isEmpty {
+            body["tools"] = tools.map(Self.serializeTool)
+        }
 
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -122,6 +129,50 @@ public final class OpenRouterProvider: AIProvider, Sendable {
     }
 
     // MARK: - Private: part serialization
+
+    private static func serializeTool(_ tool: ToolSpec) -> [String: Any] {
+        [
+            "type": "function",
+            "function": [
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters.anyValue,
+            ] as [String: Any],
+        ]
+    }
+
+    private static func serializeMessage(_ message: ChatMessage) throws -> [String: Any] {
+        if case .toolResult(let id, let content, _) = message.parts.first, message.parts.count == 1 {
+            return [
+                "role": ChatMessage.Role.tool.rawValue,
+                "tool_call_id": id,
+                "content": content,
+            ]
+        }
+
+        var serialized: [String: Any] = [
+            "role": message.role.rawValue,
+            "content": serializeParts(message.parts),
+        ]
+        let toolCalls = try message.parts.compactMap { part -> [String: Any]? in
+            guard case .toolUse(let call) = part else { return nil }
+            return [
+                "id": call.id,
+                "type": "function",
+                "function": [
+                    "name": call.name,
+                    "arguments": try call.arguments.jsonString(),
+                ] as [String: Any],
+            ]
+        }
+        if !toolCalls.isEmpty {
+            serialized["tool_calls"] = toolCalls
+            if !message.parts.contains(where: { if case .text = $0 { true } else { false } }) {
+                serialized["content"] = NSNull()
+            }
+        }
+        return serialized
+    }
 
     private static func serializeParts(_ parts: [ChatMessage.Part]) -> Any {
         if parts.count == 1, case .text(let s) = parts[0] {

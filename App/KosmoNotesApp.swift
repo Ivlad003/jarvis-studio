@@ -605,6 +605,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 liveTranscriptProvider: { [weak recorder] in
                     guard let recorder else { return nil }
                     return await recorder.liveTranscriptSnapshot()
+                },
+                screenFrameSourceProvider: { [weak recorder] in
+                    guard let recorder,
+                          case .recording(let sessionId) = recorder.status else { return nil }
+                    let dir = await sessionStore.sessionDir(for: sessionId)
+                    return ScreenFrameSource(
+                        sessionId: sessionId,
+                        videoURL: dir.appendingPathComponent("screen.mp4")
+                    )
                 }
             )
             self.agentSessionHolder = agentSession

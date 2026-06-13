@@ -24,6 +24,10 @@ public protocol AgentTool: Sendable {
     func execute(input: [String: Any]) async throws -> String
 }
 
+public protocol RichAgentTool: AgentTool {
+    func executeResult(input: [String: Any]) async throws -> ToolExecutionResult
+}
+
 // MARK: - Built-in tools
 
 /// Read the contents of a UTF-8 text file. Restricted to the workspace
@@ -530,6 +534,159 @@ public struct SearchTranscriptsTool: AgentTool {
     }
 }
 
+struct ScreenFrameSource: Sendable, Equatable {
+    let sessionId: String?
+    let videoURL: URL
+
+    init(sessionId: String?, videoURL: URL) {
+        self.sessionId = sessionId
+        self.videoURL = videoURL
+    }
+}
+
+@available(macOS 14.0, *)
+struct GetScreenFrameTool: RichAgentTool {
+    typealias SourceProvider = @MainActor @Sendable () async -> ScreenFrameSource?
+    typealias FrameLoader = @Sendable (_ seconds: TimeInterval, _ videoURL: URL) async throws -> Data
+
+    let name = "get_screen_frame"
+    let description = "Extract one JPEG frame from the active recording's screen.mp4 at a requested timestamp and return it as vision context."
+    let inputSchema: [String: Any] = [
+        "type": "object",
+        "properties": [
+            "timestamp": [
+                "description": "Timestamp in seconds or h:mm:ss / mm:ss format, relative to the active screen recording.",
+                "oneOf": [
+                    ["type": "number"],
+                    ["type": "string"],
+                ],
+            ],
+        ],
+        "required": ["timestamp"],
+    ]
+
+    private let sourceProvider: SourceProvider
+    private let frameLoader: FrameLoader
+
+    init(
+        sourceProvider: @escaping SourceProvider,
+        frameLoader: @escaping FrameLoader = { seconds, videoURL in
+            try await FrameExtractor.extractFrame(at: seconds, from: videoURL)
+        }
+    ) {
+        self.sourceProvider = sourceProvider
+        self.frameLoader = frameLoader
+    }
+
+    func execute(input: [String: Any]) async throws -> String {
+        try await executeResult(input: input).content
+    }
+
+    func executeResult(input: [String: Any]) async throws -> ToolExecutionResult {
+        let seconds = try Self.parseTimestamp(input["timestamp"])
+        guard let source = await sourceProvider() else {
+            throw AgentToolError.runtime("get_screen_frame: no active screen recording is available")
+        }
+
+        let jpeg = try await frameLoader(seconds, source.videoURL)
+        let label = Self.formatTimestamp(seconds)
+        let sourceLabel: String
+        if let sessionId = source.sessionId {
+            sourceLabel = "session \(String(sessionId.prefix(8)))"
+        } else {
+            sourceLabel = source.videoURL.deletingLastPathComponent().lastPathComponent
+        }
+
+        return ToolExecutionResult(
+            content: "Frame extracted from \(sourceLabel) at \(label).",
+            attachments: [.image(jpegData: jpeg, mimeType: "image/jpeg")]
+        )
+    }
+
+    private static func parseTimestamp(_ value: Any?) throws -> TimeInterval {
+        guard let value else {
+            throw AgentToolError.badInput("get_screen_frame: missing 'timestamp'")
+        }
+
+        let seconds: TimeInterval
+        if let value = value as? Double {
+            seconds = value
+        } else if let value = value as? Int {
+            seconds = TimeInterval(value)
+        } else if let value = value as? NSNumber {
+            seconds = value.doubleValue
+        } else if let value = value as? String {
+            seconds = try parseTimestampString(value)
+        } else {
+            throw AgentToolError.badInput("get_screen_frame: timestamp must be a number or timestamp string")
+        }
+
+        guard seconds.isFinite, seconds >= 0 else {
+            throw AgentToolError.badInput("get_screen_frame: timestamp must be a non-negative finite value")
+        }
+        return seconds
+    }
+
+    private static func parseTimestampString(_ raw: String) throws -> TimeInterval {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else {
+            throw AgentToolError.badInput("get_screen_frame: empty timestamp")
+        }
+
+        if trimmed.contains(":") {
+            let parts = trimmed.split(separator: ":").map(String.init)
+            guard parts.count == 2 || parts.count == 3,
+                  let values = parseIntegerComponents(parts) else {
+                throw AgentToolError.badInput("get_screen_frame: invalid timestamp '\(raw)'")
+            }
+            if values.count == 2 {
+                let minutes = values[0]
+                let seconds = values[1]
+                guard seconds < 60 else {
+                    throw AgentToolError.badInput("get_screen_frame: invalid seconds in '\(raw)'")
+                }
+                return TimeInterval(minutes * 60 + seconds)
+            }
+            let hours = values[0]
+            let minutes = values[1]
+            let seconds = values[2]
+            guard minutes < 60, seconds < 60 else {
+                throw AgentToolError.badInput("get_screen_frame: invalid time in '\(raw)'")
+            }
+            return TimeInterval(hours * 3600 + minutes * 60 + seconds)
+        }
+
+        let suffixes = [" seconds", " second", " secs", " sec", "s"]
+        let numeric = suffixes.reduce(trimmed) { partial, suffix in
+            partial.hasSuffix(suffix) ? String(partial.dropLast(suffix.count)) : partial
+        }.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let seconds = TimeInterval(numeric) else {
+            throw AgentToolError.badInput("get_screen_frame: invalid timestamp '\(raw)'")
+        }
+        return seconds
+    }
+
+    private static func parseIntegerComponents(_ parts: [String]) -> [Int]? {
+        var values: [Int] = []
+        for part in parts {
+            guard let value = Int(part), value >= 0 else { return nil }
+            values.append(value)
+        }
+        return values
+    }
+
+    private static func formatTimestamp(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        }
+        return String(format: "%02d:%02d", minutes, secs)
+    }
+}
+
 public struct SearchKnowledgeBaseTool: AgentTool {
     public let name = "search_knowledge_base"
     public let description = "Search user-added local knowledge-base documents and code chunks. Returns matching file paths and snippets."
@@ -722,7 +879,8 @@ enum AgentToolRegistry {
         workspace: URL,
         database: AppDatabase? = nil,
         knowledgeBaseStore: KnowledgeBaseStore?,
-        liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider?
+        liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider?,
+        screenFrameSourceProvider: GetScreenFrameTool.SourceProvider? = nil
     ) async -> [AgentTool] {
         var tools: [AgentTool] = [
             BashTool(workspace: workspace),
@@ -736,6 +894,10 @@ enum AgentToolRegistry {
 
         if let liveTranscriptProvider {
             tools.append(SearchLiveTranscriptTool(snapshotProvider: liveTranscriptProvider))
+        }
+
+        if let screenFrameSourceProvider {
+            tools.append(GetScreenFrameTool(sourceProvider: screenFrameSourceProvider))
         }
 
         if let knowledgeBaseStore {
@@ -761,6 +923,9 @@ extension AgentTool {
             execute: { arguments in
                 let input = (arguments.anyValue as? [String: Any]) ?? [:]
                 do {
+                    if let richTool = self as? RichAgentTool {
+                        return try await richTool.executeResult(input: input)
+                    }
                     return ToolExecutionResult(content: try await execute(input: input))
                 } catch {
                     return ToolExecutionResult(content: error.localizedDescription, isError: true)

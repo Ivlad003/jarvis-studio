@@ -95,6 +95,44 @@ struct ToolLoopEngineTests {
         }.first
         #expect(resultPart == .toolResult(id: "toolu_missing", content: "Unknown tool: missing_tool. Available: ", isError: true))
     }
+
+    @Test("tool results can carry image attachments into the next provider turn")
+    func toolResultsCanCarryImageAttachmentsIntoNextProviderTurn() async throws {
+        let provider = ScreenFrameToolProvider()
+        let jpeg = Data([0xFF, 0xD8, 0xFF, 0xD9])
+        let tool = ToolDefinition(
+            spec: ToolSpec(
+                name: "get_screen_frame",
+                description: "Extract a screen frame",
+                parameters: .object(["type": .string("object")])
+            ),
+            execute: { _ in
+                ToolExecutionResult(
+                    content: "Frame extracted at 00:05.",
+                    attachments: [.image(jpegData: jpeg, mimeType: "image/jpeg")]
+                )
+            }
+        )
+        let engine = ToolLoopEngine(
+            provider: provider,
+            tools: [tool],
+            config: AIConfig(model: "mock"),
+            maxIterations: 4,
+            maxTranscriptBytes: 20_000
+        )
+
+        _ = try await engine.run(messages: [
+            ChatMessage(role: .user, content: "Show me the screen at 00:05"),
+        ])
+
+        let secondCall = try #require(await provider.calls.last)
+        #expect(secondCall.messages.contains {
+            $0.parts == [.toolResult(id: "toolu_frame", content: "Frame extracted at 00:05.", isError: false)]
+        })
+        #expect(secondCall.messages.contains {
+            $0.parts.contains(.image(jpegData: jpeg, mimeType: "image/jpeg"))
+        })
+    }
 }
 
 private actor ToolProviderCalls {
@@ -147,5 +185,28 @@ private struct UnknownToolProvider: AIProvider {
             ], stopReason: .toolUse)
         }
         return ChatResponse(parts: [.text("Done")], stopReason: .endTurn)
+    }
+}
+
+private struct ScreenFrameToolProvider: AIProvider {
+    let calls = ToolProviderCalls()
+
+    func chat(messages: [ChatMessage], config: AIConfig) async throws -> String {
+        ""
+    }
+
+    func chat(messages: [ChatMessage], tools: [ToolSpec], config: AIConfig) async throws -> ChatResponse {
+        await calls.append(messages: messages, tools: tools)
+        if await calls.calls.count == 1 {
+            #expect(tools.map(\.name) == ["get_screen_frame"])
+            return ChatResponse(parts: [
+                .toolUse(.init(
+                    id: "toolu_frame",
+                    name: "get_screen_frame",
+                    arguments: .object(["timestamp": .number(5)])
+                )),
+            ], stopReason: .toolUse)
+        }
+        return ChatResponse(parts: [.text("I can see the frame.")], stopReason: .endTurn)
     }
 }

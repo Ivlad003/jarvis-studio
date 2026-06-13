@@ -3,10 +3,16 @@ import Foundation
 public struct ToolExecutionResult: Sendable, Equatable {
     public let content: String
     public let isError: Bool
+    public let attachments: [ChatMessage.Part]
 
-    public init(content: String, isError: Bool = false) {
+    public init(
+        content: String,
+        isError: Bool = false,
+        attachments: [ChatMessage.Part] = []
+    ) {
         self.content = content
         self.isError = isError
+        self.attachments = attachments
     }
 }
 
@@ -115,13 +121,22 @@ public actor ToolLoopEngine {
                 return ToolLoopRunResult(response: response, transcript: transcript)
             }
 
-            var resultParts: [ChatMessage.Part] = []
             for call in calls {
                 let result = await execute(call)
                 emit(.init(kind: .toolResult, text: result.content, toolName: call.name))
-                resultParts.append(.toolResult(id: call.id, content: result.content, isError: result.isError))
+                transcript.append(ChatMessage(
+                    role: .user,
+                    parts: [.toolResult(id: call.id, content: result.content, isError: result.isError)]
+                ))
+                if !result.attachments.isEmpty {
+                    transcript.append(ChatMessage(
+                        role: .user,
+                        parts: [
+                            .text("Tool \(call.name) returned \(result.attachments.count) visual attachment(s) for result \(call.id)."),
+                        ] + result.attachments
+                    ))
+                }
             }
-            transcript.append(ChatMessage(role: .user, parts: resultParts))
         }
 
         emit(.init(kind: .error, text: "Tool loop reached max iterations (\(maxIterations))."))

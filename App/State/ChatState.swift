@@ -422,6 +422,9 @@ final class ChatState {
         if let liveContextProvider {
             tools.append(SearchLiveTranscriptTool(snapshotProvider: liveContextProvider))
         }
+        if let screenFrameSource = await currentScreenFrameSource() {
+            tools.append(GetScreenFrameTool(sourceProvider: { screenFrameSource }))
+        }
         if let knowledgeBaseStore {
             tools.append(SearchKnowledgeBaseTool(store: knowledgeBaseStore))
             let codeRoots = (try? await knowledgeBaseStore.listSources())
@@ -433,6 +436,15 @@ final class ChatState {
             tools.append(SearchCodeTool(roots: codeRoots))
         }
         return tools.map { $0.toolDefinition() }
+    }
+
+    private func currentScreenFrameSource() async -> ScreenFrameSource? {
+        guard case .recording(let sessionId) = recorder.status else { return nil }
+        let dir = await sessionStore.sessionDir(for: sessionId)
+        return ScreenFrameSource(
+            sessionId: sessionId,
+            videoURL: dir.appendingPathComponent("screen.mp4")
+        )
     }
 
     // MARK: - Private: vision frame extraction

@@ -67,6 +67,29 @@ struct AgentSearchToolTests {
         #expect(output.contains("budget"))
     }
 
+    @Test("get_screen_frame returns a JPEG image attachment from the active screen source")
+    func getScreenFrameReturnsJPEGImageAttachmentFromActiveScreenSource() async throws {
+        let source = ScreenFrameSource(
+            sessionId: "active-session-12345678",
+            videoURL: URL(fileURLWithPath: "/tmp/active-session-12345678/screen.mp4")
+        )
+        let jpeg = Data([0xFF, 0xD8, 0xFF, 0xD9])
+        let tool = GetScreenFrameTool(
+            sourceProvider: { source },
+            frameLoader: { seconds, url in
+                #expect(seconds == 5)
+                #expect(url == source.videoURL)
+                return jpeg
+            }
+        )
+
+        let result = try await tool.executeResult(input: ["timestamp": "00:05"])
+
+        #expect(result.content.contains("active-session-12345678".prefix(8)))
+        #expect(result.content.contains("00:05"))
+        #expect(result.attachments == [.image(jpegData: jpeg, mimeType: "image/jpeg")])
+    }
+
     @Test("builtin agent tool registry includes live transcript search when a provider is available")
     func builtinToolRegistryIncludesLiveTranscriptSearchWhenProviderAvailable() async throws {
         let workspace = try makeTempDir()
@@ -78,11 +101,18 @@ struct AgentSearchToolTests {
             workspace: workspace,
             database: db,
             knowledgeBaseStore: nil,
-            liveTranscriptProvider: { .empty }
+            liveTranscriptProvider: { .empty },
+            screenFrameSourceProvider: {
+                ScreenFrameSource(
+                    sessionId: "active-session-12345678",
+                    videoURL: workspace.appendingPathComponent("screen.mp4")
+                )
+            }
         )
 
         #expect(tools.map(\.name).contains("search_transcripts"))
         #expect(tools.map(\.name).contains("search_live_transcript"))
+        #expect(tools.map(\.name).contains("get_screen_frame"))
     }
 
     @Test("search_knowledge_base returns formatted KB hits")

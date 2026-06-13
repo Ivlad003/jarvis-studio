@@ -48,6 +48,7 @@ final class AgentSessionState {
     private let database: AppDatabase?
     private let knowledgeBaseStore: KnowledgeBaseStore?
     private let liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider?
+    private let screenFrameSourceProvider: GetScreenFrameTool.SourceProvider?
     /// One of these is non-nil while a session runs. Built-in backend uses
     /// AgentRunner; CLI backends use ExternalAgentRunner. Polymorphism via
     /// helpers below to avoid an extra protocol layer.
@@ -74,12 +75,14 @@ final class AgentSessionState {
         settings: AppSettings,
         database: AppDatabase? = nil,
         knowledgeBaseStore: KnowledgeBaseStore? = nil,
-        liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider? = nil
+        liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider? = nil,
+        screenFrameSourceProvider: GetScreenFrameTool.SourceProvider? = nil
     ) {
         self.settings = settings
         self.database = database
         self.knowledgeBaseStore = knowledgeBaseStore
         self.liveTranscriptProvider = liveTranscriptProvider
+        self.screenFrameSourceProvider = screenFrameSourceProvider
     }
 
     // MARK: - Public API
@@ -192,7 +195,8 @@ final class AgentSessionState {
             workspace: workspace,
             database: database,
             knowledgeBaseStore: knowledgeBaseStore,
-            liveTranscriptProvider: liveTranscriptProvider
+            liveTranscriptProvider: liveTranscriptProvider,
+            screenFrameSourceProvider: screenFrameSourceProvider
         )
         let systemPrompt = settings.agentSystemPrompt.isEmpty
             ? AppSettings.defaultAgentSystemPrompt
