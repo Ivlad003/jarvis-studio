@@ -53,6 +53,7 @@ public actor ReconnectingSession {
     private let audioBytesPerSecond: Double?
     private let defaultCloseMessage: String?
     private let finishDrainTimeoutNanoseconds: UInt64
+    private let terminalMessage: @Sendable (WebSocketMessage) -> Bool
     private let lifecycle: WebSocketSessionLifecycle
 
     /// Ring buffer: tuples of (wallClockDate, audioData, audioDurationSeconds).
@@ -79,7 +80,8 @@ public actor ReconnectingSession {
         clock: any ReconnectClock = SystemClock(),
         keepAliveClock: any ReconnectClock = SystemClock(),
         defaultCloseMessage: String? = nil,
-        finishDrainTimeoutNanoseconds: UInt64 = 2_500_000_000
+        finishDrainTimeoutNanoseconds: UInt64 = 2_500_000_000,
+        terminalMessage: @escaping @Sendable (WebSocketMessage) -> Bool = { _ in false }
     ) {
         let lifecycle = WebSocketSessionLifecycle()
         let (stream, cont) = Self.makeEventStream(lifecycle: lifecycle)
@@ -92,6 +94,7 @@ public actor ReconnectingSession {
         self.audioBytesPerSecond = nil
         self.defaultCloseMessage = defaultCloseMessage
         self.finishDrainTimeoutNanoseconds = finishDrainTimeoutNanoseconds
+        self.terminalMessage = terminalMessage
         self.lifecycle = lifecycle
     }
 
@@ -102,7 +105,8 @@ public actor ReconnectingSession {
         keepAliveClock: any ReconnectClock = SystemClock(),
         audioBytesPerSecond: Double,
         defaultCloseMessage: String? = nil,
-        finishDrainTimeoutNanoseconds: UInt64 = 2_500_000_000
+        finishDrainTimeoutNanoseconds: UInt64 = 2_500_000_000,
+        terminalMessage: @escaping @Sendable (WebSocketMessage) -> Bool = { _ in false }
     ) {
         let lifecycle = WebSocketSessionLifecycle()
         let (stream, cont) = Self.makeEventStream(lifecycle: lifecycle)
@@ -115,6 +119,7 @@ public actor ReconnectingSession {
         self.audioBytesPerSecond = audioBytesPerSecond > 0 ? audioBytesPerSecond : nil
         self.defaultCloseMessage = defaultCloseMessage
         self.finishDrainTimeoutNanoseconds = finishDrainTimeoutNanoseconds
+        self.terminalMessage = terminalMessage
         self.lifecycle = lifecycle
     }
 
@@ -200,6 +205,7 @@ public actor ReconnectingSession {
         receiveLoopFinished = false
         let cont = continuation
         let parser = self.parserFactory(connectionTimestampOffset)
+        let terminalMessage = self.terminalMessage
 
         receiveTask = Task.detached { [weak self] in
             guard let self else { return }
@@ -231,6 +237,9 @@ public actor ReconnectingSession {
                 // later disconnect is a new consecutive-failure run, not a
                 // lifetime retry budget hit.
                 activeConsecutiveFailures = 0
+                if terminalMessage(message) {
+                    break
+                }
                 let segments = parser.parse(message)
                 for segment in segments {
                     cont.yield(segment)

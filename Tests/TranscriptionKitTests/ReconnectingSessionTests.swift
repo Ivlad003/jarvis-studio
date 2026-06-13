@@ -63,6 +63,10 @@ private func makeSession(
     return session
 }
 
+private func metadataJSON() -> String {
+    #"{"type":"Metadata","request_id":"abc","sha256":"x"}"#
+}
+
 private func repoFile(_ relativePath: String) throws -> String {
     let testFile = URL(fileURLWithPath: #filePath)
     let repoRoot = testFile
@@ -75,6 +79,56 @@ private func repoFile(_ relativePath: String) throws -> String {
             partial.appendingPathComponent(String(component))
         }
     return try String(contentsOf: fileURL, encoding: .utf8)
+}
+
+@Suite("ReconnectingSession — finish drain", .serialized)
+struct FinishDrainTests {
+    @Test("finish returns when terminal metadata arrives after CloseStream")
+    func finishReturnsOnTerminalMetadata() async throws {
+        let transport = MockWebSocketTransport()
+        let session = ReconnectingSession(
+            transportFactory: { transport },
+            parser: DeepgramEventParser.makeParser(),
+            clock: MockClock(),
+            defaultCloseMessage: DeepgramProvider.closeStreamMessage,
+            finishDrainTimeoutNanoseconds: 1_000_000_000,
+            terminalMessage: DeepgramEventParser.isTerminalMetadata
+        )
+        await session.start()
+
+        let finishTask = Task {
+            do {
+                try await session.finish()
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        for _ in 0..<50 {
+            if transport.recordedSends.contains(.text(DeepgramProvider.closeStreamMessage)) {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(transport.recordedSends.contains(.text(DeepgramProvider.closeStreamMessage)))
+
+        transport.enqueueText(metadataJSON())
+
+        let completedBeforeTimeout = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await finishTask.value }
+            group.addTask {
+                try? await Task.sleep(for: .milliseconds(200))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+
+        #expect(completedBeforeTimeout)
+        #expect(transport.closeCode == .normalClosure)
+    }
 }
 
 // MARK: - Tests

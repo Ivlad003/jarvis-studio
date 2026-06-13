@@ -77,7 +77,9 @@ public final class DeepgramProvider: TranscriptionProvider, Sendable {
             },
             clock: clock,
             audioBytesPerSecond: Double(config.sampleRate * config.channels * 2),
-            defaultCloseMessage: Self.closeStreamMessage
+            defaultCloseMessage: Self.closeStreamMessage,
+            finishDrainTimeoutNanoseconds: sessionDrainTimeoutNanoseconds,
+            terminalMessage: DeepgramEventParser.isTerminalMetadata
         )
         await session.start()
         return session
