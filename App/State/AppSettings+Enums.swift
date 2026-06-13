@@ -88,12 +88,14 @@ extension AppSettings {
     enum OllamaAPIMode: String, CaseIterable, Identifiable {
         case native
         case openaiCompat
+        case anthropicCompat
 
         var id: String { rawValue }
         var displayName: String {
             switch self {
             case .native: return "Native (/api/chat)"
             case .openaiCompat: return "OpenAI-compat (/v1/chat/completions)"
+            case .anthropicCompat: return "Anthropic-compat (/v1/messages)"
             }
         }
     }

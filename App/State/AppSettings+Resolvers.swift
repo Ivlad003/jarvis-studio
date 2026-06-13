@@ -98,8 +98,9 @@ extension AppSettings {
 
     private var ollamaResolverMode: OllamaProvider.APIMode {
         switch ollamaApiMode {
-        case .native:       return .native
-        case .openaiCompat: return .openaiCompat
+        case .native:           return .native
+        case .openaiCompat:     return .openaiCompat
+        case .anthropicCompat:  return .anthropicCompat
         }
     }
 

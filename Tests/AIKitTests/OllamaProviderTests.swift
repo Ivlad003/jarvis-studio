@@ -292,6 +292,75 @@ struct OllamaProviderOpenAICompatRequestTests {
     }
 }
 
+@Suite("OllamaProvider Anthropic-compat request builder")
+struct OllamaProviderAnthropicCompatRequestTests {
+
+    private let baseConfig = AIConfig(model: "qwen3-coder", temperature: 0.2, maxTokens: 1024)
+
+    @Test("Builds POST to /v1/messages with Anthropic tool schema")
+    func buildsMessagesRequestWithTools() throws {
+        let endpoint = URL(string: "http://localhost:11434")!
+        let request = try OllamaProvider.buildAnthropicCompatRequest(
+            endpoint: endpoint,
+            bearerToken: nil,
+            messages: [ChatMessage(role: .user, content: "Search the live transcript")],
+            tools: [
+                ToolSpec(
+                    name: "search_live_transcript",
+                    description: "Search active transcript",
+                    parameters: .object([
+                        "type": .string("object"),
+                        "properties": .object(["query": .object(["type": .string("string")])]),
+                        "required": .array([.string("query")]),
+                    ])
+                ),
+            ],
+            config: baseConfig
+        )
+
+        #expect(request.httpMethod == "POST")
+        #expect(request.url?.path == "/v1/messages")
+        #expect(request.value(forHTTPHeaderField: "content-type") == "application/json")
+
+        let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as! [String: Any]
+        #expect(body["model"] as? String == "qwen3-coder")
+        #expect(body["max_tokens"] as? Int == 1024)
+        let messages = try #require(body["messages"] as? [[String: Any]])
+        #expect(messages.count == 1)
+        #expect(messages[0]["role"] as? String == "user")
+        let tools = try #require(body["tools"] as? [[String: Any]])
+        #expect(tools.count == 1)
+        #expect(tools[0]["name"] as? String == "search_live_transcript")
+        #expect(tools[0]["input_schema"] != nil)
+    }
+
+    @Test("Tool result parts serialize as Anthropic content blocks")
+    func serializesToolResults() throws {
+        let endpoint = URL(string: "http://localhost:11434")!
+        let request = try OllamaProvider.buildAnthropicCompatRequest(
+            endpoint: endpoint,
+            bearerToken: "ollama-cloud-token",
+            messages: [
+                ChatMessage(role: .user, parts: [
+                    .toolResult(id: "toolu_123", content: "Found budget at 00:14.", isError: false),
+                ]),
+            ],
+            tools: [],
+            config: baseConfig
+        )
+
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer ollama-cloud-token")
+        let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as! [String: Any]
+        let messages = try #require(body["messages"] as? [[String: Any]])
+        let content = try #require(messages[0]["content"] as? [[String: Any]])
+        #expect(content.count == 1)
+        #expect(content[0]["type"] as? String == "tool_result")
+        #expect(content[0]["tool_use_id"] as? String == "toolu_123")
+        #expect(content[0]["content"] as? String == "Found budget at 00:14.")
+        #expect(content[0]["is_error"] as? Bool == false)
+    }
+}
+
 // MARK: - Response parsers
 
 @Suite("OllamaProvider native response parser")
@@ -576,6 +645,71 @@ struct OllamaProviderCompatE2ETests {
             config: AIConfig(model: "qwen2.5:14b")
         )
         #expect(box.url?.path == "/v1/chat/completions")
+    }
+}
+
+@Suite("OllamaProvider end-to-end Anthropic-compat mode")
+struct OllamaProviderAnthropicCompatE2ETests {
+
+    private let endpoint = URL(string: "http://localhost:11434")!
+
+    @Test("chat with tools posts to /v1/messages and parses tool_use response")
+    func chatWithToolsParsesToolUse() async throws {
+        final class Box: @unchecked Sendable {
+            var request: URLRequest?
+        }
+        let box = Box()
+        let provider = try OllamaProvider(
+            endpoint: endpoint,
+            apiMode: .anthropicCompat,
+            httpClient: { request in
+                box.request = request
+                let response = HTTPURLResponse(
+                    url: URL(string: "http://localhost:11434/v1/messages")!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (Data("""
+                {
+                  "id": "msg_ollama_tool",
+                  "type": "message",
+                  "role": "assistant",
+                  "content": [
+                    {
+                      "type": "tool_use",
+                      "id": "toolu_live",
+                      "name": "search_live_transcript",
+                      "input": { "query": "budget" }
+                    }
+                  ],
+                  "stop_reason": "tool_use"
+                }
+                """.utf8), response)
+            }
+        )
+
+        let tool = ToolSpec(
+            name: "search_live_transcript",
+            description: "Search active transcript",
+            parameters: .object(["type": .string("object")])
+        )
+
+        let response = try await provider.chat(
+            messages: [ChatMessage(role: .user, content: "What did we say about budget?")],
+            tools: [tool],
+            config: AIConfig(model: "qwen3-coder")
+        )
+
+        #expect(box.request?.url?.path == "/v1/messages")
+        #expect(response.stopReason == .toolUse)
+        #expect(response.parts == [
+            .toolUse(.init(
+                id: "toolu_live",
+                name: "search_live_transcript",
+                arguments: .object(["query": .string("budget")])
+            )),
+        ])
     }
 }
 

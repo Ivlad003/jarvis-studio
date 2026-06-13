@@ -4,9 +4,10 @@ import Foundation
 
 /// `AIProvider` for Ollama's local inference server.
 ///
-/// Supports two API modes picked at runtime:
-///   - `.native`       POST /api/chat  (Ollama-native JSON, stream=false)
-///   - `.openaiCompat` POST /v1/chat/completions  (OpenAI-compat)
+/// Supports three API modes picked at runtime:
+///   - `.native`          POST /api/chat  (Ollama-native JSON, stream=false)
+///   - `.openaiCompat`    POST /v1/chat/completions  (OpenAI-compat)
+///   - `.anthropicCompat` POST /v1/messages  (Anthropic Messages compat)
 ///
 /// Endpoint validation: HTTP is allowed only for localhost / RFC-1918 ranges.
 /// HTTPS is allowed for any host.
@@ -18,8 +19,9 @@ public final class OllamaProvider: AIProvider, Sendable {
     // MARK: - API mode
 
     public enum APIMode: String, Sendable {
-        case native        // POST /api/chat
-        case openaiCompat  // POST /v1/chat/completions
+        case native           // POST /api/chat
+        case openaiCompat     // POST /v1/chat/completions
+        case anthropicCompat  // POST /v1/messages
     }
 
     public typealias HTTPClient = @Sendable (URLRequest) async throws -> (Data, URLResponse)
@@ -49,6 +51,10 @@ public final class OllamaProvider: AIProvider, Sendable {
     // MARK: - AIProvider
 
     public func chat(messages: [ChatMessage], config: AIConfig) async throws -> String {
+        try await chat(messages: messages, tools: [], config: config).text
+    }
+
+    public func chat(messages: [ChatMessage], tools: [ToolSpec], config: AIConfig) async throws -> ChatResponse {
         let request: URLRequest
         switch apiMode {
         case .native:
@@ -63,6 +69,14 @@ public final class OllamaProvider: AIProvider, Sendable {
                 endpoint: endpoint,
                 bearerToken: bearerToken,
                 messages: messages,
+                config: config
+            )
+        case .anthropicCompat:
+            request = try Self.buildAnthropicCompatRequest(
+                endpoint: endpoint,
+                bearerToken: bearerToken,
+                messages: messages,
+                tools: tools,
                 config: config
             )
         }
@@ -81,8 +95,12 @@ public final class OllamaProvider: AIProvider, Sendable {
         switch httpResponse.statusCode {
         case 200:
             switch apiMode {
-            case .native:       return try Self.parseNative(data: data)
-            case .openaiCompat: return try Self.parseOpenAICompat(data: data)
+            case .native:
+                return ChatResponse(parts: [.text(try Self.parseNative(data: data))])
+            case .openaiCompat:
+                return ChatResponse(parts: [.text(try Self.parseOpenAICompat(data: data))])
+            case .anthropicCompat:
+                return try AnthropicMessagesCodec.parseResponse(data: data)
             }
         case 401:
             throw AIError.authenticationFailed
@@ -311,6 +329,26 @@ public final class OllamaProvider: AIProvider, Sendable {
             throw AIError.decodingFailed(message: "No choices in response")
         }
         return first.message.content
+    }
+
+    // MARK: - Anthropic-compat mode (/v1/messages)
+
+    static func buildAnthropicCompatRequest(
+        endpoint: URL,
+        bearerToken: String?,
+        messages: [ChatMessage],
+        tools: [ToolSpec] = [],
+        config: AIConfig
+    ) throws -> URLRequest {
+        let url = endpoint.appendingPathComponent("v1/messages")
+        return try AnthropicMessagesCodec.buildRequest(
+            endpoint: url,
+            apiKey: nil,
+            bearerToken: bearerToken,
+            messages: messages,
+            tools: tools,
+            config: config
+        )
     }
 
     // MARK: - Private helpers

@@ -323,7 +323,7 @@ final class AppSettings {
     var ollamaEndpoint: String {
         didSet { UserDefaults.standard.set(ollamaEndpoint, forKey: Defaults.ollamaEndpoint) }
     }
-    /// API mode: native /api/chat or OpenAI-compat /v1/chat/completions.
+    /// API mode: native /api/chat, OpenAI-compat /v1/chat/completions, or Anthropic-compat /v1/messages.
     var ollamaApiMode: OllamaAPIMode {
         didSet { UserDefaults.standard.set(ollamaApiMode.rawValue, forKey: Defaults.ollamaApiMode) }
     }

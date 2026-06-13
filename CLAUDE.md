@@ -128,7 +128,7 @@ These come from §3 of the Jarvis Note design doc.
 - **Signed builds, no notarization, no auto-update.** `make install` signs with Apple Development cert (`700E6802C639969593A1AC7F57C1FBFA0A1C7762`, Team `Q7ZGRSDQSQ`) so TCC permissions persist across updates. Not notarized — hand-shared binaries require Gatekeeper bypass: `xattr -d com.apple.quarantine /Applications/KosmoNotes.app`.
 - **Secrets in macOS Keychain.** Configuration JSON stores only Keychain account references; never plain-text secrets.
 - **Provider abstraction is one protocol.** `Provider` (in §7 of design doc) covers Anthropic / OpenAI / OpenRouter / Ollama. Default LLM: Anthropic Claude Sonnet (latest at ship time). Default transcription: Deepgram Nova-2 with EU residency.
-- **Ollama is REST-only.** No bundled inference. User configures their own endpoint. v1 supports both `/v1/chat/completions` (OpenAI-compat) and `/api/chat` (native) — picked at runtime, not compile time.
+- **Ollama is REST-only.** No bundled inference. User configures their own endpoint. v1 supports `/api/chat` (native), `/v1/chat/completions` (OpenAI-compat), and `/v1/messages` (Anthropic-compat for tool use) — picked at runtime, not compile time.
 - **No hosted viewer page for shared links.** Presigned URLs point at the raw audio / markdown bundle. Recipients open in browser.
 
 ## Build and run
