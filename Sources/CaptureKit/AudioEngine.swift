@@ -903,6 +903,14 @@ public actor AudioEngine {
             audioEngineLog.error("AudioEngine.\(context, privacy: .public): voice processing unavailable — \(error.localizedDescription, privacy: .public)")
         }
     }
+    // NOTE (D21): VoiceProcessingIO is a *duplex* unit — it only delivers the
+    // echo-cancelled mic to our tap while the engine renders its OUTPUT side.
+    // This engine is input-tap-only (no output graph), so enabling voice
+    // processing makes the input callback never fire ("tap did not fire within
+    // 8 s" → zero captured audio). Attempts to add the output render path
+    // (connect input→mainMixer, muted) throw an uncatchable CoreAudio -10868
+    // on this AUHAL/aggregate format. Until that is solved + verified on a real
+    // device, echo cancellation defaults OFF (AppSettings.echoCancellationEnabled).
 
     // MARK: - Buffer-flow supervisor (private)
 

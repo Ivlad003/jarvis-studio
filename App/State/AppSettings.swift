@@ -40,6 +40,7 @@ final class AppSettings {
         static let ollamaBearer = "ollamaBearer"
         static let systemAudioEnabled = "systemAudioEnabled"
         static let echoCancellationEnabled = "echoCancellationEnabled"
+        static let echoCancellationMigratedOff = "echoCancellationMigratedOff_v1"
         static let dictationLLMCleanup = "dictationLLMCleanup"
         // Three insertion strategies for the cleaned dictation transcript:
         //   - axapiThenClipboard (faster, less reliable in Electron)
@@ -617,7 +618,20 @@ final class AppSettings {
         self.ollamaModel = UserDefaults.standard.string(forKey: Defaults.ollamaModel) ?? "qwen2.5:14b"
 
         self.systemAudioEnabled = UserDefaults.standard.bool(forKey: Defaults.systemAudioEnabled)
-        self.echoCancellationEnabled = (UserDefaults.standard.object(forKey: Defaults.echoCancellationEnabled) as? Bool) ?? true
+        // Echo cancellation (VoiceProcessingIO) defaults OFF. The duplex VPIO
+        // unit only delivers audio while the engine renders an output path,
+        // which this input-tap-only engine doesn't provide — so turning it on
+        // makes the mic tap never fire and recording fails. (Adding that output
+        // path throws an uncatchable CoreAudio -10868 on real AUHAL/aggregate
+        // formats; see the NOTE in AudioEngine.applyVoiceProcessingIfNeeded.)
+        // One-time migration flips any previously-persisted `true` (the old D21
+        // default) to false so existing installs record again. The user can
+        // still re-enable it afterwards.
+        if UserDefaults.standard.object(forKey: Defaults.echoCancellationMigratedOff) == nil {
+            UserDefaults.standard.set(false, forKey: Defaults.echoCancellationEnabled)
+            UserDefaults.standard.set(true, forKey: Defaults.echoCancellationMigratedOff)
+        }
+        self.echoCancellationEnabled = (UserDefaults.standard.object(forKey: Defaults.echoCancellationEnabled) as? Bool) ?? false
         // Default true for cleanup; UserDefaults.bool returns false for missing keys, so check object presence.
         self.dictationLLMCleanup = (UserDefaults.standard.object(forKey: Defaults.dictationLLMCleanup) as? Bool) ?? true
         // Default `clipboardSimulatedV` — universal compatibility. The

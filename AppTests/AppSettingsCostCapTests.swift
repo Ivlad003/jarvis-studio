@@ -7,6 +7,7 @@ import Testing
 struct AppSettingsCostCapTests {
     private let costCapUSDKey = "costCapUSD"
     private let echoCancellationEnabledKey = "echoCancellationEnabled"
+    private let echoCancellationMigratedOffKey = "echoCancellationMigratedOff_v1"
 
     @Test("missing cost cap defaults to one dollar")
     func missingCostCapDefaultsToOneDollar() {
@@ -30,26 +31,58 @@ struct AppSettingsCostCapTests {
         #expect(settings.costCapUSD == 0.0)
     }
 
-    @Test("missing echo cancellation preference defaults on")
-    func missingEchoCancellationPreferenceDefaultsOn() {
-        let prior = UserDefaults.standard.object(forKey: echoCancellationEnabledKey)
+    // Echo cancellation defaults OFF: VoiceProcessingIO has never delivered
+    // audio on this input-tap-only engine (see AudioEngine NOTE). A one-time
+    // migration flips the legacy D21 default (`true`) to false.
+
+    @Test("missing echo cancellation preference defaults off")
+    func missingEchoCancellationPreferenceDefaultsOff() {
+        let priorPref = UserDefaults.standard.object(forKey: echoCancellationEnabledKey)
+        let priorMig = UserDefaults.standard.object(forKey: echoCancellationMigratedOffKey)
         UserDefaults.standard.removeObject(forKey: echoCancellationEnabledKey)
-        defer { restore(prior, forKey: echoCancellationEnabledKey) }
-
-        let settings = AppSettings()
-
-        #expect(settings.echoCancellationEnabled == true)
-    }
-
-    @Test("stored disabled echo cancellation preference is preserved")
-    func storedDisabledEchoCancellationPreferenceIsPreserved() {
-        let prior = UserDefaults.standard.object(forKey: echoCancellationEnabledKey)
-        UserDefaults.standard.set(false, forKey: echoCancellationEnabledKey)
-        defer { restore(prior, forKey: echoCancellationEnabledKey) }
+        // Migration already done — isolates the default from the migration path.
+        UserDefaults.standard.set(true, forKey: echoCancellationMigratedOffKey)
+        defer {
+            restore(priorPref, forKey: echoCancellationEnabledKey)
+            restore(priorMig, forKey: echoCancellationMigratedOffKey)
+        }
 
         let settings = AppSettings()
 
         #expect(settings.echoCancellationEnabled == false)
+    }
+
+    @Test("legacy enabled echo cancellation is migrated off once")
+    func legacyEnabledEchoCancellationIsMigratedOff() {
+        let priorPref = UserDefaults.standard.object(forKey: echoCancellationEnabledKey)
+        let priorMig = UserDefaults.standard.object(forKey: echoCancellationMigratedOffKey)
+        UserDefaults.standard.set(true, forKey: echoCancellationEnabledKey)        // old D21 default persisted
+        UserDefaults.standard.removeObject(forKey: echoCancellationMigratedOffKey) // migration not yet run
+        defer {
+            restore(priorPref, forKey: echoCancellationEnabledKey)
+            restore(priorMig, forKey: echoCancellationMigratedOffKey)
+        }
+
+        let settings = AppSettings()
+
+        #expect(settings.echoCancellationEnabled == false)
+        #expect(UserDefaults.standard.bool(forKey: echoCancellationMigratedOffKey) == true)
+    }
+
+    @Test("echo cancellation re-enabled after migration is preserved")
+    func echoCancellationReenabledAfterMigrationIsPreserved() {
+        let priorPref = UserDefaults.standard.object(forKey: echoCancellationEnabledKey)
+        let priorMig = UserDefaults.standard.object(forKey: echoCancellationMigratedOffKey)
+        UserDefaults.standard.set(true, forKey: echoCancellationEnabledKey)
+        UserDefaults.standard.set(true, forKey: echoCancellationMigratedOffKey) // migration already done
+        defer {
+            restore(priorPref, forKey: echoCancellationEnabledKey)
+            restore(priorMig, forKey: echoCancellationMigratedOffKey)
+        }
+
+        let settings = AppSettings()
+
+        #expect(settings.echoCancellationEnabled == true)
     }
 
     @Test("empty keychain commit is skipped after a read failure")
