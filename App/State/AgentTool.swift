@@ -1,4 +1,5 @@
 import Foundation
+import AIKit
 import os
 import StorageKit
 import TranscriptionKit
@@ -673,6 +674,23 @@ enum AgentToolRegistry {
         }
 
         return tools
+    }
+}
+
+extension AgentTool {
+    func toolDefinition() -> ToolDefinition {
+        let schema = (try? JSONValue(any: inputSchema)) ?? .object(["type": .string("object")])
+        return ToolDefinition(
+            spec: ToolSpec(name: name, description: description, parameters: schema),
+            execute: { arguments in
+                let input = (arguments.anyValue as? [String: Any]) ?? [:]
+                do {
+                    return ToolExecutionResult(content: try await execute(input: input))
+                } catch {
+                    return ToolExecutionResult(content: error.localizedDescription, isError: true)
+                }
+            }
+        )
     }
 }
 

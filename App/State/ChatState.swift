@@ -26,6 +26,7 @@ final class ChatState {
 
     static let defaultChatMaxTokens = 4_096
     typealias LiveContextProvider = @MainActor @Sendable () async -> LiveTranscriptState?
+    typealias ProviderResolver = @MainActor @Sendable (AIProviderResolver.Config) -> AIProviderResolver.Resolved?
 
     // MARK: - Attached session discriminant
 
@@ -73,6 +74,7 @@ final class ChatState {
     let database: AppDatabase
     private let sessionStore: SessionStore
     private let recorder: RecorderState
+    private let knowledgeBaseStore: KnowledgeBaseStore?
     // Injectable factory so unit tests can swap WhisperProvider without network.
     private let whisperProviderFactory: @Sendable (String) -> WhisperProvider
     // Optional autonomous-agent hand-off. nil keeps the chat working stand-alone
@@ -80,6 +82,7 @@ final class ChatState {
     private let agentSession: AgentSessionState?
     private let onOpenAgentConsole: (@MainActor () -> Void)?
     private let liveContextProvider: LiveContextProvider?
+    private let providerResolver: ProviderResolver
 
     // MARK: - Computed state exposed to the View
 
@@ -96,18 +99,22 @@ final class ChatState {
         database: AppDatabase,
         sessionStore: SessionStore,
         recorder: RecorderState,
+        knowledgeBaseStore: KnowledgeBaseStore? = nil,
         whisperProviderFactory: (@Sendable (String) -> WhisperProvider)? = nil,
         agentSession: AgentSessionState? = nil,
         onOpenAgentConsole: (@MainActor () -> Void)? = nil,
-        liveContextProvider: LiveContextProvider? = nil
+        liveContextProvider: LiveContextProvider? = nil,
+        providerResolver: @escaping ProviderResolver = { AIProviderResolver.resolve($0) }
     ) {
         self.settings = settings
         self.database = database
         self.sessionStore = sessionStore
         self.recorder = recorder
+        self.knowledgeBaseStore = knowledgeBaseStore
         self.agentSession = agentSession
         self.onOpenAgentConsole = onOpenAgentConsole
         self.liveContextProvider = liveContextProvider
+        self.providerResolver = providerResolver
         // Default factory captures the user-selected OpenAI model
         // (whisper-1 / gpt-4o-transcribe / gpt-4o-mini-transcribe) at
         // init time, so chat-side audio snapshots use the same upgrade
@@ -385,7 +392,7 @@ final class ChatState {
 
     /// Shared send-to-LLM path used by both `send()` and `sendSnapshot()`.
     private func runProvider(messages: [ChatMessage], systemPrompt: String?) async throws -> String {
-        guard let resolved = AIProviderResolver.resolve(settings.aiProviderConfig) else {
+        guard let resolved = providerResolver(settings.aiProviderConfig) else {
             throw AIError.authenticationFailed
         }
         let config = AIConfig(
@@ -393,7 +400,36 @@ final class ChatState {
             maxTokens: Self.defaultChatMaxTokens,
             systemPrompt: systemPrompt
         )
-        return try await resolved.provider.chat(messages: messages, config: config)
+        let tools = await makeChatTools()
+        guard !tools.isEmpty else {
+            return try await resolved.provider.chat(messages: messages, config: config)
+        }
+
+        let engine = ToolLoopEngine(
+            provider: resolved.provider,
+            tools: tools,
+            config: config,
+            maxTranscriptBytes: ToolLoopEngine.defaultMaxTranscriptBytes
+        )
+        return try await engine.run(messages: messages).text
+    }
+
+    private func makeChatTools() async -> [ToolDefinition] {
+        var tools: [AgentTool] = []
+        if let liveContextProvider {
+            tools.append(SearchLiveTranscriptTool(snapshotProvider: liveContextProvider))
+        }
+        if let knowledgeBaseStore {
+            tools.append(SearchKnowledgeBaseTool(store: knowledgeBaseStore))
+            let codeRoots = (try? await knowledgeBaseStore.listSources())
+                .map { sources in
+                    sources
+                        .filter { $0.kind == .codeFolder }
+                        .map { URL(fileURLWithPath: $0.path, isDirectory: true) }
+                } ?? []
+            tools.append(SearchCodeTool(roots: codeRoots))
+        }
+        return tools.map { $0.toolDefinition() }
     }
 
     // MARK: - Private: vision frame extraction

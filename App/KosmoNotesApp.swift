@@ -890,6 +890,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             database: database,
             sessionStore: sessionStore,
             recorder: recorder,
+            knowledgeBaseStore: knowledgeBaseStoreHolder as? KnowledgeBaseStore,
             agentSession: agentSessionHolder as? AgentSessionState,
             onOpenAgentConsole: { [weak self] in
                 self?.openAgentConsole()
