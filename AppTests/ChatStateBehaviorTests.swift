@@ -39,6 +39,19 @@ struct ChatStateBehaviorTests {
         return (chat, tmpDir)
     }
 
+    private func repoFile(_ relativePath: String) throws -> String {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repoRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let fileURL = relativePath
+            .split(separator: "/")
+            .reduce(repoRoot) { partial, component in
+                partial.appendingPathComponent(String(component))
+            }
+        return try String(contentsOf: fileURL, encoding: .utf8)
+    }
+
     @Test("timestamp parser rejects impossible mm:ss and h:mm:ss values")
     func timestampParserRejectsImpossibleSecondsAndMinutes() {
         let parsed = ChatState.parseTimestampMentions(
@@ -112,6 +125,18 @@ struct ChatStateBehaviorTests {
         #expect(prompt?.contains("== Active recording live transcript ==") == true)
         #expect(prompt?.contains("== Attached sessions ==") == true)
         #expect(prompt?.contains("finished context") == true)
+    }
+
+    @Test("chat view contains scrolling live transcript panel")
+    func chatViewContainsScrollingLiveTranscriptPanel() throws {
+        let chatViewSource = try repoFile("App/Views/Chat/ChatView.swift")
+        let chatStateSource = try repoFile("App/State/ChatState.swift")
+
+        #expect(chatViewSource.contains("liveTranscriptPanel"))
+        #expect(chatViewSource.contains("ScrollViewReader"))
+        #expect(chatViewSource.contains("Live transcript"))
+        #expect(chatStateSource.contains("liveTranscriptPreview"))
+        #expect(chatStateSource.contains("runLiveTranscriptPreviewLoop"))
     }
 
     @Test("send executes live transcript tools through the shared tool loop")

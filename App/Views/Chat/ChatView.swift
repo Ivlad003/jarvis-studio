@@ -27,6 +27,10 @@ struct ChatView: View {
             Divider()
             attachedSessionsRow
             Divider()
+            if chat.isRecording && chat.hasLiveTranscriptPreviewSource {
+                liveTranscriptPanel
+                Divider()
+            }
             messageList
             if let error = chat.lastError {
                 errorBanner(error)
@@ -37,6 +41,13 @@ struct ChatView: View {
         .frame(minWidth: 540, minHeight: 600)
         .sheet(isPresented: $showSessionPicker) {
             sessionPickerSheet
+        }
+        .task(id: chat.isRecording) {
+            if chat.isRecording {
+                await chat.runLiveTranscriptPreviewLoop()
+            } else {
+                await chat.resetLiveTranscriptPreview()
+            }
         }
     }
 
@@ -144,6 +155,77 @@ struct ChatView: View {
         }
         .frame(minHeight: 36)
         .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    // MARK: - Live transcript panel
+
+    private var liveTranscriptPanel: some View {
+        let rows = ChatState.liveTranscriptDisplayRows(from: chat.liveTranscriptPreview)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("Live transcript", systemImage: "waveform")
+                    .font(.callout.weight(.semibold))
+                Spacer()
+                Text(liveTranscriptStatusText)
+                    .font(.caption)
+                    .foregroundStyle(liveTranscriptStatusIsError ? .red : .secondary)
+                    .lineLimit(1)
+            }
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        if rows.isEmpty {
+                            Text("Waiting for transcript...")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id("live-transcript-empty")
+                        } else {
+                            ForEach(rows) { row in
+                                LiveTranscriptRow(row: row)
+                                    .id(row.id)
+                            }
+                        }
+                    }
+                    .padding(10)
+                }
+                .frame(minHeight: 92, maxHeight: 150)
+                .background(Color(NSColor.textBackgroundColor))
+                .onChange(of: rows.last?.id) { _, lastID in
+                    guard let lastID else { return }
+                    withAnimation {
+                        proxy.scrollTo(lastID, anchor: .bottom)
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color(NSColor.separatorColor), lineWidth: 1)
+            )
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    private var liveTranscriptStatusText: String {
+        guard let status = chat.liveTranscriptPreview?.status else { return "Waiting" }
+        switch status {
+        case .healthy:
+            return "Live"
+        case .delayed:
+            return "Delayed"
+        case .failed(let error):
+            return error.isEmpty ? "Failed" : "Failed: \(error)"
+        }
+    }
+
+    private var liveTranscriptStatusIsError: Bool {
+        if case .failed = chat.liveTranscriptPreview?.status { return true }
+        return false
     }
 
     // MARK: - Message list
@@ -331,6 +413,38 @@ struct ChatView: View {
 
     private var canSendSnapshot: Bool {
         !chat.snapshotQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+// MARK: - LiveTranscriptRow
+
+@available(macOS 14.0, *)
+private struct LiveTranscriptRow: View {
+
+    let row: ChatState.LiveTranscriptDisplayRow
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(row.timeRange)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 88, alignment: .leading)
+
+            Text(row.text)
+                .font(.callout)
+                .foregroundStyle(row.isDraft ? .secondary : .primary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if row.isDraft {
+                Text("draft")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color(NSColor.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 4))
+            }
+        }
     }
 }
 

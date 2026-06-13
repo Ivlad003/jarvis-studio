@@ -48,6 +48,13 @@ final class ChatState {
         }
     }
 
+    struct LiveTranscriptDisplayRow: Identifiable, Equatable {
+        let id: String
+        let timeRange: String
+        let text: String
+        let isDraft: Bool
+    }
+
     // MARK: - Observable state
 
     var messages: [ChatMessage] = []
@@ -63,6 +70,7 @@ final class ChatState {
     // Live snapshot controls
     var snapshotQuestion: String = ""
     var isSnapshotting: Bool = false
+    var liveTranscriptPreview: LiveTranscriptState?
 
     // Agent hand-off
     var isLaunchingAgent: Bool = false
@@ -90,6 +98,10 @@ final class ChatState {
     var isRecording: Bool {
         if case .recording = recorder.status { return true }
         return false
+    }
+
+    var hasLiveTranscriptPreviewSource: Bool {
+        liveContextProvider != nil
     }
 
     // MARK: - Init
@@ -388,6 +400,26 @@ final class ChatState {
         }
     }
 
+    func runLiveTranscriptPreviewLoop(cadence: Duration = .milliseconds(500)) async {
+        guard let liveContextProvider else {
+            liveTranscriptPreview = nil
+            return
+        }
+
+        while !Task.isCancelled && isRecording {
+            liveTranscriptPreview = await liveContextProvider()
+            try? await Task.sleep(for: cadence)
+        }
+
+        if !isRecording {
+            liveTranscriptPreview = nil
+        }
+    }
+
+    func resetLiveTranscriptPreview() {
+        liveTranscriptPreview = nil
+    }
+
     // MARK: - Private: provider dispatch
 
     /// Shared send-to-LLM path used by both `send()` and `sendSnapshot()`.
@@ -646,6 +678,35 @@ final class ChatState {
     ) {
         guard messages.indices.contains(index), messages[index] == message else { return }
         messages.remove(at: index)
+    }
+
+    static func liveTranscriptDisplayRows(from state: LiveTranscriptState?) -> [LiveTranscriptDisplayRow] {
+        guard let state else { return [] }
+
+        var rows: [LiveTranscriptDisplayRow] = []
+        for (index, unit) in state.stableUnits.enumerated() {
+            let text = unit.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            rows.append(LiveTranscriptDisplayRow(
+                id: "stable-\(index)-\(unit.start)-\(unit.end)",
+                timeRange: "\(formatLiveTimestamp(unit.start))-\(formatLiveTimestamp(unit.end))",
+                text: text,
+                isDraft: false
+            ))
+        }
+
+        for (index, unit) in state.draftUnits.enumerated() {
+            let text = unit.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            rows.append(LiveTranscriptDisplayRow(
+                id: "draft-\(index)-\(unit.start)-\(unit.end)",
+                timeRange: "\(formatLiveTimestamp(unit.start))-\(formatLiveTimestamp(unit.end))",
+                text: text,
+                isDraft: true
+            ))
+        }
+
+        return rows
     }
 
     static func liveTranscriptPromptSection(
