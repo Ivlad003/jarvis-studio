@@ -51,8 +51,10 @@ struct RecorderLiveAdapter: Sendable {
     }
 
     static func displayState(for snapshot: LiveTranscriptState) -> DisplayState {
-        let stableText = snapshot.stableText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let mutableText = snapshot.mutableText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Speaker-labeled ("You:" / "Them:") when the live transcript merges two
+        // sources; identical to plain text for single-source transcripts.
+        let stableText = snapshot.labeledStableText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let mutableText = snapshot.labeledMutableText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         switch snapshot.status {
         case .healthy:

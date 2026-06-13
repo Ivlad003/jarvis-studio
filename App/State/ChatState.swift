@@ -717,12 +717,17 @@ final class ChatState {
         for unit in state.stableUnits {
             let text = unit.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
-            lines.append("[\(formatLiveTimestamp(unit.start))-\(formatLiveTimestamp(unit.end))] \(text)")
+            let speaker = unit.speaker.map { "\($0.label): " } ?? ""
+            lines.append("[\(formatLiveTimestamp(unit.start))-\(formatLiveTimestamp(unit.end))] \(speaker)\(text)")
         }
 
         let draft = state.draftUnits
-            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .compactMap { unit -> String? in
+                let text = unit.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { return nil }
+                let speaker = unit.speaker.map { "\($0.label): " } ?? ""
+                return "\(speaker)\(text)"
+            }
             .joined(separator: " ")
         if !draft.isEmpty {
             lines.append("[draft] \(draft)")

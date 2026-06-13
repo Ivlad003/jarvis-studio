@@ -191,6 +191,9 @@ final class RecorderState {
     private let cameraBubbleController = CameraBubbleWindowController()
     private var liveTranscriptAdapter = RecorderLiveAdapter()
     private var liveTranscriptTee: RecorderLiveTee?
+    /// Second window engine for system/app audio ("Them") when dual-source live
+    /// transcription is active; the primary `liveTranscriptTee` carries mic ("You").
+    private var liveTranscriptTeeThem: RecorderLiveTee?
     private var streamingLiveSource: StreamingLiveSource?
     private var liveTranscriptHub: LiveTranscriptHub?
     private var liveTranscriptStore: TranscriptStore?
@@ -418,16 +421,29 @@ final class RecorderState {
             let liveSink: (any LivePCMSink)?
             var liveSinks: [any LivePCMSink] = []
             self.liveTranscriptTee = nil
+            self.liveTranscriptTeeThem = nil
             self.streamingLiveSource = nil
             self.liveTranscriptHub = nil
             self.liveTranscriptStore = nil
             if let liveProvider = settings.makeLiveProvider() {
-                let engine = LiveTranscriptEngine(provider: liveProvider, exporter: LiveWindowExporter())
-                let tee = RecorderLiveTee(engine: engine)
-                await tee.start()
-                self.liveTranscriptTee = tee
-                liveSinks.append(tee)
-                Self.recorderLog.info("RecorderState.start: live transcript engine armed")
+                // "You" — the local microphone.
+                let youEngine = LiveTranscriptEngine(provider: liveProvider, exporter: LiveWindowExporter())
+                let youTee = RecorderLiveTee(engine: youEngine)
+                await youTee.start()
+                self.liveTranscriptTee = youTee
+                liveSinks.append(SourceFilteredPCMSink(youTee, allowedSources: [.mic]))
+                Self.recorderLog.info("RecorderState.start: live transcript engine armed (you/mic)")
+
+                // "Them" — app/system audio on its own engine so each tee's CAF
+                // stays single-format. Only when system audio is actually captured.
+                if systemAudioEnabled, let themProvider = settings.makeLiveProvider() {
+                    let themEngine = LiveTranscriptEngine(provider: themProvider, exporter: LiveWindowExporter())
+                    let themTee = RecorderLiveTee(engine: themEngine)
+                    await themTee.start()
+                    self.liveTranscriptTeeThem = themTee
+                    liveSinks.append(SourceFilteredPCMSink(themTee, allowedSources: [.system]))
+                    Self.recorderLog.info("RecorderState.start: live transcript engine armed (them/system)")
+                }
             }
             let sessionStore = self.sessionStore
             let streamingSessionID = session.id
@@ -459,15 +475,17 @@ final class RecorderState {
                     self.streamingLiveSource = streamingSource
                     self.liveTranscriptHub = hub
                     self.liveTranscriptStore = liveStore
-                    liveSinks.append(streamingSource)
+                    // Streaming (Deepgram) is mic-only for now; system-audio
+                    // dual-stream is a follow-up. Per-sink source filtering.
+                    liveSinks.append(SourceFilteredPCMSink(streamingSource, allowedSources: [.mic]))
                     Self.recorderLog.info("RecorderState.start: streaming live transcript source armed")
                 } catch {
                     Self.recorderLog.error("RecorderState.start: streaming live transcript source failed to arm — \(error.localizedDescription, privacy: .public)")
                 }
             }
-            liveSink = liveSinks.isEmpty
-                ? nil
-                : SourceFilteredPCMSink(FanOutPCMSink(liveSinks), allowedSources: [.mic])
+            // Each child sink already filters by source (mic → "you", system →
+            // "them"), so the fan-out passes everything through unfiltered.
+            liveSink = liveSinks.isEmpty ? nil : FanOutPCMSink(liveSinks)
 
             let capture = CaptureSession(config: config, liveSink: liveSink)
             try await capture.start()
@@ -1050,25 +1068,22 @@ final class RecorderState {
         if let hub = liveTranscriptHub {
             return await hub.snapshot()
         }
-        if let tee = liveTranscriptTee {
-            return await tee.snapshot()
+        if let youTee = liveTranscriptTee {
+            let you = await youTee.snapshot()
+            guard let themTee = liveTranscriptTeeThem else { return you }
+            let them = await themTee.snapshot()
+            return LiveTranscriptState.merging(you: you, them: them)
         }
         return nil
     }
 
     private func configureLiveTranscriptForRecording() async {
-        if let hub = liveTranscriptHub {
-            liveTranscriptAdapter = RecorderLiveAdapter(snapshotSource: { await hub.snapshot() })
-            liveTranscriptRefreshTask?.cancel()
-            liveTranscriptRefreshTask = Task { @MainActor [weak self] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .milliseconds(500))
-                    if Task.isCancelled { return }
-                    await self?.refreshLiveTranscript()
-                }
-            }
-        } else if let tee = liveTranscriptTee {
-            liveTranscriptAdapter = RecorderLiveAdapter(snapshotSource: { await tee.snapshot() })
+        // One snapshot source over both possible engines; `liveTranscriptSnapshot`
+        // merges the mic ("you") and system ("them") streams when both are armed.
+        if liveTranscriptHub != nil || liveTranscriptTee != nil {
+            liveTranscriptAdapter = RecorderLiveAdapter(snapshotSource: { [weak self] in
+                await self?.liveTranscriptSnapshot() ?? .empty
+            })
             liveTranscriptRefreshTask?.cancel()
             liveTranscriptRefreshTask = Task { @MainActor [weak self] in
                 while !Task.isCancelled {
@@ -1092,6 +1107,9 @@ final class RecorderState {
         liveTranscriptRefreshTask = nil
         if let tee = liveTranscriptTee {
             await tee.stop()
+        }
+        if let teeThem = liveTranscriptTeeThem {
+            await teeThem.stop()
         }
         if let source = streamingLiveSource {
             await source.stop()

@@ -101,7 +101,9 @@ public actor RecorderLiveTee: LivePCMSink {
     }
 
     public func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64, source: LivePCMSource) async {
-        guard source == .mic else { return }
+        // Source routing is the caller's job via SourceFilteredPCMSink (mic →
+        // "you" engine, system → "them" engine), so accept whatever arrives —
+        // each tee owns a single-source CAF, keeping its format homogeneous.
         if audioFile == nil {
             do {
                 audioFile = try AVAudioFile(forWriting: audioFileURL, settings: buffer.format.settings)

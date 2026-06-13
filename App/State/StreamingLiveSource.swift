@@ -76,6 +76,8 @@ actor StreamingLiveSource: LivePCMSink {
     }
 
     func receive(_ buffer: AVAudioPCMBuffer, at hostTime: UInt64, source: LivePCMSource) async {
+        // Streaming (Deepgram) is mic-only until the dual-source follow-up;
+        // the system-audio "them" stream goes through RecorderLiveTee today.
         guard source == .mic, let session else { return }
 
         do {
