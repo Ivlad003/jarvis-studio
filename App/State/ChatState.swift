@@ -241,7 +241,7 @@ final class ChatState {
             let isoFormatter = ISO8601DateFormatter()
             for attachment in attachedSessions {
                 let record = attachment.record
-                let transcriptText = await loadTranscript(for: record)
+                let transcriptText = Self.cappedAttachedTranscript(await loadTranscript(for: record))
                 guard !transcriptText.isEmpty else { continue }
                 let dateStr = isoFormatter.string(from: record.recordedAt)
                 let durStr = String(format: "%.0f", record.durationSecs)
@@ -773,6 +773,24 @@ final class ChatState {
         return "[earlier live transcript omitted]\n\(suffix)"
     }
 
+    /// Per-session character cap for an attached session transcript injected
+    /// into a prompt. Bounds the previously-unbounded attached-session stuffing
+    /// called out in the 2026-06-12 live-chat design (§4) — the live transcript
+    /// already caps via `cappedLiveTranscriptBody`.
+    static let attachedTranscriptMaxCharacters = 12_000
+
+    /// Truncates an attached transcript to the most recent `maxCharacters`,
+    /// mirroring `cappedLiveTranscriptBody`. Empty/short text is returned
+    /// verbatim so existing emptiness guards keep working.
+    static func cappedAttachedTranscript(
+        _ text: String,
+        maxCharacters: Int = attachedTranscriptMaxCharacters
+    ) -> String {
+        guard maxCharacters > 0, text.count > maxCharacters else { return text }
+        let suffix = String(text.suffix(maxCharacters))
+        return "[earlier transcript omitted to fit the context budget]\n\(suffix)"
+    }
+
     private static func formatLiveTimestamp(_ seconds: TimeInterval) -> String {
         let total = max(0, Int(seconds.rounded(.down)))
         let h = total / 3600
@@ -849,7 +867,7 @@ final class ChatState {
             var sections: [String] = []
             for attachment in attachedSessions {
                 let record = attachment.record
-                let transcriptText = await loadTranscript(for: record)
+                let transcriptText = Self.cappedAttachedTranscript(await loadTranscript(for: record))
                 let dateStr = isoFormatter.string(from: record.recordedAt)
                 let durStr = String(format: "%.0f", record.durationSecs)
                 let langStr = record.language ?? "auto"

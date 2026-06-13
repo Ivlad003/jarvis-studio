@@ -112,6 +112,27 @@ struct ChatStateBehaviorTests {
         #expect(ChatState.liveTranscriptPromptSection(from: .empty, maxCharacters: 1_000) == nil)
     }
 
+    @Test("attached transcript is capped to bound context stuffing")
+    func attachedTranscriptIsCappedToBoundContextStuffing() {
+        // Short/empty transcripts pass through untouched so emptiness guards hold.
+        #expect(ChatState.cappedAttachedTranscript("", maxCharacters: 1_000).isEmpty)
+        let short = "a short attached transcript"
+        #expect(ChatState.cappedAttachedTranscript(short, maxCharacters: 1_000) == short)
+
+        // Long transcripts are truncated to the most recent maxCharacters,
+        // with a marker, so a multi-hour session can't blow up the prompt.
+        let long = String(repeating: "x", count: 5_000)
+        let capped = ChatState.cappedAttachedTranscript(long, maxCharacters: 1_000)
+        #expect(capped.count < long.count)
+        #expect(capped.contains("earlier transcript omitted"))
+        #expect(capped.hasSuffix(String(repeating: "x", count: 1_000)))
+
+        // The default cap is positive and actually truncates an over-budget transcript.
+        #expect(ChatState.attachedTranscriptMaxCharacters > 0)
+        let huge = String(repeating: "y", count: ChatState.attachedTranscriptMaxCharacters + 500)
+        #expect(ChatState.cappedAttachedTranscript(huge).contains("earlier transcript omitted"))
+    }
+
     @Test("context prompt can be reused by normal chat and live snapshots")
     func contextPromptCanBeReusedByNormalChatAndLiveSnapshots() {
         let prompt = ChatState.contextPrompt(
