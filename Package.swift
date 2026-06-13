@@ -7,6 +7,7 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
+        .library(name: "AudioDSP", targets: ["AudioDSP"]),
         .library(name: "CaptureKit", targets: ["CaptureKit"]),
         .library(name: "TranscriptionKit", targets: ["TranscriptionKit"]),
         .library(name: "AIKit", targets: ["AIKit"]),
@@ -29,8 +30,13 @@ let package = Package(
         // MARK: - Library targets
 
         .target(
+            name: "AudioDSP",
+            path: "Sources/AudioDSP"
+        ),
+        .target(
             name: "CaptureKit",
             dependencies: [
+                "AudioDSP",
                 "StorageKit",
             ],
             path: "Sources/CaptureKit"
@@ -85,6 +91,11 @@ let package = Package(
 
         // MARK: - Test targets
 
+        .testTarget(
+            name: "AudioDSPTests",
+            dependencies: ["AudioDSP"],
+            path: "Tests/AudioDSPTests"
+        ),
         .testTarget(
             name: "CaptureKitTests",
             dependencies: ["CaptureKit"],
