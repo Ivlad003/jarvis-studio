@@ -156,6 +156,12 @@ public struct ChatResponse: Sendable, Codable, Equatable {
 // MARK: - ChatMessage
 
 public struct ChatMessage: Sendable, Codable, Equatable {
+    private enum CodingKeys: String, CodingKey {
+        case role
+        case parts
+        case id
+    }
+
     public enum Role: String, Sendable, Codable {
         case system
         case user
@@ -232,16 +238,45 @@ public struct ChatMessage: Sendable, Codable, Equatable {
 
     public let role: Role
     public let parts: [Part]
+    public let id: UUID
 
     public init(role: Role, parts: [Part]) {
         self.role = role
         self.parts = parts
+        self.id = UUID()
+    }
+
+    public init(role: Role, parts: [Part], id: UUID) {
+        self.role = role
+        self.parts = parts
+        self.id = id
     }
 
     /// Convenience: single text-only message.
     public init(role: Role, content: String) {
         self.role = role
         self.parts = [.text(content)]
+        self.id = UUID()
+    }
+
+    public init(role: Role, content: String, id: UUID) {
+        self.role = role
+        self.parts = [.text(content)]
+        self.id = id
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.role = try container.decode(Role.self, forKey: .role)
+        self.parts = try container.decode([Part].self, forKey: .parts)
+        self.id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(role, forKey: .role)
+        try container.encode(parts, forKey: .parts)
+        try container.encode(id, forKey: .id)
     }
 
     /// Concatenated text content for display and logging; ignores image parts.

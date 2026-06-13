@@ -152,12 +152,9 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(chat.messages.enumerated()), id: \.offset) { idx, message in
-                        // Skip system messages — they're injected context, not conversation.
-                        if message.role != .system {
-                            MessageBubble(message: message)
-                                .id(idx)
-                        }
+                    ForEach(chat.messages.filter { $0.role != .system }, id: \.id) { message in
+                        MessageBubble(message: message)
+                            .id(message.id)
                     }
                     if chat.isSending {
                         thinkingIndicator
@@ -167,8 +164,10 @@ struct ChatView: View {
                 .padding(16)
             }
             .onChange(of: chat.messages.count) { _, _ in
-                withAnimation {
-                    proxy.scrollTo(chat.messages.count - 1, anchor: .bottom)
+                if let lastID = chat.messages.last(where: { $0.role != .system })?.id {
+                    withAnimation {
+                        proxy.scrollTo(lastID, anchor: .bottom)
+                    }
                 }
             }
             .onChange(of: chat.isSending) { _, sending in
@@ -423,6 +422,14 @@ private struct MessageBubble: View {
     let message: ChatMessage
 
     var body: some View {
+        if isToolActivity {
+            toolActivityBody
+        } else {
+            textBubbleBody
+        }
+    }
+
+    private var textBubbleBody: some View {
         HStack {
             if message.role == .user { Spacer(minLength: 60) }
             Text(message.text)
@@ -433,6 +440,66 @@ private struct MessageBubble: View {
                 .foregroundStyle(foregroundColor)
                 .font(.body)
             if message.role != .user { Spacer(minLength: 60) }
+        }
+    }
+
+    private var toolActivityBody: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(toolRows.enumerated()), id: \.offset) { _, row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label(row.title, systemImage: row.icon)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(row.color)
+                        if !row.detail.isEmpty {
+                            Text(row.detail)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(Color(NSColor.secondaryLabelColor))
+                                .textSelection(.enabled)
+                                .lineLimit(8)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color(NSColor.windowBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(NSColor.separatorColor), lineWidth: 1)
+            )
+            Spacer(minLength: 60)
+        }
+    }
+
+    private var isToolActivity: Bool {
+        message.parts.contains { part in
+            if case .toolUse = part { return true }
+            if case .toolResult = part { return true }
+            return false
+        }
+    }
+
+    private var toolRows: [(title: String, detail: String, icon: String, color: Color)] {
+        message.parts.compactMap { part in
+            switch part {
+            case .toolUse(let call):
+                return (
+                    title: "Calling \(call.name)",
+                    detail: (try? call.arguments.jsonString()) ?? "",
+                    icon: "wrench.and.screwdriver",
+                    color: Color.accentColor
+                )
+            case .toolResult(_, let content, let isError):
+                return (
+                    title: isError ? "Tool error" : "Tool result",
+                    detail: content,
+                    icon: isError ? "exclamationmark.triangle" : "checkmark.circle",
+                    color: isError ? Color.orange : Color(NSColor.secondaryLabelColor)
+                )
+            case .text, .image:
+                return nil
+            }
         }
     }
 

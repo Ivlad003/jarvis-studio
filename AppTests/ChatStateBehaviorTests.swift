@@ -131,8 +131,19 @@ struct ChatStateBehaviorTests {
         await chat.send()
 
         #expect(chat.lastError == nil)
+        #expect(chat.messages.count == 4)
         #expect(chat.messages.last?.role == .assistant)
         #expect(chat.messages.last?.text == "Budget is due Friday.")
+        if chat.messages.count >= 3 {
+            #expect(chat.messages[1].parts.contains {
+                guard case .toolUse(let call) = $0 else { return false }
+                return call.name == "search_live_transcript"
+            })
+            #expect(chat.messages[2].parts.contains {
+                guard case .toolResult(_, let content, let isError) = $0 else { return false }
+                return !isError && content.contains("The launch budget is due Friday.")
+            })
+        }
         #expect(await calls.toolNamesByTurn.first == ["search_live_transcript"])
         #expect(await calls.receivedToolResult(containing: "The launch budget is due Friday."))
     }

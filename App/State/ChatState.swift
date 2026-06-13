@@ -294,8 +294,8 @@ final class ChatState {
 
         do {
             let systemPrompt = await buildSystemPrompt()
-            let reply = try await runProvider(messages: messages, systemPrompt: systemPrompt)
-            messages.append(ChatMessage(role: .assistant, content: reply))
+            let replyMessages = try await runProvider(messages: messages, systemPrompt: systemPrompt)
+            messages.append(contentsOf: replyMessages)
         } catch let error as AIError {
             lastError = friendlyMessage(for: error)
             Self.rollbackUserMessage(at: userMessageIndex, matching: userMessage, from: &messages)
@@ -377,8 +377,8 @@ final class ChatState {
             snapshotQuestion = ""
 
             let systemPrompt = await buildSystemPrompt()
-            let reply = try await runProvider(messages: messages, systemPrompt: systemPrompt)
-            messages.append(ChatMessage(role: .assistant, content: reply))
+            let replyMessages = try await runProvider(messages: messages, systemPrompt: systemPrompt)
+            messages.append(contentsOf: replyMessages)
         } catch {
             if let rollbackTarget {
                 Self.rollbackUserMessage(at: rollbackTarget.index, matching: rollbackTarget.message, from: &messages)
@@ -391,7 +391,7 @@ final class ChatState {
     // MARK: - Private: provider dispatch
 
     /// Shared send-to-LLM path used by both `send()` and `sendSnapshot()`.
-    private func runProvider(messages: [ChatMessage], systemPrompt: String?) async throws -> String {
+    private func runProvider(messages: [ChatMessage], systemPrompt: String?) async throws -> [ChatMessage] {
         guard let resolved = providerResolver(settings.aiProviderConfig) else {
             throw AIError.authenticationFailed
         }
@@ -402,7 +402,7 @@ final class ChatState {
         )
         let tools = await makeChatTools()
         guard !tools.isEmpty else {
-            return try await resolved.provider.chat(messages: messages, config: config)
+            return [ChatMessage(role: .assistant, content: try await resolved.provider.chat(messages: messages, config: config))]
         }
 
         let engine = ToolLoopEngine(
@@ -411,7 +411,8 @@ final class ChatState {
             config: config,
             maxTranscriptBytes: ToolLoopEngine.defaultMaxTranscriptBytes
         )
-        return try await engine.run(messages: messages).text
+        let result = try await engine.runWithTranscript(messages: messages)
+        return Array(result.transcript.dropFirst(messages.count))
     }
 
     private func makeChatTools() async -> [ToolDefinition] {

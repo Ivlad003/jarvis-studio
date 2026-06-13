@@ -39,6 +39,41 @@ struct ToolLoopEngineTests {
         })
     }
 
+    @Test("runWithTranscript returns tool turns for UI display")
+    func runWithTranscriptReturnsToolTurnsForUIDisplay() async throws {
+        let provider = ScriptedToolProvider()
+        let tool = ToolDefinition(
+            spec: ToolSpec(
+                name: "search_live_transcript",
+                description: "Search active transcript",
+                parameters: .object(["type": .string("object")])
+            ),
+            execute: { _ in ToolExecutionResult(content: "budget is due Friday") }
+        )
+        let engine = ToolLoopEngine(
+            provider: provider,
+            tools: [tool],
+            config: AIConfig(model: "mock"),
+            maxIterations: 4,
+            maxTranscriptBytes: 20_000
+        )
+
+        let result = try await engine.runWithTranscript(
+            messages: [ChatMessage(role: .user, content: "What was said about budget?")]
+        )
+
+        #expect(result.response.text == "Budget is due Friday.")
+        #expect(result.transcript.count == 4)
+        #expect(result.transcript[1].parts.contains {
+            guard case .toolUse(let call) = $0 else { return false }
+            return call.name == "search_live_transcript"
+        })
+        #expect(result.transcript[2].parts == [
+            .toolResult(id: "toolu_1", content: "budget is due Friday", isError: false),
+        ])
+        #expect(result.transcript[3].text == "Budget is due Friday.")
+    }
+
     @Test("unknown tool names are folded back as error tool results")
     func unknownToolsAreFoldedBackAsErrorResults() async throws {
         let provider = UnknownToolProvider()

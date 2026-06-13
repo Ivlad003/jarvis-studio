@@ -43,6 +43,16 @@ public struct ToolLoopEvent: Sendable, Equatable {
     }
 }
 
+public struct ToolLoopRunResult: Sendable, Equatable {
+    public let response: ChatResponse
+    public let transcript: [ChatMessage]
+
+    public init(response: ChatResponse, transcript: [ChatMessage]) {
+        self.response = response
+        self.transcript = transcript
+    }
+}
+
 public actor ToolLoopEngine {
     public typealias EventHandler = @Sendable (ToolLoopEvent) -> Void
 
@@ -72,6 +82,10 @@ public actor ToolLoopEngine {
     }
 
     public func run(messages initialMessages: [ChatMessage]) async throws -> ChatResponse {
+        try await runWithTranscript(messages: initialMessages).response
+    }
+
+    public func runWithTranscript(messages initialMessages: [ChatMessage]) async throws -> ToolLoopRunResult {
         var transcript = initialMessages
         let specs = tools.map(\.spec)
 
@@ -98,7 +112,7 @@ public actor ToolLoopEngine {
 
             guard response.stopReason == .toolUse, !calls.isEmpty else {
                 emit(.init(kind: .stop, text: "Tool loop finished (\(response.stopReason.rawValue))."))
-                return response
+                return ToolLoopRunResult(response: response, transcript: transcript)
             }
 
             var resultParts: [ChatMessage.Part] = []

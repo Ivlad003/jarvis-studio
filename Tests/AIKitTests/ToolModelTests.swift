@@ -43,6 +43,23 @@ struct ToolModelTests {
         #expect(decoded.text == "I will check.")
     }
 
+    @Test("chat message decoding accepts legacy JSON without id")
+    func chatMessageDecodingAcceptsLegacyJSONWithoutID() throws {
+        let data = Data("""
+        {
+          "role": "assistant",
+          "parts": [
+            { "type": "text", "text": "Legacy reply" }
+          ]
+        }
+        """.utf8)
+
+        let decoded = try JSONDecoder().decode(ChatMessage.self, from: data)
+
+        #expect(decoded.role == .assistant)
+        #expect(decoded.text == "Legacy reply")
+    }
+
     @Test("AIProvider tool overload defaults to text response")
     func aiProviderToolOverloadDefaultsToTextResponse() async throws {
         let provider = TextOnlyProvider()
