@@ -144,7 +144,7 @@ struct ChatStateBehaviorTests {
                 return !isError && content.contains("The launch budget is due Friday.")
             })
         }
-        #expect(await calls.toolNamesByTurn.first == ["search_live_transcript"])
+        #expect(await calls.toolNamesByTurn.first == ["search_transcripts", "search_live_transcript"])
         #expect(await calls.receivedToolResult(containing: "The launch budget is due Friday."))
     }
 
@@ -201,9 +201,51 @@ struct ChatStateBehaviorTests {
 
         #expect(chat.lastError == nil)
         #expect(chat.messages.last?.text == "Roadmap and code agree.")
-        #expect(await calls.toolNamesByTurn.first == ["search_knowledge_base", "search_code"])
+        #expect(await calls.toolNamesByTurn.first == ["search_transcripts", "search_knowledge_base", "search_code"])
         #expect(await calls.receivedToolResult(containing: "roadmap.md"))
         #expect(await calls.receivedToolResult(containing: "launchBudgetStatus"))
+    }
+
+    @Test("send exposes finished transcript search through the shared tool loop")
+    func sendExposesFinishedTranscriptSearchThroughSharedToolLoop() async throws {
+        let tmpDir = URL.temporaryDirectory.appendingPathComponent("KosmoNotesChatTranscriptToolTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let db = try AppDatabase(path: tmpDir.appendingPathComponent("sessions.sqlite"))
+        try await db.migrate()
+        let sessionStore = try SessionStore(rootDir: tmpDir.appendingPathComponent("recordings"), database: db)
+        let record = try await sessionStore.createSession(mode: .meeting, language: "en")
+        try await sessionStore.indexTranscript(
+            sid: record.id,
+            text: "The finished transcript says the launch budget is due Friday."
+        )
+        let settings = AppSettings()
+        let recorder = RecorderState(database: db, sessionStore: sessionStore, settings: settings)
+        let calls = TranscriptToolChatProviderCalls()
+        let provider = TranscriptToolChatProvider(calls: calls)
+        let chat = ChatState(
+            settings: settings,
+            database: db,
+            sessionStore: sessionStore,
+            recorder: recorder,
+            providerResolver: { _ in
+                AIProviderResolver.Resolved(
+                    provider: provider,
+                    model: "mock-chat",
+                    pricing: .init(inputPerMillion: 0, outputPerMillion: 0)
+                )
+            }
+        )
+        chat.autoSearchSessions = false
+
+        chat.inputDraft = "What did the finished transcript say about launch budget?"
+        await chat.send()
+
+        #expect(chat.lastError == nil)
+        #expect(chat.messages.last?.text == "Finished transcript says budget is due Friday.")
+        #expect(await calls.toolNamesByTurn.first?.contains("search_transcripts") == true)
+        #expect(await calls.receivedToolResult(containing: "finished transcript"))
     }
 }
 
@@ -299,5 +341,50 @@ private struct KnowledgeToolChatProvider: AIProvider {
             ], stopReason: .toolUse)
         }
         return ChatResponse(parts: [.text("Roadmap and code agree.")], stopReason: .endTurn)
+    }
+}
+
+private actor TranscriptToolChatProviderCalls {
+    private var turns: [(messages: [ChatMessage], tools: [ToolSpec])] = []
+
+    var toolNamesByTurn: [[String]] {
+        turns.map { $0.tools.map(\.name) }
+    }
+
+    var count: Int { turns.count }
+
+    func append(messages: [ChatMessage], tools: [ToolSpec]) {
+        turns.append((messages, tools))
+    }
+
+    func receivedToolResult(containing needle: String) -> Bool {
+        turns.contains { turn in
+            turn.messages.flatMap(\.parts).contains { part in
+                guard case .toolResult(_, let content, _) = part else { return false }
+                return content.localizedCaseInsensitiveContains(needle)
+            }
+        }
+    }
+}
+
+private struct TranscriptToolChatProvider: AIProvider {
+    let calls: TranscriptToolChatProviderCalls
+
+    func chat(messages: [ChatMessage], config: AIConfig) async throws -> String {
+        "plain chat path should not be used"
+    }
+
+    func chat(messages: [ChatMessage], tools: [ToolSpec], config: AIConfig) async throws -> ChatResponse {
+        await calls.append(messages: messages, tools: tools)
+        if await calls.count == 1 {
+            return ChatResponse(parts: [
+                .toolUse(.init(
+                    id: "toolu_transcripts",
+                    name: "search_transcripts",
+                    arguments: .object(["query": .string("launch budget"), "limit": .number(5)])
+                )),
+            ], stopReason: .toolUse)
+        }
+        return ChatResponse(parts: [.text("Finished transcript says budget is due Friday.")], stopReason: .endTurn)
     }
 }

@@ -600,6 +600,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let agentSession = AgentSessionState(
                 settings: settings,
+                database: database,
                 knowledgeBaseStore: knowledgeBaseStore,
                 liveTranscriptProvider: { [weak recorder] in
                     guard let recorder else { return nil }

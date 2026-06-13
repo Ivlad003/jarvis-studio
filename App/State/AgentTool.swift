@@ -459,6 +459,77 @@ public struct SearchLiveTranscriptTool: AgentTool {
     }
 }
 
+public struct SearchTranscriptsTool: AgentTool {
+    public let name = "search_transcripts"
+    public let description = "Search finished saved transcript sessions with local full-text search. Returns session metadata and matching snippets."
+    public let inputSchema: [String: Any] = [
+        "type": "object",
+        "properties": [
+            "query": ["type": "string", "description": "Words to search for in completed transcript sessions."],
+            "limit": ["type": "integer", "description": "Maximum finished transcript hits to return, from 1 to 20."],
+        ],
+        "required": ["query"],
+    ]
+
+    private let database: AppDatabase
+
+    public init(database: AppDatabase) {
+        self.database = database
+    }
+
+    public func execute(input: [String: Any]) async throws -> String {
+        guard let query = input["query"] as? String else {
+            throw AgentToolError.badInput("search_transcripts: missing 'query'")
+        }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw AgentToolError.badInput("search_transcripts: empty query")
+        }
+
+        let limit = Self.clampedLimit(from: input["limit"], defaultValue: 8, upperBound: 20)
+        let hits = try await database.searchTranscripts(query: trimmed, limit: limit)
+        guard !hits.isEmpty else {
+            return "No finished transcript matches for `\(trimmed)`."
+        }
+
+        var lines: [String] = []
+        let formatter = ISO8601DateFormatter()
+        for (index, hit) in hits.enumerated() {
+            let shortID = String(hit.sid.prefix(8))
+            if let record = try await database.session(id: hit.sid) {
+                let recordedAt = formatter.string(from: record.recordedAt)
+                let duration = String(format: "%.0fs", record.durationSecs)
+                let language = record.language ?? "auto"
+                lines.append("""
+                [\(index + 1)] \(recordedAt) · \(record.mode.displayName) · \(duration) · \(language) · \(shortID)
+                \(hit.snippet)
+                """)
+            } else {
+                lines.append("""
+                [\(index + 1)] session \(shortID)
+                \(hit.snippet)
+                """)
+            }
+        }
+
+        return lines.joined(separator: "\n\n")
+    }
+
+    private static func clampedLimit(from value: Any?, defaultValue: Int, upperBound: Int) -> Int {
+        let raw: Int
+        if let value = value as? Int {
+            raw = value
+        } else if let value = value as? Double {
+            raw = Int(value)
+        } else if let value = value as? NSNumber {
+            raw = value.intValue
+        } else {
+            raw = defaultValue
+        }
+        return max(1, min(raw, upperBound))
+    }
+}
+
 public struct SearchKnowledgeBaseTool: AgentTool {
     public let name = "search_knowledge_base"
     public let description = "Search user-added local knowledge-base documents and code chunks. Returns matching file paths and snippets."
@@ -649,6 +720,7 @@ public struct SearchCodeTool: AgentTool {
 enum AgentToolRegistry {
     static func makeBuiltinTools(
         workspace: URL,
+        database: AppDatabase? = nil,
         knowledgeBaseStore: KnowledgeBaseStore?,
         liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider?
     ) async -> [AgentTool] {
@@ -657,6 +729,10 @@ enum AgentToolRegistry {
             ReadFileTool(workspace: workspace),
             WriteFileTool(workspace: workspace),
         ]
+
+        if let database {
+            tools.append(SearchTranscriptsTool(database: database))
+        }
 
         if let liveTranscriptProvider {
             tools.append(SearchLiveTranscriptTool(snapshotProvider: liveTranscriptProvider))

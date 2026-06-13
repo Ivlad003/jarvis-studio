@@ -416,7 +416,9 @@ final class ChatState {
     }
 
     private func makeChatTools() async -> [ToolDefinition] {
-        var tools: [AgentTool] = []
+        var tools: [AgentTool] = [
+            SearchTranscriptsTool(database: database),
+        ]
         if let liveContextProvider {
             tools.append(SearchLiveTranscriptTool(snapshotProvider: liveContextProvider))
         }

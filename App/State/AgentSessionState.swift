@@ -45,6 +45,7 @@ final class AgentSessionState {
     // MARK: - Dependencies
 
     private let settings: AppSettings
+    private let database: AppDatabase?
     private let knowledgeBaseStore: KnowledgeBaseStore?
     private let liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider?
     /// One of these is non-nil while a session runs. Built-in backend uses
@@ -71,10 +72,12 @@ final class AgentSessionState {
 
     init(
         settings: AppSettings,
+        database: AppDatabase? = nil,
         knowledgeBaseStore: KnowledgeBaseStore? = nil,
         liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider? = nil
     ) {
         self.settings = settings
+        self.database = database
         self.knowledgeBaseStore = knowledgeBaseStore
         self.liveTranscriptProvider = liveTranscriptProvider
     }
@@ -187,6 +190,7 @@ final class AgentSessionState {
 
         let tools = await AgentToolRegistry.makeBuiltinTools(
             workspace: workspace,
+            database: database,
             knowledgeBaseStore: knowledgeBaseStore,
             liveTranscriptProvider: liveTranscriptProvider
         )

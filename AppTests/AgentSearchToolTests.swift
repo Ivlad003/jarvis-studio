@@ -44,17 +44,44 @@ struct AgentSearchToolTests {
         #expect(output == "No live transcript is available.")
     }
 
+    @Test("search_transcripts returns formatted finished-session hits")
+    func searchTranscriptsReturnsFormattedFinishedSessionHits() async throws {
+        let tmpDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let db = try AppDatabase(path: tmpDir.appendingPathComponent("sessions.sqlite"))
+        try await db.migrate()
+        let store = try SessionStore(rootDir: tmpDir.appendingPathComponent("recordings"), database: db)
+        let record = try await store.createSession(mode: .meeting, language: "en")
+        try await store.indexTranscript(
+            sid: record.id,
+            text: "The launch budget was approved after the customer onboarding discussion."
+        )
+
+        let tool = SearchTranscriptsTool(database: db)
+        let output = try await tool.execute(input: ["query": "launch budget", "limit": 5])
+
+        #expect(output.contains(record.id.prefix(8)))
+        #expect(output.contains("Meeting"))
+        #expect(output.contains("launch"))
+        #expect(output.contains("budget"))
+    }
+
     @Test("builtin agent tool registry includes live transcript search when a provider is available")
     func builtinToolRegistryIncludesLiveTranscriptSearchWhenProviderAvailable() async throws {
         let workspace = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: workspace) }
+        let db = try AppDatabase(path: workspace.appendingPathComponent("sessions.sqlite"))
+        try await db.migrate()
 
         let tools = await AgentToolRegistry.makeBuiltinTools(
             workspace: workspace,
+            database: db,
             knowledgeBaseStore: nil,
             liveTranscriptProvider: { .empty }
         )
 
+        #expect(tools.map(\.name).contains("search_transcripts"))
         #expect(tools.map(\.name).contains("search_live_transcript"))
     }
 
