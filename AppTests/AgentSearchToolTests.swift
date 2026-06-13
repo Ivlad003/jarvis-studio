@@ -1,6 +1,7 @@
 import Foundation
 import StorageKit
 import Testing
+import TranscriptionKit
 @testable import KosmoNotes
 
 @Suite("Agent search tools")
@@ -9,6 +10,52 @@ struct AgentSearchToolTests {
         let tmpDir = URL.temporaryDirectory.appendingPathComponent("KosmoNotesAgentToolTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
         return tmpDir
+    }
+
+    @Test("search_live_transcript returns timestamped stable and draft matches")
+    func searchLiveTranscriptReturnsTimestampedStableAndDraftMatches() async throws {
+        let state = LiveTranscriptState(
+            stableUnits: [
+                LiveTranscriptUnit(start: 1, end: 5, text: "The launch budget is due Friday.", state: .stable),
+                LiveTranscriptUnit(start: 8, end: 11, text: "Unrelated hiring note.", state: .stable),
+            ],
+            draftUnits: [
+                LiveTranscriptUnit(start: 12, end: 15, text: "Mutable tail mentions customer onboarding.", state: .draft),
+            ],
+            status: .healthy
+        )
+        let tool = SearchLiveTranscriptTool(snapshotProvider: { state })
+
+        let stableOutput = try await tool.execute(input: ["query": "launch budget", "limit": 5])
+        #expect(stableOutput.contains("[1] [00:01-00:05] stable"))
+        #expect(stableOutput.contains("The launch budget is due Friday."))
+        #expect(!stableOutput.contains("Unrelated hiring note."))
+
+        let draftOutput = try await tool.execute(input: ["query": "customer onboarding", "limit": 5])
+        #expect(draftOutput.contains("[1] [00:12-00:15] draft"))
+        #expect(draftOutput.contains("Mutable tail mentions customer onboarding."))
+    }
+
+    @Test("search_live_transcript reports when no live snapshot is available")
+    func searchLiveTranscriptReportsNoSnapshotAvailable() async throws {
+        let tool = SearchLiveTranscriptTool(snapshotProvider: { nil })
+        let output = try await tool.execute(input: ["query": "launch budget"])
+
+        #expect(output == "No live transcript is available.")
+    }
+
+    @Test("builtin agent tool registry includes live transcript search when a provider is available")
+    func builtinToolRegistryIncludesLiveTranscriptSearchWhenProviderAvailable() async throws {
+        let workspace = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let tools = await AgentToolRegistry.makeBuiltinTools(
+            workspace: workspace,
+            knowledgeBaseStore: nil,
+            liveTranscriptProvider: { .empty }
+        )
+
+        #expect(tools.map(\.name).contains("search_live_transcript"))
     }
 
     @Test("search_knowledge_base returns formatted KB hits")

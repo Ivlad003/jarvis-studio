@@ -598,7 +598,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let knowledgeBaseStore = KnowledgeBaseStore(database: database)
             self.knowledgeBaseStoreHolder = knowledgeBaseStore
 
-            let agentSession = AgentSessionState(settings: settings, knowledgeBaseStore: knowledgeBaseStore)
+            let agentSession = AgentSessionState(
+                settings: settings,
+                knowledgeBaseStore: knowledgeBaseStore,
+                liveTranscriptProvider: { [weak recorder] in
+                    guard let recorder else { return nil }
+                    return await recorder.liveTranscriptSnapshot()
+                }
+            )
             self.agentSessionHolder = agentSession
             let agentHotkey = AgentHotkeyState(
                 settings: settings,

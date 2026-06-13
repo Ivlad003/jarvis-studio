@@ -1,6 +1,7 @@
 import Foundation
 import os
 import StorageKit
+import TranscriptionKit
 
 private let agentToolLog = Logger(subsystem: "dev.kosmonotes.studio", category: "AgentTool")
 
@@ -357,6 +358,106 @@ public struct BashTool: AgentTool {
     }
 }
 
+public struct SearchLiveTranscriptTool: AgentTool {
+    public typealias SnapshotProvider = @MainActor @Sendable () async -> LiveTranscriptState?
+
+    public let name = "search_live_transcript"
+    public let description = "Search the current in-progress live transcript. Returns timestamped stable and draft matches from what has been said so far."
+    public let inputSchema: [String: Any] = [
+        "type": "object",
+        "properties": [
+            "query": ["type": "string", "description": "Words to search for in the live transcript."],
+            "limit": ["type": "integer", "description": "Maximum matching transcript spans to return, from 1 to 20."],
+        ],
+        "required": ["query"],
+    ]
+
+    private let snapshotProvider: SnapshotProvider
+
+    public init(snapshotProvider: @escaping SnapshotProvider) {
+        self.snapshotProvider = snapshotProvider
+    }
+
+    public func execute(input: [String: Any]) async throws -> String {
+        guard let query = input["query"] as? String else {
+            throw AgentToolError.badInput("search_live_transcript: missing 'query'")
+        }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw AgentToolError.badInput("search_live_transcript: empty query")
+        }
+
+        guard let snapshot = await snapshotProvider() else {
+            return "No live transcript is available."
+        }
+
+        let units = (snapshot.stableUnits + snapshot.draftUnits)
+            .sorted { lhs, rhs in
+                if lhs.start == rhs.start { return lhs.end < rhs.end }
+                return lhs.start < rhs.start
+            }
+        guard !units.isEmpty else {
+            return "Live transcript is empty."
+        }
+
+        let tokens = Self.searchTokens(in: trimmed)
+        let limit = Self.clampedLimit(from: input["limit"], defaultValue: 8, upperBound: 20)
+        let matches = units.filter { unit in
+            let haystack = unit.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            return tokens.allSatisfy { haystack.contains($0) }
+        }.prefix(limit)
+
+        guard !matches.isEmpty else {
+            return "No live transcript matches for `\(trimmed)`."
+        }
+
+        return matches.enumerated().map { index, unit in
+            "[\(index + 1)] [\(Self.formatTimestamp(unit.start))-\(Self.formatTimestamp(unit.end))] \(Self.label(for: unit.state))\n\(unit.text)"
+        }.joined(separator: "\n\n")
+    }
+
+    private static func searchTokens(in query: String) -> [String] {
+        query
+            .split { $0.isWhitespace || $0.isNewline }
+            .map { String($0).folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func label(for state: LiveTranscriptUnitState) -> String {
+        switch state {
+        case .stable:
+            return "stable"
+        case .draft:
+            return "draft"
+        }
+    }
+
+    private static func formatTimestamp(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded(.down)))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        if hours > 0 {
+            return String(format: "%02d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
+    }
+
+    private static func clampedLimit(from value: Any?, defaultValue: Int, upperBound: Int) -> Int {
+        let raw: Int
+        if let value = value as? Int {
+            raw = value
+        } else if let value = value as? Double {
+            raw = Int(value)
+        } else if let value = value as? NSNumber {
+            raw = value.intValue
+        } else {
+            raw = defaultValue
+        }
+        return max(1, min(raw, upperBound))
+    }
+}
+
 public struct SearchKnowledgeBaseTool: AgentTool {
     public let name = "search_knowledge_base"
     public let description = "Search user-added local knowledge-base documents and code chunks. Returns matching file paths and snippets."
@@ -541,6 +642,37 @@ public struct SearchCodeTool: AgentTool {
             raw = defaultValue
         }
         return max(1, min(raw, upperBound))
+    }
+}
+
+enum AgentToolRegistry {
+    static func makeBuiltinTools(
+        workspace: URL,
+        knowledgeBaseStore: KnowledgeBaseStore?,
+        liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider?
+    ) async -> [AgentTool] {
+        var tools: [AgentTool] = [
+            BashTool(workspace: workspace),
+            ReadFileTool(workspace: workspace),
+            WriteFileTool(workspace: workspace),
+        ]
+
+        if let liveTranscriptProvider {
+            tools.append(SearchLiveTranscriptTool(snapshotProvider: liveTranscriptProvider))
+        }
+
+        if let knowledgeBaseStore {
+            tools.append(SearchKnowledgeBaseTool(store: knowledgeBaseStore))
+            let codeRoots = (try? await knowledgeBaseStore.listSources())
+                .map { sources in
+                    sources
+                        .filter { $0.kind == .codeFolder }
+                        .map { URL(fileURLWithPath: $0.path, isDirectory: true) }
+                } ?? []
+            tools.append(SearchCodeTool(roots: codeRoots))
+        }
+
+        return tools
     }
 }
 

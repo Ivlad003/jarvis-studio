@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import os
 import StorageKit
+import TranscriptionKit
 
 private let agentSessionLog = Logger(subsystem: "dev.kosmonotes.studio", category: "AgentSession")
 
@@ -45,6 +46,7 @@ final class AgentSessionState {
 
     private let settings: AppSettings
     private let knowledgeBaseStore: KnowledgeBaseStore?
+    private let liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider?
     /// One of these is non-nil while a session runs. Built-in backend uses
     /// AgentRunner; CLI backends use ExternalAgentRunner. Polymorphism via
     /// helpers below to avoid an extra protocol layer.
@@ -67,9 +69,14 @@ final class AgentSessionState {
         return e
     }()
 
-    init(settings: AppSettings, knowledgeBaseStore: KnowledgeBaseStore? = nil) {
+    init(
+        settings: AppSettings,
+        knowledgeBaseStore: KnowledgeBaseStore? = nil,
+        liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider? = nil
+    ) {
         self.settings = settings
         self.knowledgeBaseStore = knowledgeBaseStore
+        self.liveTranscriptProvider = liveTranscriptProvider
     }
 
     // MARK: - Public API
@@ -178,21 +185,11 @@ final class AgentSessionState {
             return
         }
 
-        var tools: [AgentTool] = [
-            BashTool(workspace: workspace),
-            ReadFileTool(workspace: workspace),
-            WriteFileTool(workspace: workspace),
-        ]
-        if let knowledgeBaseStore {
-            tools.append(SearchKnowledgeBaseTool(store: knowledgeBaseStore))
-            let codeRoots = (try? await knowledgeBaseStore.listSources())
-                .map { sources in
-                    sources
-                        .filter { $0.kind == .codeFolder }
-                        .map { URL(fileURLWithPath: $0.path, isDirectory: true) }
-                } ?? []
-            tools.append(SearchCodeTool(roots: codeRoots))
-        }
+        let tools = await AgentToolRegistry.makeBuiltinTools(
+            workspace: workspace,
+            knowledgeBaseStore: knowledgeBaseStore,
+            liveTranscriptProvider: liveTranscriptProvider
+        )
         let systemPrompt = settings.agentSystemPrompt.isEmpty
             ? AppSettings.defaultAgentSystemPrompt
             : settings.agentSystemPrompt
