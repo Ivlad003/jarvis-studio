@@ -144,6 +144,24 @@ public struct KnowledgeBaseHit: Sendable, Equatable {
     }
 }
 
+struct KnowledgeBaseIndexedEmbedding: Sendable, Equatable {
+    let documentID: String
+    let chunkIndex: Int
+    let vector: Data
+    let model: String
+    let indexedAt: Date
+}
+
+struct KnowledgeBaseEmbeddingRow: Sendable, Equatable {
+    let sourceID: String
+    let documentID: String
+    let relPath: String
+    let chunkIndex: Int
+    let text: String
+    let vector: Data
+    let model: String
+}
+
 struct KnowledgeBaseIndexedDocument: Sendable, Equatable {
     let relPath: String
     let mtime: Date
@@ -496,6 +514,37 @@ public actor AppDatabase {
         }
     }
 
+    func replaceKnowledgeBaseEmbeddings(
+        sourceID: String,
+        embeddings: [KnowledgeBaseIndexedEmbedding]
+    ) async throws {
+        try await pool.write { db in
+            try db.execute(
+                sql: """
+                    DELETE FROM kb_embeddings
+                    WHERE doc_id IN (SELECT id FROM kb_documents WHERE source_id = ?)
+                    """,
+                arguments: [sourceID]
+            )
+
+            for embedding in embeddings {
+                try db.execute(
+                    sql: """
+                        INSERT INTO kb_embeddings (doc_id, chunk_index, vector, model, indexed_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        embedding.documentID,
+                        embedding.chunkIndex,
+                        embedding.vector,
+                        embedding.model,
+                        embedding.indexedAt.timeIntervalSince1970,
+                    ]
+                )
+            }
+        }
+    }
+
     func searchKnowledgeBase(query: String, limit: Int = 20) async throws -> [KnowledgeBaseHit] {
         guard let pattern = Self.knowledgeBaseSearchPattern(matchingAllTokensIn: query) else { return [] }
         return try await pool.read { db in
@@ -521,6 +570,38 @@ public actor AppDatabase {
                     relPath: row["rel_path"],
                     chunkIndex: row["chunk_index"],
                     snippet: row["snip"]
+                )
+            }
+        }
+    }
+
+    func allKnowledgeBaseEmbeddings() async throws -> [KnowledgeBaseEmbeddingRow] {
+        try await pool.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT d.source_id AS source_id,
+                           e.doc_id AS doc_id,
+                           d.rel_path AS rel_path,
+                           e.chunk_index AS chunk_index,
+                           c.text AS text,
+                           e.vector AS vector,
+                           e.model AS model
+                    FROM kb_embeddings e
+                    JOIN kb_documents d ON d.id = e.doc_id
+                    JOIN kb_chunks_fts c ON c.doc_id = e.doc_id
+                                         AND c.chunk_index = e.chunk_index
+                    """
+            )
+            return rows.map { row in
+                KnowledgeBaseEmbeddingRow(
+                    sourceID: row["source_id"],
+                    documentID: row["doc_id"],
+                    relPath: row["rel_path"],
+                    chunkIndex: row["chunk_index"],
+                    text: row["text"],
+                    vector: row["vector"],
+                    model: row["model"]
                 )
             }
         }

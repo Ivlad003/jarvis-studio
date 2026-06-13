@@ -1,4 +1,5 @@
 import SwiftUI
+import AIKit
 import AppKit
 import AVFoundation
 import KeyboardShortcuts
@@ -595,7 +596,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // restricted to the workspace folder. Hotkey installs even when
             // disabled (it bails inside handlePress on the toggle), so a
             // future enable doesn't require relaunch.
-            let knowledgeBaseStore = KnowledgeBaseStore(database: database)
+            let knowledgeBaseStore = KnowledgeBaseStore(
+                database: database,
+                embeddingProvider: AppSettingsKnowledgeBaseEmbeddingProvider(settings: settings)
+            )
             self.knowledgeBaseStoreHolder = knowledgeBaseStore
 
             let agentSession = AgentSessionState(

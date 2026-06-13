@@ -1,4 +1,5 @@
 import Foundation
+import StorageKit
 
 // MARK: - EmbeddingProvider
 
@@ -83,6 +84,8 @@ public final class OpenAIEmbeddingProvider: EmbeddingProvider, Sendable {
         return first.embedding
     }
 }
+
+extension OpenAIEmbeddingProvider: KnowledgeBaseEmbeddingProvider {}
 
 // MARK: - Vector helpers
 

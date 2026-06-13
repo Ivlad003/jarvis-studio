@@ -134,6 +134,66 @@ struct KnowledgeBaseStoreTests {
         #expect(try await store.search(query: "replacement", limit: 10).count == 1)
     }
 
+    @Test("search returns semantic KB hits when FTS has no lexical match")
+    func searchReturnsSemanticHitsWhenFTSHasNoLexicalMatch() async throws {
+        let (_, db, tmpDir) = try await makeStore()
+        defer { cleanup(tmpDir) }
+
+        let sourceDir = tmpDir.appendingPathComponent("knowledge")
+        try FileManager.default.createDirectory(at: sourceDir, withIntermediateDirectories: true)
+        try "Quarterly roadmap says launch funding is due Friday.".write(
+            to: sourceDir.appendingPathComponent("roadmap.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let embedder = DeterministicKnowledgeBaseEmbedder { text in
+            text.contains("strategy question") || text.contains("roadmap")
+                ? [1, 0]
+                : [0, 1]
+        }
+        let store = KnowledgeBaseStore(database: db, embeddingProvider: embedder)
+        _ = try await store.addSource(kind: .document, path: sourceDir)
+        try await store.reindexAll()
+
+        let hits = try await store.search(query: "strategy question", limit: 10)
+
+        #expect(hits.map(\.relPath) == ["roadmap.md"])
+        #expect(hits.first?.snippet.contains("Quarterly roadmap") == true)
+    }
+
+    @Test("search keeps FTS hits first and appends cosine hits")
+    func searchKeepsFTSHitsFirstAndAppendsCosineHits() async throws {
+        let (_, db, tmpDir) = try await makeStore()
+        defer { cleanup(tmpDir) }
+
+        let sourceDir = tmpDir.appendingPathComponent("knowledge")
+        try FileManager.default.createDirectory(at: sourceDir, withIntermediateDirectories: true)
+        try "The budget spreadsheet is archived.".write(
+            to: sourceDir.appendingPathComponent("budget.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "Quarterly roadmap says launch funding is due Friday.".write(
+            to: sourceDir.appendingPathComponent("roadmap.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let embedder = DeterministicKnowledgeBaseEmbedder { text in
+            text.contains("budget") || text.contains("roadmap")
+                ? [1, 0]
+                : [0, 1]
+        }
+        let store = KnowledgeBaseStore(database: db, embeddingProvider: embedder)
+        _ = try await store.addSource(kind: .document, path: sourceDir)
+        try await store.reindexAll()
+
+        let hits = try await store.search(query: "budget", limit: 10)
+
+        #expect(hits.map(\.relPath) == ["budget.txt", "roadmap.md"])
+    }
+
     @Test("removeSource deletes source metadata and indexed chunks")
     func removeSourceDeletesMetadataAndIndexedChunks() async throws {
         let (store, _, tmpDir) = try await makeStore()
@@ -155,5 +215,18 @@ struct KnowledgeBaseStoreTests {
 
         #expect(try await store.listSources().isEmpty)
         #expect(try await store.search(query: "roadmap", limit: 10).isEmpty)
+    }
+}
+
+private struct DeterministicKnowledgeBaseEmbedder: KnowledgeBaseEmbeddingProvider {
+    let modelIdentifier = "deterministic-test-embedder"
+    let embedText: @Sendable (String) -> [Float]
+
+    init(_ embedText: @escaping @Sendable (String) -> [Float]) {
+        self.embedText = embedText
+    }
+
+    func embed(_ text: String) async throws -> [Float] {
+        embedText(text)
     }
 }
