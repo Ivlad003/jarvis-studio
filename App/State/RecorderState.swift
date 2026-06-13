@@ -272,6 +272,22 @@ final class RecorderState {
             }
         }
 
+        if let estimated = RecordingStartWarningPolicy.streamingTranscriptionStartCostOverage(
+            provider: settings.transcriptionProvider,
+            costCapUSD: settings.costCapUSD
+        ) {
+            let proceed = await Self.confirmCostOverage(
+                kind: "Live transcription (first hour)",
+                estimated: estimated,
+                cap: settings.costCapUSD,
+                onIncrease: { [weak self] newCap in self?.settings.costCapUSD = newCap }
+            )
+            if !proceed {
+                status = .failed(message: "Live transcription cancelled — estimated first-hour streaming cost exceeded the cap.")
+                return
+            }
+        }
+
         // Pre-flight: Microphone permission. First call triggers the macOS prompt;
         // subsequent calls return cached status. On denial, surface a modal with a
         // direct link to System Settings → Privacy → Microphone.

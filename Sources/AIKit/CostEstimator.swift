@@ -87,6 +87,11 @@ public enum CostEstimator {
     /// Deepgram Nova-2 batch (`/v1/listen`). $0.0043 / minute as of 2026-04.
     public static let deepgram_nova_2_batch = TranscriptionPricing(perMinute: 0.0043)
 
+    /// Deepgram Nova-2 streaming uses the same per-minute listen pricing as
+    /// batch transcription. Kept separate so start-time streaming gates do not
+    /// accidentally depend on a post-stop batch label.
+    public static let deepgram_nova_2_streaming = TranscriptionPricing(perMinute: 0.0043)
+
     /// Estimate USD cost for transcribing `durationSec` of audio at the given
     /// per-minute rate.
     public static func estimateTranscription(durationSec: Double, pricing: TranscriptionPricing) -> Double {
