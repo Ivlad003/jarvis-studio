@@ -3,7 +3,14 @@ CONFIGURATION = Release
 DERIVED_DATA  = build
 APP_PATH      = $(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/$(SCHEME).app
 INSTALL_PATH  = /Applications/$(SCHEME).app
-CERT_HASH     = 700E6802C639969593A1AC7F57C1FBFA0A1C7762
+# Signing identity: auto-detect the first "Apple Development" cert in the
+# keychain; fall back to ad-hoc ("-") when none is present (e.g. a fresh dev
+# machine with no Apple ID configured). Override explicitly with:
+#   make install CERT_HASH=<hash>
+# Ad-hoc builds run locally but their signature changes each build, so TCC
+# permissions (mic, screen) must be re-granted after every reinstall.
+CERT_HASH    ?= $(shell security find-identity -v -p codesigning | awk '/Apple Development/ {print $$2; exit}')
+CERT_HASH    := $(if $(CERT_HASH),$(CERT_HASH),-)
 ENTITLEMENTS  = App/KosmoNotes.entitlements
 DEVELOPER_DIR = /Applications/Xcode.app/Contents/Developer
 
