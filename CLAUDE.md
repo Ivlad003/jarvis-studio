@@ -175,6 +175,17 @@ Other commands:
 
 **Permission check on startup:** `checkPermissionsOnStartup()` in `KosmoNotesApp.swift` runs on every launch. It uses `CGPreflightScreenCaptureAccess()` (reliable on macOS 15+/26) to check screen recording — shows an alert only when genuinely denied. Microphone access is requested at first record. **Do NOT use `SCShareableContent.excludingDesktopWindows` as a TCC probe** — on macOS 15+/26 it throws `-3801 userDeclined` even when permission IS granted (false positive confirmed).
 
+## Branching strategy
+
+**Trunk-based development.** `main` is the single long-lived trunk and is always
+releasable; all work integrates there via short-lived `feat/` · `fix/` · `chore/`
+(etc.) branches merged through PRs with green CI, squash/rebase to keep history
+linear. There is **no** `develop` / `master` / release branch — `develop` was
+fast-forward-merged into `main` and retired, along with all merged feature
+branches, on 2026-07-13. Releases are cut by tagging `main`, not by a release
+branch. Branch off `main` with short-lived `feat/`·`fix/`·`chore/` branches and
+merge back through PRs — don't push directly to `main`.
+
 ## Editing the design doc
 
 `docs/plans/2026-05-02-jarvis-note-design.md` is the spec, not a draft. Don't silently change decisions there to match implementation drift — if implementation diverges, that's a discussion, and the design doc gets a new dated revision rather than an in-place edit. The §15 Decision Log is load-bearing: it records what was settled and what would cause revisit.
