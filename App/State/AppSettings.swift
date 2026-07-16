@@ -54,10 +54,9 @@ final class AppSettings {
         // How the Dictation hotkey is delivered. JSON-encoded HotkeyTrigger
         // because the enum carries associated values (hold ms, etc) so a plain
         // raw-value can't round-trip it. Same JSON pattern for the parallel
-        // Push-to-Markdown and Agent triggers.
+        // Push-to-Markdown trigger.
         static let dictationTrigger = "dictationTrigger"
         static let pushToMarkdownTrigger = "pushToMarkdownTrigger"
-        static let agentTrigger = "agentTriggerKind"  // "agentTrigger" is a KeyboardShortcuts.Name; rename here to avoid collision
         // Optional double-tap-modifier shortcut for the Library window. Stored
         // as the raw string of DoubleTapModifier; empty / missing = disabled.
         // The combo `.openLibrary` (default ⌘⇧L) stays wired regardless.
@@ -96,20 +95,6 @@ final class AppSettings {
         // but result is saved as a .md file (using the markdownExport*
         // prompts above) instead of pasted into the focused field.
         static let pushToMarkdownEnabled = "pushToMarkdownEnabled"
-        // Autonomous agent — voice instruction → tool-using Claude loop.
-        static let agentEnabled = "agentEnabled"
-        static let agentSystemPrompt = "agentSystemPrompt"
-        static let agentMaxIterations = "agentMaxIterations"
-        static let agentWorkspaceFolder = "agentWorkspaceFolder"
-        // Backend selector — built-in Anthropic-API loop, or spawn an
-        // external CLI (Claude Code, Codex, GitHub Copilot).
-        static let agentBackend = "agentBackend"
-        // Claude model used by the *built-in* backend (Opus 4.7 / Sonnet 4.6
-        // / Haiku 4.5). External CLI backends pick their own model.
-        static let agentBuiltinModel = "agentBuiltinModel"
-        static let agentClaudeCodeBin = "agentClaudeCodeBin"
-        static let agentCodexBin = "agentCodexBin"
-        static let agentCopilotBin = "agentCopilotBin"
         // S3 sharing
         static let s3Endpoint = "s3Endpoint"
         static let s3Region = "s3Region"
@@ -238,52 +223,6 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(pushToMarkdownEnabled, forKey: Defaults.pushToMarkdownEnabled) }
     }
 
-    /// Autonomous agent toggle. When ON, the global hotkey
-    /// `KeyboardShortcuts.Name.agentTrigger` (default ⌘⇧A) is push-to-talk
-    /// for an agent loop: hold it, speak an instruction, release. Whisper
-    /// transcribes; AgentSessionState spawns a Claude tool-use loop with
-    /// bash/read_file/write_file tools restricted to the workspace folder.
-    var agentEnabled: Bool {
-        didSet { UserDefaults.standard.set(agentEnabled, forKey: Defaults.agentEnabled) }
-    }
-    /// System prompt the agent runs with. User-editable in Settings → Agent.
-    var agentSystemPrompt: String {
-        didSet { UserDefaults.standard.set(agentSystemPrompt, forKey: Defaults.agentSystemPrompt) }
-    }
-    /// Hard cap on agent loop iterations — runaway protection. Default 12.
-    /// Each iteration = one round-trip to Claude + zero or more tool runs.
-    var agentMaxIterations: Int {
-        didSet { UserDefaults.standard.set(agentMaxIterations, forKey: Defaults.agentMaxIterations) }
-    }
-    /// Workspace directory the agent's bash/read/write tools are restricted
-    /// to. Empty → `~/Documents/KosmoNotes-agent` (auto-created on first run).
-    var agentWorkspaceFolder: String {
-        didSet { UserDefaults.standard.set(agentWorkspaceFolder, forKey: Defaults.agentWorkspaceFolder) }
-    }
-    /// Which backend drives the agent loop. `.builtin` keeps the Anthropic-API
-    /// AgentRunner; the other three spawn an external CLI as a subprocess.
-    var agentBackend: AgentBackendChoice {
-        didSet { UserDefaults.standard.set(agentBackend.rawValue, forKey: Defaults.agentBackend) }
-    }
-
-    /// Claude model variant used by the *built-in* agent backend. External
-    /// CLI backends ignore this — they have their own model selection.
-    var agentBuiltinModel: AgentBuiltinModel {
-        didSet { UserDefaults.standard.set(agentBuiltinModel.rawValue, forKey: Defaults.agentBuiltinModel) }
-    }
-    /// Absolute path to the `claude` binary (Claude Code CLI). Empty = use $PATH lookup.
-    var agentClaudeCodeBin: String {
-        didSet { UserDefaults.standard.set(agentClaudeCodeBin, forKey: Defaults.agentClaudeCodeBin) }
-    }
-    /// Absolute path to the `codex` binary (OpenAI Codex CLI). Empty = $PATH lookup.
-    var agentCodexBin: String {
-        didSet { UserDefaults.standard.set(agentCodexBin, forKey: Defaults.agentCodexBin) }
-    }
-    /// Absolute path to the `gh` binary (GitHub CLI w/ Copilot extension). Empty = $PATH lookup.
-    var agentCopilotBin: String {
-        didSet { UserDefaults.standard.set(agentCopilotBin, forKey: Defaults.agentCopilotBin) }
-    }
-
     var transcriptionProvider: TranscriptionProviderChoice {
         didSet { UserDefaults.standard.set(transcriptionProvider.rawValue, forKey: Defaults.transcriptionProvider) }
     }
@@ -380,16 +319,6 @@ final class AppSettings {
         }
     }
 
-    /// Same shape as `dictationTrigger`, for the autonomous-agent hotkey.
-    var agentTrigger: HotkeyTrigger {
-        didSet {
-            if let data = try? JSONEncoder().encode(agentTrigger) {
-                UserDefaults.standard.set(data, forKey: Defaults.agentTrigger)
-            }
-            NotificationCenter.default.post(name: AppSettings.agentTriggerDidChange, object: nil)
-        }
-    }
-
     /// Optional double-tap-modifier shortcut for opening the Library window.
     /// `nil` = feature disabled; only the combo `.openLibrary` is active.
     /// Routed through `KeyTriggerEngine` (CGEventTap), so it needs Accessibility
@@ -410,7 +339,6 @@ final class AppSettings {
     /// subscribes and re-registers its hotkey without requiring an app relaunch.
     static let dictationTriggerDidChange      = Notification.Name("dev.kosmonotes.studio.dictationTriggerDidChange")
     static let pushToMarkdownTriggerDidChange = Notification.Name("dev.kosmonotes.studio.pushToMarkdownTriggerDidChange")
-    static let agentTriggerDidChange          = Notification.Name("dev.kosmonotes.studio.agentTriggerDidChange")
     static let libraryDoubleTapModifierDidChange = Notification.Name("dev.kosmonotes.studio.libraryDoubleTapModifierDidChange")
 
     /// Run the long-form meeting transcript through an LLM cleanup
@@ -574,19 +502,6 @@ final class AppSettings {
             ?? AppSettings.defaultMarkdownExportUserPrompt
         self.pushToMarkdownEnabled = (UserDefaults.standard.object(forKey: Defaults.pushToMarkdownEnabled) as? Bool) ?? false
 
-        self.agentEnabled = (UserDefaults.standard.object(forKey: Defaults.agentEnabled) as? Bool) ?? false
-        self.agentSystemPrompt = UserDefaults.standard.string(forKey: Defaults.agentSystemPrompt) ?? AppSettings.defaultAgentSystemPrompt
-        let savedIters = UserDefaults.standard.integer(forKey: Defaults.agentMaxIterations)
-        self.agentMaxIterations = savedIters > 0 ? savedIters : 12
-        self.agentWorkspaceFolder = UserDefaults.standard.string(forKey: Defaults.agentWorkspaceFolder) ?? ""
-        let backendRaw = UserDefaults.standard.string(forKey: Defaults.agentBackend) ?? AgentBackendChoice.builtin.rawValue
-        self.agentBackend = AgentBackendChoice(rawValue: backendRaw) ?? .builtin
-        let modelRaw = UserDefaults.standard.string(forKey: Defaults.agentBuiltinModel) ?? AgentBuiltinModel.sonnet46.rawValue
-        self.agentBuiltinModel = AgentBuiltinModel(rawValue: modelRaw) ?? .sonnet46
-        self.agentClaudeCodeBin = UserDefaults.standard.string(forKey: Defaults.agentClaudeCodeBin) ?? ""
-        self.agentCodexBin = UserDefaults.standard.string(forKey: Defaults.agentCodexBin) ?? ""
-        self.agentCopilotBin = UserDefaults.standard.string(forKey: Defaults.agentCopilotBin) ?? ""
-
         let llmRaw = UserDefaults.standard.string(forKey: Defaults.llmProvider) ?? LLMProviderChoice.anthropic.rawValue
         self.llmProvider = LLMProviderChoice(rawValue: llmRaw) ?? .anthropic
 
@@ -642,12 +557,11 @@ final class AppSettings {
         let maxSecs = UserDefaults.standard.integer(forKey: Defaults.dictationMaxSeconds)
         self.dictationMaxSeconds = maxSecs > 0 ? maxSecs : 60
 
-        // dictationTrigger / pushToMarkdownTrigger / agentTrigger: each is a
-        // JSON blob in UserDefaults; .combo if absent or corrupt so existing
-        // installs see no behaviour change at upgrade.
+        // dictationTrigger / pushToMarkdownTrigger: each is a JSON blob in
+        // UserDefaults; .combo if absent or corrupt so existing installs see
+        // no behaviour change at upgrade.
         self.dictationTrigger = AppSettings.loadTrigger(forKey: Defaults.dictationTrigger)
         self.pushToMarkdownTrigger = AppSettings.loadTrigger(forKey: Defaults.pushToMarkdownTrigger)
-        self.agentTrigger = AppSettings.loadTrigger(forKey: Defaults.agentTrigger)
 
         // libraryDoubleTapModifier: optional rawValue string in UserDefaults.
         if let raw = UserDefaults.standard.string(forKey: Defaults.libraryDoubleTapModifier) {
@@ -845,7 +759,6 @@ final class AppSettings {
             "summaryLanguage=\(summaryLanguage)",
             "markdownExportEnabled=\(markdownExportEnabled)",
             "pushToMarkdownEnabled=\(pushToMarkdownEnabled)",
-            "agentEnabled=\(agentEnabled) agentBackend=\(agentBackend.rawValue) agentBuiltinModel=\(agentBuiltinModel.rawValue)",
             "cameraBubbleEnabled=\(cameraBubbleEnabled)",
             "s3Configured=\(!s3Endpoint.isEmpty && !s3Bucket.isEmpty && !s3AccessKey.isEmpty)",
             "openaiKeySet=\(!openaiApiKey.isEmpty)",

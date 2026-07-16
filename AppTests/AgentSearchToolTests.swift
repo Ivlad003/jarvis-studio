@@ -90,30 +90,6 @@ struct AgentSearchToolTests {
         #expect(result.attachments == [.image(jpegData: jpeg, mimeType: "image/jpeg")])
     }
 
-    @Test("builtin agent tool registry includes live transcript search when a provider is available")
-    func builtinToolRegistryIncludesLiveTranscriptSearchWhenProviderAvailable() async throws {
-        let workspace = try makeTempDir()
-        defer { try? FileManager.default.removeItem(at: workspace) }
-        let db = try AppDatabase(path: workspace.appendingPathComponent("sessions.sqlite"))
-        try await db.migrate()
-
-        let tools = await AgentToolRegistry.makeBuiltinTools(
-            workspace: workspace,
-            database: db,
-            knowledgeBaseStore: nil,
-            liveTranscriptProvider: { .empty },
-            screenFrameSourceProvider: {
-                ScreenFrameSource(
-                    sessionId: "active-session-12345678",
-                    videoURL: workspace.appendingPathComponent("screen.mp4")
-                )
-            }
-        )
-
-        #expect(tools.map(\.name).contains("search_transcripts"))
-        #expect(tools.map(\.name).contains("search_live_transcript"))
-        #expect(tools.map(\.name).contains("get_screen_frame"))
-    }
 
     @Test("search_knowledge_base returns formatted KB hits")
     func searchKnowledgeBaseReturnsFormattedHits() async throws {

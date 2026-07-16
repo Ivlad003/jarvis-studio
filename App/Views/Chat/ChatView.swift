@@ -92,23 +92,6 @@ struct ChatView: View {
 
             Spacer(minLength: 8)
 
-            Button {
-                Task { await chat.runAsAgent() }
-            } label: {
-                if chat.isLaunchingAgent {
-                    ProgressView()
-                        .scaleEffect(0.6)
-                        .progressViewStyle(.circular)
-                        .frame(width: 18, height: 18)
-                } else {
-                    Label("Run as agent", systemImage: "wand.and.stars")
-                        .labelStyle(.iconOnly)
-                }
-            }
-            .buttonStyle(.borderless)
-            .help(chat.runAsAgentDisabledReason ?? "Hand the current message + attached sessions off to the autonomous agent (opens Agent Console)")
-            .disabled(!chat.canRunAsAgent)
-
             Button(action: { Task { await chat.clear() } }) {
                 Label("Clear", systemImage: "trash")
                     .labelStyle(.iconOnly)

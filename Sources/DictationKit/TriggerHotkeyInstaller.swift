@@ -24,8 +24,8 @@ public final class TriggerHotkeyInstaller {
     // MARK: Configuration
 
     /// `KeyboardShortcuts.Name` to use for the legacy combo path. Each consumer
-    /// should pass a distinct name (e.g. `.dictation`, `.pushToMarkdown`,
-    /// `.agentTrigger`) so the user can rebind them independently.
+    /// should pass a distinct name (e.g. `.dictation`, `.pushToMarkdown`) so the
+    /// user can rebind them independently.
     private let comboName: KeyboardShortcuts.Name
     /// Tag for log messages so a missing-AX failure points at the right feature.
     private let label: String

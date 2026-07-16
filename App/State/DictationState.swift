@@ -141,7 +141,7 @@ final class DictationState {
 
         // Zero-frame mic-flow protection lives inside DictationPipeline
         // (pipeline-internal 5 s watchdog → status = .failed), so
-        // PushToMarkdownState and AgentHotkeyState get it for free.
+        // PushToMarkdownState gets it for free.
         // handleRelease surfaces that .failed status to the user.
 
         // Wire a live adapter if the current transcription provider supports it.

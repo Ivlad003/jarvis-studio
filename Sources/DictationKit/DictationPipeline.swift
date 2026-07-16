@@ -132,9 +132,9 @@ public final class DictationPipeline {
 
     private var engineBox: EngineBox? = nil
     /// 5-second zero-frame watchdog. Lives inside the pipeline rather than
-    /// at the call site so every caller (DictationState, PushToMarkdownState,
-    /// AgentHotkeyState) fails loudly instead of silently pasting an empty
-    /// transcript when the mic engine never delivers a frame.
+    /// at the call site so every caller (DictationState, PushToMarkdownState)
+    /// fails loudly instead of silently pasting an empty transcript when the
+    /// mic engine never delivers a frame.
     private var watchdogTask: Task<Void, Never>? = nil
 
     /// The URL of the live CAF audio file being written during the current
@@ -183,9 +183,9 @@ public final class DictationPipeline {
 
     /// Initializer that injects custom transcription / paste shims. Originally
     /// test-only (internal), now public so app-layer features like
-    /// PushToMarkdownState and AgentHotkeyState can swap the paste step for
-    /// their own sinks (save .md, launch agent, etc.) while reusing the
-    /// dictation capture + transcribe + cleanup flow unchanged.
+    /// PushToMarkdownState can swap the paste step for their own sinks
+    /// (e.g. save .md) while reusing the dictation capture + transcribe +
+    /// cleanup flow unchanged.
     public init(
         transcriber: @escaping Transcriber,
         paster: @escaping Paster,
@@ -254,9 +254,8 @@ public final class DictationPipeline {
         // shared mic-flow watchdog. If the engine delivers
         // zero frames in the first 5 s, abort loudly so the user sees an
         // error instead of having the eventual paste land an empty string.
-        // Lives inside the pipeline so PushToMarkdownState and
-        // AgentHotkeyState — neither of which installed their own watchdog
-        // historically — get the protection for free.
+        // Lives inside the pipeline so PushToMarkdownState — which did not
+        // install its own watchdog historically — gets the protection for free.
         watchdogTask?.cancel()
         let pipelineRef = self
         let boxRef = box

@@ -39,9 +39,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var chatHolder: AnyObject?           // ChatState (macOS 14+)
     private var dictationHolder: AnyObject?      // DictationState (macOS 14+)
     private var pushToMarkdownHolder: AnyObject? // PushToMarkdownState (macOS 14+)
-    private var agentSessionHolder: AnyObject?   // AgentSessionState (macOS 14+)
-    private var agentHotkeyHolder: AnyObject?    // AgentHotkeyState (macOS 14+)
-    private var agentConsoleHolder: AnyObject?   // AgentConsoleWindowController (macOS 14+)
     private var startupScreenRecordingWarning: String?
 
     private static var isRunningUnderXCTest: Bool {
@@ -93,8 +90,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Ignore SIGPIPE so that writing to a closed child-process stdin
-        // (ExternalAgentRunner, BashTool) raises EPIPE in the throwing
+        // Ignore SIGPIPE so that any child-process pipe I/O (e.g. the code
+        // search tool's `rg` subprocess) raises EPIPE in the throwing
         // FileHandle API instead of killing our host process. Default macOS
         // behaviour for SIGPIPE is to terminate.
         signal(SIGPIPE, SIG_IGN)
@@ -450,12 +447,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         chatItem.target = self
         menu.addItem(chatItem)
 
-        let agentItem = NSMenuItem(title: "Agent Console…",
-                                   action: #selector(openAgentConsole),
-                                   keyEquivalent: "")
-        agentItem.target = self
-        menu.addItem(agentItem)
-
         menu.addItem(.separator())
 
         let settingsItem = NSMenuItem(title: "Settings…",
@@ -581,42 +572,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             p2md.install()
             self.pushToMarkdownHolder = p2md
 
-            // Autonomous agent: voice instruction → tool-using Claude loop
-            // restricted to the workspace folder. Hotkey installs even when
-            // disabled (it bails inside handlePress on the toggle), so a
-            // future enable doesn't require relaunch.
+            // Knowledge base: user-attached documents + code folders the chat
+            // assistant can search. Shared with the ChatState built below.
             let knowledgeBaseStore = KnowledgeBaseStore(
                 database: database,
                 embeddingProvider: AppSettingsKnowledgeBaseEmbeddingProvider(settings: settings)
             )
             self.knowledgeBaseStoreHolder = knowledgeBaseStore
-
-            let agentSession = AgentSessionState(
-                settings: settings,
-                database: database,
-                knowledgeBaseStore: knowledgeBaseStore,
-                liveTranscriptProvider: { [weak recorder] in
-                    guard let recorder else { return nil }
-                    return await recorder.liveTranscriptSnapshot()
-                },
-                screenFrameSourceProvider: { [weak recorder] in
-                    guard let recorder,
-                          case .recording(let sessionId) = recorder.status else { return nil }
-                    let dir = await sessionStore.sessionDir(for: sessionId)
-                    return ScreenFrameSource(
-                        sessionId: sessionId,
-                        videoURL: dir.appendingPathComponent("screen.mp4")
-                    )
-                }
-            )
-            self.agentSessionHolder = agentSession
-            let agentHotkey = AgentHotkeyState(
-                settings: settings,
-                agentSession: agentSession,
-                recorder: recorder
-            )
-            agentHotkey.install()
-            self.agentHotkeyHolder = agentHotkey
 
             // Force a menu refresh so any stale "Recording requires macOS 14+"
             // labels flip to the real recorder-ready titles.
@@ -830,20 +792,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    @objc private func openAgentConsole() {
-        guard #available(macOS 14.0, *) else { return }
-        guard let session = agentSessionHolder as? AgentSessionState else { return }
-        let controller: AgentConsoleWindowController
-        if let existing = agentConsoleHolder as? AgentConsoleWindowController {
-            controller = existing
-        } else {
-            controller = AgentConsoleWindowController()
-            agentConsoleHolder = controller
-        }
-        controller.open(session: session, windowDelegate: self)
-    }
-
-    @MainActor
     @objc private func openChat() {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -874,10 +822,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sessionStore: sessionStore,
             recorder: recorder,
             knowledgeBaseStore: knowledgeBaseStoreHolder as? KnowledgeBaseStore,
-            agentSession: agentSessionHolder as? AgentSessionState,
-            onOpenAgentConsole: { [weak self] in
-                self?.openAgentConsole()
-            },
             liveContextProvider: { [weak recorder] in
                 guard let recorder else { return nil }
                 return await recorder.liveTranscriptSnapshot()
@@ -1121,10 +1065,6 @@ extension AppDelegate: NSWindowDelegate {
         case "chat":
             chatWindow = nil
             chatHolder = nil
-        case "agentConsole":
-            if #available(macOS 14.0, *) {
-                (agentConsoleHolder as? AgentConsoleWindowController)?.didClose()
-            }
         default:
             break
         }
@@ -1144,18 +1084,10 @@ extension AppDelegate: NSWindowDelegate {
             }
             return false
         }()
-        let agentConsoleVisible: Bool = {
-            if #available(macOS 14.0, *),
-               let controller = agentConsoleHolder as? AgentConsoleWindowController {
-                return controller.isVisible
-            }
-            return false
-        }()
         let anyVisible = settingsWindow != nil
             || onboardingWindow != nil
             || chatWindow != nil
             || libraryVisible
-            || agentConsoleVisible
         if !anyVisible {
             NSApp.setActivationPolicy(.accessory)
         }

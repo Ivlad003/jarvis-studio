@@ -100,58 +100,6 @@ extension AppSettings {
         }
     }
 
-    /// Which backend drives the autonomous agent loop:
-    ///   - `builtin`     → in-process Anthropic Messages API loop with bash/read/write tools (AgentRunner)
-    ///   - `claudeCode`  → spawn `claude -p "<instruction>" --output-format stream-json --verbose` and stream stdout
-    ///   - `codex`       → spawn `codex exec "<instruction>"` and stream stdout
-    ///   - `copilot`     → spawn `gh copilot suggest -t shell "<instruction>"` (one-shot, no streaming loop)
-    ///
-    /// External CLIs run in the agent workspace folder as cwd; their own auth
-    /// (claude.ai login, ChatGPT subscription, GitHub auth) is reused as-is.
-    enum AgentBackendChoice: String, CaseIterable, Identifiable {
-        case builtin
-        case claudeCode
-        case codex
-        case copilot
-
-        var id: String { rawValue }
-        var displayName: String {
-            switch self {
-            case .builtin:    return "Built-in (Anthropic API)"
-            case .claudeCode: return "Claude Code CLI"
-            case .codex:      return "Codex CLI"
-            case .copilot:    return "GitHub Copilot CLI"
-            }
-        }
-    }
-
-    /// Anthropic Claude model the *built-in* backend uses for the agent loop.
-    /// External CLI backends pick their own model out-of-band (`claude` /
-    /// `codex` / `gh copilot` honour their own config), so this only applies
-    /// when `agentBackend == .builtin`.
-    ///
-    /// Defaults to Sonnet 4.6 — the current speed/cost/quality sweet spot for
-    /// tool-using loops. Bump to Opus 4.7 for hard tasks; drop to Haiku 4.5
-    /// for cheap exploratory runs.
-    enum AgentBuiltinModel: String, CaseIterable, Identifiable {
-        case opus47   = "claude-opus-4-7"
-        case opus46   = "claude-opus-4-6"
-        case sonnet46 = "claude-sonnet-4-6"
-        case sonnet45 = "claude-sonnet-4-5"
-        case haiku45  = "claude-haiku-4-5"
-
-        var id: String { rawValue }
-        var displayName: String {
-            switch self {
-            case .opus47:   return "Claude Opus 4.7 (highest quality, slowest, most expensive)"
-            case .opus46:   return "Claude Opus 4.6 (previous opus — supports faster Fast Mode)"
-            case .sonnet46: return "Claude Sonnet 4.6 (balanced — default)"
-            case .sonnet45: return "Claude Sonnet 4.5 (previous sonnet — cheaper alternative)"
-            case .haiku45:  return "Claude Haiku 4.5 (fastest, cheapest, smaller context)"
-            }
-        }
-    }
-
     enum RecordingMode: String, CaseIterable, Identifiable {
         case audioOnly
         case audioAndScreen

@@ -59,9 +59,6 @@ struct SettingsView: View {
             MarkdownExportTab(settings: settings)
                 .tabItem { Label("Markdown", systemImage: "doc.text") }
 
-            AgentTab(settings: settings)
-                .tabItem { Label("Agent", systemImage: "wand.and.rays") }
-
             KnowledgeBaseTab(store: knowledgeBaseStore)
                 .tabItem { Label("Knowledge", systemImage: "books.vertical") }
 
@@ -146,7 +143,7 @@ private struct KnowledgeBaseTab: View {
             }
 
             Section("Indexing") {
-                Text("Documents can be Markdown, text, or PDF files. Code folders are indexed with identifier-safe full-text search and are also available to the agent's code search tool.")
+                Text("Documents can be Markdown, text, or PDF files. Code folders are indexed with identifier-safe full-text search and are also available to the assistant's code search tool.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -811,7 +808,7 @@ private struct DictationTab: View {
 // MARK: - TriggerPickerSection (reusable)
 
 /// One Form Section that surfaces the configurable HotkeyTrigger for any
-/// press/hold/release feature (Dictation, Push-to-Markdown, Agent). The
+/// press/hold/release feature (Dictation, Push-to-Markdown). The
 /// .doubleTapModifier variant is intentionally hidden from the picker —
 /// none of the consumers support it (they all need a release event), and
 /// TriggerHotkeyInstaller falls back to .combo at install time if a stale
@@ -954,7 +951,6 @@ private struct HotkeysTab: View {
                 KeyboardShortcuts.Recorder("Open Library", name: .openLibrary)
                 KeyboardShortcuts.Recorder("Dictation (push-to-talk)", name: .dictation)
                 KeyboardShortcuts.Recorder("Push-to-Markdown (hold + speak → save .md)", name: .pushToMarkdown)
-                KeyboardShortcuts.Recorder("Agent (hold + speak → autonomous agent)", name: .agentTrigger)
                 KeyboardShortcuts.Recorder("Drawing overlay (toggle)", name: .toggleAnnotation)
             }
 
@@ -1491,173 +1487,6 @@ private extension AudioInputDevice {
     /// touching the enumerator directly.
     static func fresh() -> [AudioInputDevice] {
         AudioDeviceEnumerator.inputDevices()
-    }
-}
-
-// MARK: - AgentTab
-
-/// Settings for the autonomous voice-driven agent. Toggle, hotkey rebind
-/// hint, workspace folder picker, max-iterations cap, and a TextEditor for
-/// the system prompt.
-@available(macOS 14.0, *)
-private struct AgentTab: View {
-    @Bindable var settings: AppSettings
-
-    var body: some View {
-        Form {
-            Section("Autonomous agent") {
-                Toggle("Enable agent hotkey", isOn: $settings.agentEnabled)
-                Text("Hold the hotkey, speak an instruction, release. Whisper transcribes; the chosen backend runs an autonomous loop. Open the console (menu → Agent Console…) to watch the live log and inject extra instructions mid-run.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            TriggerPickerSection(
-                title: "Agent trigger",
-                description: "How the autonomous-agent hotkey fires.",
-                trigger: $settings.agentTrigger,
-                comboName: .agentTrigger,
-                comboHint: "Default: ⌘⇧A. Click the recorder to rebind."
-            )
-
-            Section("Backend") {
-                Picker("Driver", selection: $settings.agentBackend) {
-                    ForEach(AppSettings.AgentBackendChoice.allCases) { choice in
-                        Text(choice.displayName).tag(choice)
-                    }
-                }
-                .pickerStyle(.menu)
-
-                switch settings.agentBackend {
-                case .builtin:
-                    Picker("Model", selection: $settings.agentBuiltinModel) {
-                        ForEach(AppSettings.AgentBuiltinModel.allCases) { choice in
-                            Text(choice.displayName).tag(choice)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    Text("In-process Anthropic Messages API loop with bash / read_file / write_file tools sandboxed to the workspace folder. Uses your Anthropic API key. Sonnet 4.6 is the recommended default; Opus 4.7 is slower/more expensive but tackles harder reasoning; Haiku 4.5 is the cheapest for exploratory runs.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .claudeCode:
-                    HStack {
-                        TextField("`claude` binary path", text: $settings.agentClaudeCodeBin, prompt: Text("auto-detect (Homebrew / npm-global / $PATH)"))
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.callout, design: .monospaced))
-                        Button("Choose…") { pickBinary { settings.agentClaudeCodeBin = $0 } }
-                    }
-                    Text("Spawns `claude --print --output-format stream-json --verbose <instruction>` in the workspace folder. Reuses your existing claude.ai login — no API key needed here. Install with `npm install -g @anthropic-ai/claude-code` if missing.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .codex:
-                    HStack {
-                        TextField("`codex` binary path", text: $settings.agentCodexBin, prompt: Text("auto-detect (Homebrew / npm-global / $PATH)"))
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.callout, design: .monospaced))
-                        Button("Choose…") { pickBinary { settings.agentCodexBin = $0 } }
-                    }
-                    Text("Spawns `codex exec <instruction>` in the workspace folder. Uses your ChatGPT subscription / API key as configured in the Codex CLI. Install with `npm install -g @openai/codex` if missing.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .copilot:
-                    HStack {
-                        TextField("`gh` binary path", text: $settings.agentCopilotBin, prompt: Text("auto-detect (Homebrew / $PATH)"))
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.callout, design: .monospaced))
-                        Button("Choose…") { pickBinary { settings.agentCopilotBin = $0 } }
-                    }
-                    Text("Spawns `gh copilot suggest -t shell <question>`. Requires `gh auth login` and `gh extension install github/gh-copilot`. One-shot — mid-session injection is not supported here.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section("Workspace folder") {
-                HStack(alignment: .top) {
-                    TextField("Path", text: $settings.agentWorkspaceFolder, prompt: Text("~/Documents/KosmoNotes-agent (default)"))
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.callout, design: .monospaced))
-                    Button("Choose…") { pickWorkspaceFolder() }
-                }
-                Text("All bash / read_file / write_file calls are sandboxed inside this directory. Path traversal (../etc/passwd) is rejected. Empty = use the default `~/Documents/KosmoNotes-agent` (created on first run).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Iteration cap") {
-                Stepper(value: $settings.agentMaxIterations, in: 3...30, step: 1) {
-                    Text("Max iterations: \(settings.agentMaxIterations)")
-                }
-                Text("Each iteration = one round-trip to Claude + zero or more tool runs. Hitting the cap stops the agent automatically (runaway protection).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("System prompt") {
-                TextEditor(text: $settings.agentSystemPrompt)
-                    .font(.system(.callout, design: .monospaced))
-                    .frame(minHeight: 200)
-                    .border(Color(NSColor.separatorColor), width: 1)
-                HStack {
-                    Text("Sent as Claude's `system` message every iteration. The workspace path + macOS version are appended automatically at run time.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Reset to default") {
-                        settings.agentSystemPrompt = AppSettings.defaultAgentSystemPrompt
-                    }
-                    .buttonStyle(.borderless)
-                    .controlSize(.small)
-                }
-            }
-
-            Section("Session logs") {
-                let logsDir = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false))?
-                    .appendingPathComponent("KosmoNotes/agent-sessions").path
-                    ?? "~/Library/Application Support/KosmoNotes/agent-sessions"
-                Text("Each session writes a JSONL log to:")
-                    .font(.caption)
-                Text(logsDir)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                Button("Open logs folder") {
-                    if let url = URL(string: "file://" + logsDir) {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-            }
-        }
-        .formStyle(.grouped)
-    }
-
-    private func pickWorkspaceFolder() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        panel.title = "Pick the agent workspace folder"
-        if panel.runModal() == .OK, let url = panel.url {
-            settings.agentWorkspaceFolder = url.path
-        }
-    }
-
-    /// File-picker for absolute CLI binary paths (claude / codex / gh).
-    /// Permits any executable; the runner verifies `isExecutableFile` at spawn.
-    private func pickBinary(_ commit: (String) -> Void) {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.treatsFilePackagesAsDirectories = true
-        panel.showsHiddenFiles = true
-        panel.prompt = "Use binary"
-        panel.title = "Pick the CLI binary"
-        if panel.runModal() == .OK, let url = panel.url {
-            commit(url.path)
-        }
     }
 }
 
