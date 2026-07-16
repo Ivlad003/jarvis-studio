@@ -148,33 +148,76 @@ final class ShareCoordinator {
         alert.messageText = "Session shared"
         alert.alertStyle = .informational
 
-        var lines: [String] = []
-        if let u = result.audioURL { lines.append("Audio: \(u.absoluteString)") }
-        if let u = result.videoURL { lines.append("Video: \(u.absoluteString)") }
-        if let u = result.summaryURL { lines.append("Summary: \(u.absoluteString)") }
-        if let u = result.transcriptURL { lines.append("Transcript: \(u.absoluteString)") }
+        // Ordered (label, url) pairs for whatever was actually uploaded. Short,
+        // human labels — the raw presigned URLs stay off-screen so the modal
+        // isn't a wall of query-string noise.
+        let rows: [(label: String, url: URL)] = [
+            ("Audio", result.audioURL),
+            ("Screen recording", result.videoURL),
+            ("Summary", result.summaryURL),
+            ("Transcript", result.transcriptURL),
+        ].compactMap { label, url in url.map { (label, $0) } }
 
-        alert.informativeText = lines.isEmpty
-            ? "No artifacts uploaded — the session folder was empty."
-            : lines.joined(separator: "\n\n")
-
-        if let primary = result.audioURL ?? result.videoURL ?? result.summaryURL ?? result.transcriptURL {
-            alert.addButton(withTitle: "Copy primary link")
-            alert.addButton(withTitle: "Copy all")
-            alert.addButton(withTitle: "Done")
-
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:
-                copyToPasteboard(primary.absoluteString)
-            case .alertSecondButtonReturn:
-                copyToPasteboard(result.allLinks.map(\.absoluteString).joined(separator: "\n"))
-            default:
-                break
-            }
-        } else {
+        guard !rows.isEmpty else {
+            alert.informativeText = "No artifacts uploaded — the session folder was empty."
             alert.addButton(withTitle: "OK")
             alert.runModal()
+            return
         }
+
+        alert.informativeText = "Each link is a presigned URL. Copy the ones you need — recipients open them in a browser."
+        alert.accessoryView = makeCopyRows(rows)
+
+        alert.addButton(withTitle: "Copy all")
+        alert.addButton(withTitle: "Done")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            copyToPasteboard(rows.map(\.url.absoluteString).joined(separator: "\n"))
+        }
+    }
+
+    /// One row per artifact: a label on the left and a dedicated "Copy link"
+    /// button on the right that puts just that URL on the pasteboard. Handlers
+    /// are retained by the returned view for the lifetime of the modal.
+    private func makeCopyRows(_ rows: [(label: String, url: URL)]) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        var handlers: [CopyLinkHandler] = []
+        for row in rows {
+            let handler = CopyLinkHandler(urlString: row.url.absoluteString)
+            handlers.append(handler)
+
+            let label = NSTextField(labelWithString: row.label)
+            label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+            let button = NSButton(title: "Copy link", target: handler, action: #selector(CopyLinkHandler.copy(_:)))
+            button.bezelStyle = .rounded
+            button.setContentHuggingPriority(.required, for: .horizontal)
+
+            let rowStack = NSStackView(views: [label, button])
+            rowStack.orientation = .horizontal
+            rowStack.spacing = 12
+            rowStack.alignment = .firstBaseline
+            rowStack.distribution = .fill
+            stack.addArrangedSubview(rowStack)
+            rowStack.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        let container = CopyRowsContainer(handlers: handlers)
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: 320),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        return container
     }
 
     private func copyToPasteboard(_ text: String) {
@@ -189,5 +232,51 @@ final class ShareCoordinator {
         a.informativeText = message
         a.alertStyle = .warning
         a.runModal()
+    }
+}
+
+// MARK: - Copy-link plumbing
+
+/// Target for a single artifact's "Copy link" button. Copies its URL and
+/// flashes "Copied ✓" briefly so the click is confirmed.
+@available(macOS 14.0, *)
+@MainActor
+private final class CopyLinkHandler: NSObject {
+    private let urlString: String
+
+    init(urlString: String) {
+        self.urlString = urlString
+    }
+
+    @objc func copy(_ sender: NSButton) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(urlString, forType: .string)
+
+        let original = sender.title
+        sender.title = "Copied ✓"
+        sender.isEnabled = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            sender.title = original
+            sender.isEnabled = true
+        }
+    }
+}
+
+/// Retains the per-row copy handlers for the lifetime of the modal — NSButton's
+/// `target` is a weak reference, so without this the handlers would deallocate
+/// immediately and clicks would do nothing.
+@available(macOS 14.0, *)
+private final class CopyRowsContainer: NSView {
+    private let handlers: [CopyLinkHandler]
+
+    init(handlers: [CopyLinkHandler]) {
+        self.handlers = handlers
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 }
