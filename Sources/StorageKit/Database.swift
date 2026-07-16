@@ -6,14 +6,16 @@ import GRDB
 public enum SessionMode: String, Sendable, Codable, Equatable {
     case meeting
     case dictation
-    case voiceNote
+    // NOTE: `voiceNote` was removed in 2026-07-14. Sessions recorded before then
+    // were persisted with mode "voiceNote"; both read paths (the session.json
+    // decoder in `SessionRecord.init(from:)` and `rowToSession`) map that legacy
+    // value to `.meeting` so historical recordings still open.
 
     /// Human-friendly display name for UI.
     public var displayName: String {
         switch self {
         case .meeting: return "Meeting"
         case .dictation: return "Dictation"
-        case .voiceNote: return "Voice Note"
         }
     }
 
@@ -22,7 +24,6 @@ public enum SessionMode: String, Sendable, Codable, Equatable {
         switch self {
         case .meeting: return "person.2"
         case .dictation: return "keyboard"
-        case .voiceNote: return "note.text"
         }
     }
 }
@@ -86,7 +87,13 @@ public struct SessionRecord: Sendable, Codable, Equatable {
         self.id = try c.decode(String.self, forKey: .id)
         self.recordedAt = try c.decode(Date.self, forKey: .recordedAt)
         self.durationSecs = try c.decode(TimeInterval.self, forKey: .durationSecs)
-        self.mode = try c.decode(SessionMode.self, forKey: .mode)
+        // Legacy compatibility: sessions recorded before Voice Note Mode was
+        // removed (2026-07-14) were persisted with mode "voiceNote". Decode the
+        // raw string and map any unknown/legacy value to `.meeting` so historical
+        // sidecars still load (sidecars are the source of truth). Mirrors the
+        // `?? .meeting` fallback in `rowToSession`.
+        let modeRaw = try c.decode(String.self, forKey: .mode)
+        self.mode = SessionMode(rawValue: modeRaw) ?? .meeting
         self.language = try c.decodeIfPresent(String.self, forKey: .language)
         self.status = try c.decode(SessionStatus.self, forKey: .status)
         self.enhancementStatus = try c.decodeIfPresent(SessionEnhancementStatus.self, forKey: .enhancementStatus) ?? .ok

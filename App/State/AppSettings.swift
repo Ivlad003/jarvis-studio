@@ -47,7 +47,7 @@ final class AppSettings {
         //   - clipboardOnly (no auto-paste; user pastes manually)
         // Stored as the rawValue of `DictationInsertionStrategy`.
         static let dictationInsertion = "dictationInsertion"
-        // Whether to run the meeting/voice-note transcript through an LLM cleanup
+        // Whether to run the meeting transcript through an LLM cleanup
         // pass after Whisper/Deepgram. Reuses the configured llmProvider; default ON.
         static let transcriptCleanupEnabled = "transcriptCleanupEnabled"
         static let dictationMaxSeconds = "dictationMaxSeconds"
@@ -62,7 +62,6 @@ final class AppSettings {
         // as the raw string of DoubleTapModifier; empty / missing = disabled.
         // The combo `.openLibrary` (default ⌘⇧L) stays wired regardless.
         static let libraryDoubleTapModifier = "libraryDoubleTapModifier"
-        static let voiceNoteKind = "voiceNoteKind"
         static let openrouterModel = "openrouterModel"
         static let semanticSearchEnabled = "semanticSearchEnabled"
         // Per-process Core Audio Tap source (14.4+ only). When false (or on <14.4),
@@ -414,7 +413,7 @@ final class AppSettings {
     static let agentTriggerDidChange          = Notification.Name("dev.kosmonotes.studio.agentTriggerDidChange")
     static let libraryDoubleTapModifierDidChange = Notification.Name("dev.kosmonotes.studio.libraryDoubleTapModifierDidChange")
 
-    /// Run the long-form meeting / voice-note transcript through an LLM cleanup
+    /// Run the long-form meeting transcript through an LLM cleanup
     /// pass after Whisper / Deepgram / Gemini transcribes. Reuses the configured
     /// `llmProvider`. On = ASR mistakes (numbers, names, double-words, missing
     /// punctuation) corrected; speaker voice and timing preserved. Off = raw
@@ -422,11 +421,6 @@ final class AppSettings {
     /// recording. Cleanup failures are non-fatal — raw transcript is kept.
     var transcriptCleanupEnabled: Bool {
         didSet { UserDefaults.standard.set(transcriptCleanupEnabled, forKey: Defaults.transcriptCleanupEnabled) }
-    }
-
-    /// Default Voice Note kind. The user can override per session.
-    var voiceNoteKind: PromptTemplates.VoiceNoteKind {
-        didSet { UserDefaults.standard.set(voiceNoteKind.rawValue, forKey: Defaults.voiceNoteKind) }
     }
 
     /// Default OpenRouter model. Free-text — OpenRouter accepts vendor/model strings like
@@ -661,9 +655,6 @@ final class AppSettings {
         } else {
             self.libraryDoubleTapModifier = nil
         }
-
-        let kindRaw = UserDefaults.standard.string(forKey: Defaults.voiceNoteKind) ?? PromptTemplates.VoiceNoteKind.freeform.rawValue
-        self.voiceNoteKind = PromptTemplates.VoiceNoteKind(rawValue: kindRaw) ?? .freeform
 
         self.openrouterModel = UserDefaults.standard.string(forKey: Defaults.openrouterModel) ?? "anthropic/claude-3.5-sonnet"
         self.semanticSearchEnabled = UserDefaults.standard.bool(forKey: Defaults.semanticSearchEnabled)

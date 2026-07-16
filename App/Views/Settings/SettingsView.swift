@@ -50,9 +50,6 @@ struct SettingsView: View {
             DictationTab(settings: settings)
                 .tabItem { Label("Dictation", systemImage: "keyboard") }
 
-            VoiceNoteTab(settings: settings)
-                .tabItem { Label("Voice Note", systemImage: "note.text") }
-
             HotkeysTab(settings: settings)
                 .tabItem { Label("Hotkeys", systemImage: "command") }
 
@@ -76,9 +73,9 @@ struct SettingsView: View {
         }
         .padding(20)
         // Tab labels were getting truncated on the default 520pt width
-        // because we now have 8 tabs (Transcription / AI Providers /
-        // Dictation / Voice Note / Hotkeys / Sharing / Markdown / Agent /
-        // Privacy). Bumped both ideal and min so labels render in full.
+        // because we have many tabs (Transcription / AI Providers /
+        // Dictation / Hotkeys / Sharing / Markdown / Knowledge /
+        // Privacy / Logs). Bumped both ideal and min so labels render in full.
         .frame(minWidth: 760, idealWidth: 820, minHeight: 380, idealHeight: 560)
     }
 }
@@ -927,54 +924,6 @@ private struct TriggerPickerSection: View {
     }
 }
 
-// MARK: - Voice Note tab
-
-@available(macOS 14.0, *)
-private struct VoiceNoteTab: View {
-    @Bindable var settings: AppSettings
-
-    var body: some View {
-        Form {
-            Section("Default note kind") {
-                Picker("Kind", selection: $settings.voiceNoteKind) {
-                    ForEach(PromptTemplates.VoiceNoteKind.allCases, id: \.rawValue) { kind in
-                        Text(kindDisplay(kind)).tag(kind)
-                    }
-                }
-                .pickerStyle(.segmented)
-                Text(footerForKind(settings.voiceNoteKind))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Hotkey") {
-                Text("Press ⌘⇧N to start a Voice Note. Press again to stop. The recording posts to the configured LLM provider with the note kind selected above.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .formStyle(.grouped)
-    }
-
-    private func kindDisplay(_ kind: PromptTemplates.VoiceNoteKind) -> String {
-        switch kind {
-        case .freeform: return "Freeform"
-        case .task: return "Task"
-        case .journal: return "Journal"
-        case .checklist: return "Checklist"
-        }
-    }
-
-    private func footerForKind(_ kind: PromptTemplates.VoiceNoteKind) -> String {
-        switch kind {
-        case .freeform: return "Light cleanup; preserves the speaker's voice."
-        case .task: return "Single actionable task with title, body, and optional due / tags."
-        case .journal: return "First-person journal entry with a date header."
-        case .checklist: return "Bulleted checklist (`- [ ]` items). Drops pure observations."
-        }
-    }
-}
-
 // MARK: - Hotkeys tab
 
 @available(macOS 14.0, *)
@@ -1002,7 +951,6 @@ private struct HotkeysTab: View {
         Form {
             Section("Global hotkeys") {
                 KeyboardShortcuts.Recorder("Meeting record toggle", name: .toggleMeeting)
-                KeyboardShortcuts.Recorder("Voice Note toggle", name: .toggleVoiceNote)
                 KeyboardShortcuts.Recorder("Open Library", name: .openLibrary)
                 KeyboardShortcuts.Recorder("Dictation (push-to-talk)", name: .dictation)
                 KeyboardShortcuts.Recorder("Push-to-Markdown (hold + speak → save .md)", name: .pushToMarkdown)
@@ -1024,7 +972,7 @@ private struct HotkeysTab: View {
             }
 
             Section("Defaults") {
-                Text("⌘⇧R — Meeting record · ⌘⇧N — Voice Note · ⌘⇧L — Library · ⌘⇧D — Dictation")
+                Text("⌘⇧R — Meeting record · ⌘⇧L — Library · ⌘⇧D — Dictation")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

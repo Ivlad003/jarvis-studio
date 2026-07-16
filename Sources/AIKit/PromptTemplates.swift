@@ -64,87 +64,9 @@ public enum PromptTemplates {
         "Here is the meeting transcript:\n\n\(transcript)"
     }
 
-    // MARK: Voice Note
-
-    /// Voice Note kinds. The user picks one in Settings; the prompt template
-    /// shapes the LLM output accordingly.
-    public enum VoiceNoteKind: String, Sendable, CaseIterable, Codable {
-        case freeform   // light cleanup; preserves voice
-        case task       // single actionable task: title + body + optional due / tags
-        case journal    // first-person journal entry, datestamped header
-        case checklist  // bulleted checklist with `- [ ]` items
-    }
-
-    /// System prompt for a Voice Note finalization. Output is Markdown.
-    public static func voiceNote(
-        kind: VoiceNoteKind,
-        sourceLanguage: String?,
-        targetLanguage: String?
-    ) -> String {
-        let resolvedTarget = resolveTarget(source: sourceLanguage, target: targetLanguage)
-        let targetDisplay = displayName(for: resolvedTarget)
-        let kindInstructions: String
-        switch kind {
-        case .freeform:
-            kindInstructions = """
-            Output the cleaned-up note as a short Markdown document. Fix obvious \
-            disfluencies and punctuation, but preserve the speaker's voice and \
-            ordering. No headings unless the user explicitly dictated them.
-            """
-        case .task:
-            kindInstructions = """
-            Output a single actionable task in Markdown:
-
-            # {short imperative title — ≤8 words}
-
-            **What:** {1-2 sentences expanding the title}
-            **When:** {if mentioned, else omit}
-            **Tags:** {comma-separated, derived from content; omit if empty}
-
-            Anything outside the task scope (off-topic asides) goes under a \
-            `## Notes` section at the bottom or is omitted.
-            """
-        case .journal:
-            kindInstructions = """
-            Output a first-person journal entry in Markdown:
-
-            # {today, formatted as e.g. "Tuesday, May 2"}
-
-            {body, paragraph form, first person, light cleanup of disfluencies}
-            """
-        case .checklist:
-            kindInstructions = """
-            Output a checklist in Markdown:
-
-            # {short title summarizing the list — ≤8 words}
-
-            - [ ] {item 1}
-            - [ ] {item 2}
-            ...
-
-            Only items that are actionable. Drop pure observations.
-            """
-        }
-
-        return """
-        You are a voice-note assistant. Convert the transcribed dictation into a \
-        \(kind.rawValue) note in \(targetDisplay).
-
-        \(kindInstructions)
-
-        If the source language differs from the target language, translate. \
-        Preserve proper nouns and quoted phrases verbatim.
-        """
-    }
-
-    /// Wraps the transcript as the user turn for a Voice Note finalize call.
-    public static func voiceNoteUserMessage(transcript: String) -> String {
-        "Here is the dictated note:\n\n\(transcript)"
-    }
-
     // MARK: - Transcript cleanup (long-form, post-Whisper)
 
-    /// System prompt for cleaning a long-form meeting / voice-note transcript
+    /// System prompt for cleaning a long-form meeting transcript
     /// after the speech-to-text stage. Different from `cleanupPrompt` in
     /// DictationKit — that one is tuned for short dictation snippets where the
     /// goal is paste-ready text. This one preserves segment boundaries and
