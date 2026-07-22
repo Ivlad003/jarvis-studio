@@ -180,42 +180,49 @@ final class ShareCoordinator {
     /// button on the right that puts just that URL on the pasteboard. Handlers
     /// are retained by the returned view for the lifetime of the modal.
     private func makeCopyRows(_ rows: [(label: String, url: URL)]) -> NSView {
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
         var handlers: [CopyLinkHandler] = []
+        var gridRows: [[NSView]] = []
         for row in rows {
             let handler = CopyLinkHandler(urlString: row.url.absoluteString)
             handlers.append(handler)
 
             let label = NSTextField(labelWithString: row.label)
-            label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            label.lineBreakMode = .byTruncatingTail
 
             let button = NSButton(title: "Copy link", target: handler, action: #selector(CopyLinkHandler.copy(_:)))
             button.bezelStyle = .rounded
             button.setContentHuggingPriority(.required, for: .horizontal)
 
-            let rowStack = NSStackView(views: [label, button])
-            rowStack.orientation = .horizontal
-            rowStack.spacing = 12
-            rowStack.alignment = .firstBaseline
-            rowStack.distribution = .fill
-            stack.addArrangedSubview(rowStack)
-            rowStack.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            gridRows.append([label, button])
         }
 
+        // Two aligned columns: labels on the left, "Copy link" buttons on the
+        // right. The grid sizes column 0 to the widest label, so every button
+        // starts at the same x and they line up with each other — no stretched
+        // rows, no chasm between a short label and its button.
+        let grid = NSGridView(views: gridRows)
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 10
+        grid.columnSpacing = 24
+        grid.column(at: 0).xPlacement = .leading
+        grid.column(at: 1).xPlacement = .leading
+        grid.rowAlignment = .firstBaseline
+
+        // NSAlert lays out an accessory view by its `frame`, not by the Auto
+        // Layout constraints inside it. Resolve the layout first, then hand back
+        // a frame-based container sized to fit — otherwise the rows collapse to
+        // zero height and overlap the message text above them.
+        grid.layoutSubtreeIfNeeded()
+        let size = grid.fittingSize
+
         let container = CopyRowsContainer(handlers: handlers)
-        container.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(stack)
+        container.frame = NSRect(x: 0, y: 0, width: size.width, height: size.height)
+        container.addSubview(grid)
         NSLayoutConstraint.activate([
-            container.widthAnchor.constraint(equalToConstant: 320),
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: container.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            grid.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            grid.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            grid.topAnchor.constraint(equalTo: container.topAnchor),
+            grid.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
         return container
     }
