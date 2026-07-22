@@ -162,7 +162,7 @@ The `Makefile` at repo root handles the full pipeline. `make install` signs the 
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ```
 
-375 tests in 78 suites pass in ~60 s. FTS5 perf benchmark is gated behind `JN_RUN_PERF=1`.
+397 tests in 83 suites pass in ~60 s. FTS5 perf benchmark is gated behind `JN_RUN_PERF=1`.
 
 **`make test` scope caveat:** `make test` (= `swift test`) only runs the SwiftPM `Tests/`
 targets (the kit libraries). It does **not** compile the App target or run `AppTests/` (e.g.

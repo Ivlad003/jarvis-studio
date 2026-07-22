@@ -454,7 +454,7 @@ final class AppSettings {
         }
     }
 
-    // Default prompts (Markdown export + Agent system) live in
+    // Default prompts (Markdown export) live in
     // AppSettings+Prompts.swift — they're long string literals with no logic.
 
     // MARK: Init

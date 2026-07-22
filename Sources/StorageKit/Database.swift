@@ -8,7 +8,7 @@ public enum SessionMode: String, Sendable, Codable, Equatable {
     case dictation
     // NOTE: `voiceNote` was removed in 2026-07-14. Sessions recorded before then
     // were persisted with mode "voiceNote"; both read paths (the session.json
-    // decoder in `SessionRecord.init(from:)` and `rowToSession`) map that legacy
+    // decoder in `SessionRecord.init(from:)` and `rowToRecord`) map that legacy
     // value to `.meeting` so historical recordings still open.
 
     /// Human-friendly display name for UI.
