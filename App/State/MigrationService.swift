@@ -27,8 +27,6 @@ enum MigrationService {
         static let newKeychainService = "dev.kosmonotes.studio"
         static let oldAppSupportDir = "JarvisNote"
         static let newAppSupportDir = "KosmoNotes"
-        static let oldAgentDocsDir = "JarvisNote-agent"
-        static let newAgentDocsDir = "KosmoNotes-agent"
     }
 
     /// Top-level entry. Called once from `applicationDidFinishLaunching`
@@ -36,16 +34,14 @@ enum MigrationService {
     static func runIfNeeded(
         defaults: UserDefaults = .standard,
         appSupportRoot: URL? = nil,
-        documentsRoot: URL? = nil,
         migrateKeychain: () -> Bool = MigrationService.migrateKeychain
     ) {
         if defaults.bool(forKey: didMigrateKey) {
             return
         }
         let appSupportOK = migrateAppSupport(root: appSupportRoot)
-        let agentWorkspaceOK = migrateAgentWorkspace(root: documentsRoot)
         let keychainOK = migrateKeychain()
-        guard appSupportOK, agentWorkspaceOK, keychainOK else {
+        guard appSupportOK, keychainOK else {
             migrationLog.error("MigrationService: JarvisNote → KosmoNotes rename incomplete; will retry on next launch")
             return
         }
@@ -82,26 +78,6 @@ enum MigrationService {
             return true
         } catch {
             migrationLog.error("MigrationService: AppSupport move failed — \(error.localizedDescription, privacy: .public)")
-            return false
-        }
-    }
-
-    /// `~/Documents/JarvisNote-agent/` → `…/KosmoNotes-agent/`. Same rules.
-    /// User-set workspace overrides (AppSettings.agentWorkspaceFolder) are
-    /// untouched — only the default location.
-    private static func migrateAgentWorkspace(root injectedRoot: URL? = nil) -> Bool {
-        let fm = FileManager.default
-        let docs = injectedRoot ?? fm.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents")
-        let oldURL = docs.appendingPathComponent(Const.oldAgentDocsDir, isDirectory: true)
-        let newURL = docs.appendingPathComponent(Const.newAgentDocsDir, isDirectory: true)
-        guard fm.fileExists(atPath: oldURL.path), !fm.fileExists(atPath: newURL.path) else { return true }
-        do {
-            try fm.moveItem(at: oldURL, to: newURL)
-            migrationLog.info("MigrationService: moved agent workspace \(oldURL.path, privacy: .public) → \(newURL.path, privacy: .public)")
-            return true
-        } catch {
-            migrationLog.error("MigrationService: agent workspace move failed — \(error.localizedDescription, privacy: .public)")
             return false
         }
     }

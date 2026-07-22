@@ -30,20 +30,9 @@ extension RecorderState {
 
         // Resolve target language: nil means "auto" — let PromptTemplates decide.
         let target: String? = settings.summaryLanguage == "auto" ? nil : settings.summaryLanguage
-        let system: String
-        let userMsg: String
-        switch activeMode {
-        case .voiceNote:
-            system = PromptTemplates.voiceNote(
-                kind: settings.voiceNoteKind,
-                sourceLanguage: sourceLanguage,
-                targetLanguage: target
-            )
-            userMsg = PromptTemplates.voiceNoteUserMessage(transcript: trimmed)
-        case .meeting, .dictation:
-            system = PromptTemplates.meetingSummary(sourceLanguage: sourceLanguage, targetLanguage: target)
-            userMsg = PromptTemplates.meetingUserMessage(transcript: trimmed)
-        }
+        // Meeting and dictation both use the meeting-summary template.
+        let system = PromptTemplates.meetingSummary(sourceLanguage: sourceLanguage, targetLanguage: target)
+        let userMsg = PromptTemplates.meetingUserMessage(transcript: trimmed)
 
         // Select provider and pricing based on user preference.
         guard let resolved = AIProviderResolver.resolve(settings.aiProviderConfig) else {

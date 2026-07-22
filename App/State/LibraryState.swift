@@ -11,7 +11,6 @@ enum ModeFilter: String, CaseIterable, Identifiable {
     case all
     case meeting
     case dictation
-    case voiceNote
 
     var id: String { rawValue }
 
@@ -20,7 +19,6 @@ enum ModeFilter: String, CaseIterable, Identifiable {
         case .all: return "All"
         case .meeting: return "Meeting"
         case .dictation: return "Dictation"
-        case .voiceNote: return "Voice Note"
         }
     }
 }
@@ -121,7 +119,6 @@ final class LibraryState {
                 case .all: return true
                 case .meeting: return record.mode == .meeting
                 case .dictation: return record.mode == .dictation
-                case .voiceNote: return record.mode == .voiceNote
                 }
             }
         } catch {

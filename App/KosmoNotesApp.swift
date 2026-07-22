@@ -39,9 +39,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var chatHolder: AnyObject?           // ChatState (macOS 14+)
     private var dictationHolder: AnyObject?      // DictationState (macOS 14+)
     private var pushToMarkdownHolder: AnyObject? // PushToMarkdownState (macOS 14+)
-    private var agentSessionHolder: AnyObject?   // AgentSessionState (macOS 14+)
-    private var agentHotkeyHolder: AnyObject?    // AgentHotkeyState (macOS 14+)
-    private var agentConsoleHolder: AnyObject?   // AgentConsoleWindowController (macOS 14+)
     private var startupScreenRecordingWarning: String?
 
     private static var isRunningUnderXCTest: Bool {
@@ -93,8 +90,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Ignore SIGPIPE so that writing to a closed child-process stdin
-        // (ExternalAgentRunner, BashTool) raises EPIPE in the throwing
+        // Ignore SIGPIPE so that any child-process pipe I/O (e.g. the code
+        // search tool's `rg` subprocess) raises EPIPE in the throwing
         // FileHandle API instead of killing our host process. Default macOS
         // behaviour for SIGPIPE is to terminate.
         signal(SIGPIPE, SIG_IGN)
@@ -151,17 +148,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Register global hotkeys for Meeting / Voice Note record + Library open.
-    /// Defaults: ⌘⇧R / ⌘⇧N / ⌘⇧L. Users can rebind via System Settings (Wallop's
+    /// Register global hotkeys for Meeting record + Library open.
+    /// Defaults: ⌘⇧R / ⌘⇧L. Users can rebind via System Settings (Wallop's
     /// approach — KeyboardShortcuts persists overrides in UserDefaults under the
     /// shortcut's name).
     @available(macOS 14.0, *)
     private func bootstrapHotkeys() {
         KeyboardShortcuts.onKeyDown(for: .toggleMeeting) { [weak self] in
             Task { @MainActor in self?.recordToggleAction() }
-        }
-        KeyboardShortcuts.onKeyDown(for: .toggleVoiceNote) { [weak self] in
-            Task { @MainActor in self?.voiceNoteToggleAction() }
         }
         KeyboardShortcuts.onKeyDown(for: .openLibrary) { [weak self] in
             Task { @MainActor in self?.openLibraryAction() }
@@ -396,14 +390,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordItem.identifier = NSUserInterfaceItemIdentifier("recordToggle")
         menu.addItem(recordItem)
 
-        let voiceNoteItem = NSMenuItem(title: "Start Voice Note",
-                                       action: #selector(voiceNoteToggleAction),
-                                       keyEquivalent: "n")
-        voiceNoteItem.keyEquivalentModifierMask = [.command, .shift]
-        voiceNoteItem.target = self
-        voiceNoteItem.identifier = NSUserInterfaceItemIdentifier("voiceNoteToggle")
-        menu.addItem(voiceNoteItem)
-
         // Live mic mute — only meaningful while a recording is active.
         // menuNeedsUpdate enables / disables it based on RecorderState.status
         // and toggles the title between "Mute mic" and "Unmute mic".
@@ -460,12 +446,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         chatItem.keyEquivalentModifierMask = [.command]
         chatItem.target = self
         menu.addItem(chatItem)
-
-        let agentItem = NSMenuItem(title: "Agent Console…",
-                                   action: #selector(openAgentConsole),
-                                   keyEquivalent: "")
-        agentItem.target = self
-        menu.addItem(agentItem)
 
         menu.addItem(.separator())
 
@@ -592,42 +572,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             p2md.install()
             self.pushToMarkdownHolder = p2md
 
-            // Autonomous agent: voice instruction → tool-using Claude loop
-            // restricted to the workspace folder. Hotkey installs even when
-            // disabled (it bails inside handlePress on the toggle), so a
-            // future enable doesn't require relaunch.
+            // Knowledge base: user-attached documents + code folders the chat
+            // assistant can search. Shared with the ChatState built below.
             let knowledgeBaseStore = KnowledgeBaseStore(
                 database: database,
                 embeddingProvider: AppSettingsKnowledgeBaseEmbeddingProvider(settings: settings)
             )
             self.knowledgeBaseStoreHolder = knowledgeBaseStore
-
-            let agentSession = AgentSessionState(
-                settings: settings,
-                database: database,
-                knowledgeBaseStore: knowledgeBaseStore,
-                liveTranscriptProvider: { [weak recorder] in
-                    guard let recorder else { return nil }
-                    return await recorder.liveTranscriptSnapshot()
-                },
-                screenFrameSourceProvider: { [weak recorder] in
-                    guard let recorder,
-                          case .recording(let sessionId) = recorder.status else { return nil }
-                    let dir = await sessionStore.sessionDir(for: sessionId)
-                    return ScreenFrameSource(
-                        sessionId: sessionId,
-                        videoURL: dir.appendingPathComponent("screen.mp4")
-                    )
-                }
-            )
-            self.agentSessionHolder = agentSession
-            let agentHotkey = AgentHotkeyState(
-                settings: settings,
-                agentSession: agentSession,
-                recorder: recorder
-            )
-            agentHotkey.install()
-            self.agentHotkeyHolder = agentHotkey
 
             // Force a menu refresh so any stale "Recording requires macOS 14+"
             // labels flip to the real recorder-ready titles.
@@ -771,26 +722,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Toggle Voice Note Mode recording (⌘⇧N). Same lifecycle as Meeting toggle,
-    /// but starts the recorder in `.voiceNote` mode so the post-process pipeline
-    /// uses the voice-note prompt template.
-    @MainActor
-    @objc private func voiceNoteToggleAction() {
-        guard #available(macOS 14.0, *) else { return }
-        guard let recorder = recorderState else { return }
-        Task { @MainActor in
-            switch recorder.status {
-            case .idle, .complete, .failed:
-                await recorder.start(mode: .voiceNote)
-            case .recording:
-                await recorder.stop()
-            case .transcribing:
-                break
-            }
-            statusItem?.menu?.update()
-        }
-    }
-
     @MainActor
     @objc private func openLibraryAction() {
         guard #available(macOS 14.0, *) else {
@@ -861,20 +792,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    @objc private func openAgentConsole() {
-        guard #available(macOS 14.0, *) else { return }
-        guard let session = agentSessionHolder as? AgentSessionState else { return }
-        let controller: AgentConsoleWindowController
-        if let existing = agentConsoleHolder as? AgentConsoleWindowController {
-            controller = existing
-        } else {
-            controller = AgentConsoleWindowController()
-            agentConsoleHolder = controller
-        }
-        controller.open(session: session, windowDelegate: self)
-    }
-
-    @MainActor
     @objc private func openChat() {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -905,10 +822,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sessionStore: sessionStore,
             recorder: recorder,
             knowledgeBaseStore: knowledgeBaseStoreHolder as? KnowledgeBaseStore,
-            agentSession: agentSessionHolder as? AgentSessionState,
-            onOpenAgentConsole: { [weak self] in
-                self?.openAgentConsole()
-            },
             liveContextProvider: { [weak recorder] in
                 guard let recorder else { return nil }
                 return await recorder.liveTranscriptSnapshot()
@@ -994,7 +907,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard let recordItem = menu.items.first(where: { $0.identifier?.rawValue == "recordToggle" }) else { return }
-        let voiceNoteItem = menu.items.first(where: { $0.identifier?.rawValue == "voiceNoteToggle" })
         let muteItem = menu.items.first(where: { $0.identifier?.rawValue == "toggleMicMute" })
         let liveTranscriptItem = menu.items.first(where: { $0.identifier?.rawValue == "liveTranscriptStatus" })
         let screenWarningItem = menu.items.first(where: { $0.identifier?.rawValue == "screenRecordingWarning" })
@@ -1018,27 +930,18 @@ extension AppDelegate: NSMenuDelegate {
             case .idle:
                 recordItem.title = "Start Recording"
                 recordItem.isEnabled = true
-                voiceNoteItem?.title = "Start Voice Note"
-                voiceNoteItem?.isEnabled = true
             case .recording:
                 recordItem.title = "Stop Recording"
                 recordItem.isEnabled = true
-                voiceNoteItem?.title = "Stop Voice Note"
-                voiceNoteItem?.isEnabled = true
             case .transcribing:
                 recordItem.title = "Transcribing…"
                 recordItem.isEnabled = false
-                voiceNoteItem?.isEnabled = false
             case .complete:
                 recordItem.title = "Start Recording"
                 recordItem.isEnabled = true
-                voiceNoteItem?.title = "Start Voice Note"
-                voiceNoteItem?.isEnabled = true
             case .failed:
                 recordItem.title = "Start Recording (last failed — see Settings)"
                 recordItem.isEnabled = true
-                voiceNoteItem?.title = "Start Voice Note"
-                voiceNoteItem?.isEnabled = true
             }
 
             if case .complete = recorder.status {
@@ -1049,7 +952,6 @@ extension AppDelegate: NSMenuDelegate {
         } else {
             recordItem.title = "Recording (macOS 14+ required)"
             recordItem.isEnabled = false
-            voiceNoteItem?.isEnabled = false
             openLastItem.isEnabled = false
             liveTranscriptItem?.isHidden = true
             screenWarningItem?.isHidden = true
@@ -1163,10 +1065,6 @@ extension AppDelegate: NSWindowDelegate {
         case "chat":
             chatWindow = nil
             chatHolder = nil
-        case "agentConsole":
-            if #available(macOS 14.0, *) {
-                (agentConsoleHolder as? AgentConsoleWindowController)?.didClose()
-            }
         default:
             break
         }
@@ -1186,18 +1084,10 @@ extension AppDelegate: NSWindowDelegate {
             }
             return false
         }()
-        let agentConsoleVisible: Bool = {
-            if #available(macOS 14.0, *),
-               let controller = agentConsoleHolder as? AgentConsoleWindowController {
-                return controller.isVisible
-            }
-            return false
-        }()
         let anyVisible = settingsWindow != nil
             || onboardingWindow != nil
             || chatWindow != nil
             || libraryVisible
-            || agentConsoleVisible
         if !anyVisible {
             NSApp.setActivationPolicy(.accessory)
         }

@@ -19,7 +19,6 @@ struct MigrationServiceTests {
         MigrationService.runIfNeeded(
             defaults: defaults,
             appSupportRoot: tmpDir.appendingPathComponent("Application Support"),
-            documentsRoot: tmpDir.appendingPathComponent("Documents"),
             migrateKeychain: { false }
         )
 
@@ -38,7 +37,6 @@ struct MigrationServiceTests {
         MigrationService.runIfNeeded(
             defaults: defaults,
             appSupportRoot: tmpDir.appendingPathComponent("Application Support"),
-            documentsRoot: tmpDir.appendingPathComponent("Documents"),
             migrateKeychain: { true }
         )
 

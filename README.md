@@ -36,7 +36,7 @@ make test
 # or: DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ```
 
-280 tests pass in ~60 s. A FTS5 perf benchmark is gated behind `JN_RUN_PERF=1`.
+397 tests in 83 suites pass in ~60 s. A FTS5 perf benchmark is gated behind `JN_RUN_PERF=1`. `make test` covers the kit libraries only; run `make test-app` for the App-layer behavior tests or `make test-all` for both.
 
 ### Open in Xcode
 
@@ -55,7 +55,6 @@ xed .
 | Mode | Duration | Audio | Output |
 |---|---|---|---|
 | **Meeting** | 30 min – 3 hr | Mic + system | AI summary, action items, transcript |
-| **Voice Note** | 1 – 15 min | Mic | Structured note / task / journal / checklist |
 | **Dictation** | < 60 s | Mic | Paste to active app, < 1.5 s latency |
 
 Additional features:
@@ -64,7 +63,7 @@ Additional features:
 - **Library** — full-text + semantic search across all sessions
 - **Multi-language** — UA / RU / EN / FR; record in one language, summarise in another
 - **S3 sharing** — presigned URLs, compatible with AWS / R2 / B2 / MinIO
-- **Global hotkeys** — ⌘⇧R Meeting · ⌘⇧N Voice Note · ⌘⇧L Library (rebindable)
+- **Global hotkeys** — ⌘⇧R Meeting · ⌘⇧L Library (rebindable)
 - **Optional screen recording** — H.264 screen.mp4 alongside audio; used for vision-chat frame extraction
 
 ## Stack

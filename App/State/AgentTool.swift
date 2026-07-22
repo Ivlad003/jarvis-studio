@@ -30,80 +30,11 @@ public protocol RichAgentTool: AgentTool {
 
 // MARK: - Built-in tools
 
-/// Read the contents of a UTF-8 text file. Restricted to the workspace
-/// directory the user picked in Settings — tries ~/Documents/KosmoNotes-agent
-/// by default if no workspace is set.
-public struct ReadFileTool: AgentTool {
-    public let name = "read_file"
-    public let description = "Read the contents of a UTF-8 text file at the given absolute path inside the agent workspace. Returns the file contents as a string."
-    public let inputSchema: [String: Any] = [
-        "type": "object",
-        "properties": [
-            "path": [
-                "type": "string",
-                "description": "Absolute filesystem path to read. Must resolve inside the agent workspace.",
-            ],
-        ],
-        "required": ["path"],
-    ]
-
-    private let workspace: URL
-
-    public init(workspace: URL) { self.workspace = workspace }
-
-    public func execute(input: [String: Any]) async throws -> String {
-        guard let path = input["path"] as? String else {
-            throw AgentToolError.badInput("read_file: missing 'path'")
-        }
-        let url = URL(fileURLWithPath: path)
-        try AgentToolGuard.requireInsideWorkspace(url, workspace: workspace, tool: "read_file")
-        let data = try Data(contentsOf: url)
-        guard let text = String(data: data, encoding: .utf8) else {
-            return "<binary file, \(data.count) bytes>"
-        }
-        // Cap response so a 10MB file doesn't blow the context window.
-        if text.count > 64_000 {
-            return String(text.prefix(64_000)) + "\n\n... [truncated, file is \(text.count) chars]"
-        }
-        return text
-    }
-}
-
-/// Atomically write a UTF-8 text file. Same workspace allowlist as read_file.
-/// Capped at WriteFileTool.maxBytes so an LLM mistake can't fill the disk.
-public struct WriteFileTool: AgentTool {
-    public static let maxBytes = 1_048_576  // 1 MiB
-
-    public let name = "write_file"
-    public let description = "Write a UTF-8 text file. Overwrites if it exists, creates parent directories if missing. Use absolute paths inside your workspace. Capped at 1 MiB."
-    public let inputSchema: [String: Any] = [
-        "type": "object",
-        "properties": [
-            "path": ["type": "string", "description": "Absolute filesystem path to write. Must resolve inside the agent workspace."],
-            "content": ["type": "string", "description": "Text to write. Must be ≤ 1 MiB UTF-8."],
-        ],
-        "required": ["path", "content"],
-    ]
-
-    private let workspace: URL
-
-    public init(workspace: URL) { self.workspace = workspace }
-
-    public func execute(input: [String: Any]) async throws -> String {
-        guard let path = input["path"] as? String else { throw AgentToolError.badInput("write_file: missing 'path'") }
-        guard let content = input["content"] as? String else { throw AgentToolError.badInput("write_file: missing 'content'") }
-        let bytes = Data(content.utf8)
-        guard bytes.count <= Self.maxBytes else {
-            throw AgentToolError.notAllowed("write_file: content is \(bytes.count) bytes; cap is \(Self.maxBytes) bytes")
-        }
-        let url = URL(fileURLWithPath: path)
-        try AgentToolGuard.requireInsideWorkspace(url, workspace: workspace, tool: "write_file")
-        try AgentToolGuard.requireInsideWorkspace(url.deletingLastPathComponent(), workspace: workspace, tool: "write_file (parent dir)")
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try bytes.write(to: url, options: [.atomic])
-        return "Wrote \(content.count) chars to \(url.path)"
-    }
-}
+// NOTE: `BashTool` is retained after the autonomous-agent feature was removed
+// (2026-07-14) because `SearchCodeTool` — a chat tool — reuses its static
+// helpers (`resolveBinary`, `minimalEnvironment`, `readAll`). The workspace
+// file tools (`ReadFileTool` / `WriteFileTool`) and the agent tool registry
+// were agent-only and were removed with it.
 
 /// Run a strictly-allowlisted, read-only inspection command directly via
 /// `Process` — never via a shell. The model passes a single command string;
@@ -874,47 +805,6 @@ public struct SearchCodeTool: AgentTool {
     }
 }
 
-enum AgentToolRegistry {
-    static func makeBuiltinTools(
-        workspace: URL,
-        database: AppDatabase? = nil,
-        knowledgeBaseStore: KnowledgeBaseStore?,
-        liveTranscriptProvider: SearchLiveTranscriptTool.SnapshotProvider?,
-        screenFrameSourceProvider: GetScreenFrameTool.SourceProvider? = nil
-    ) async -> [AgentTool] {
-        var tools: [AgentTool] = [
-            BashTool(workspace: workspace),
-            ReadFileTool(workspace: workspace),
-            WriteFileTool(workspace: workspace),
-        ]
-
-        if let database {
-            tools.append(SearchTranscriptsTool(database: database))
-        }
-
-        if let liveTranscriptProvider {
-            tools.append(SearchLiveTranscriptTool(snapshotProvider: liveTranscriptProvider))
-        }
-
-        if let screenFrameSourceProvider {
-            tools.append(GetScreenFrameTool(sourceProvider: screenFrameSourceProvider))
-        }
-
-        if let knowledgeBaseStore {
-            tools.append(SearchKnowledgeBaseTool(store: knowledgeBaseStore))
-            let codeRoots = (try? await knowledgeBaseStore.listSources())
-                .map { sources in
-                    sources
-                        .filter { $0.kind == .codeFolder }
-                        .map { URL(fileURLWithPath: $0.path, isDirectory: true) }
-                } ?? []
-            tools.append(SearchCodeTool(roots: codeRoots))
-        }
-
-        return tools
-    }
-}
-
 extension AgentTool {
     func toolDefinition() -> ToolDefinition {
         let schema = (try? JSONValue(any: inputSchema)) ?? .object(["type": .string("object")])
@@ -974,9 +864,7 @@ enum AgentToolGuard {
 // MARK: - Process termination signal
 
 /// One-shot Sendable bridge from `Process.terminationHandler` (called from a
-/// libdispatch queue) to async/await. Same shape as `ExternalAgentRunner`'s
-/// `AsyncSignal` but kept private to AgentTool so the two files stay
-/// independently testable.
+/// libdispatch queue) to async/await. Used by the code-search subprocess.
 final class AgentProcessSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var fired = false

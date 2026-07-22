@@ -4,9 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**v1.0 feature-complete UNVERIFIED — manual smoke pending.** All 18 acceptance criteria are wired in code; release path checklist is in `docs/release/v1.0-checklist.md`. The Swift Package exists, the menu-bar app records → transcribes live (Deepgram WebSocket) or batch → AI-summarizes → indexes (FTS5 + optional embeddings) → opens for chat (vision-capable with screen.mp4) → exports → shares to S3. Local validation via `make test` exits 0 (375 tests in 78 suites). Read `docs/plans/2026-05-02-jarvis-note-design.md` first — it is the canonical source of truth for all architectural decisions, and `.omc/plans/2026-05-02-jarvis-note-v1-implementation.md` for the phase-by-phase plan.
+**v1.0 feature-complete UNVERIFIED — manual smoke pending.** All 18 acceptance criteria are wired in code; release path checklist is in `docs/release/v1.0-checklist.md`. The Swift Package exists, the menu-bar app records → transcribes live (Deepgram WebSocket) or batch → AI-summarizes → indexes (FTS5 + optional embeddings) → opens for chat (vision-capable with screen.mp4) → exports → shares to S3. Local validation via `make test` exits 0 (397 tests in 83 suites — kit libraries only; `make test-app` / `make test-all` add the App-layer behavior tests). Read `docs/plans/2026-05-02-jarvis-note-design.md` first — it is the canonical source of truth for all architectural decisions, and `.omc/plans/2026-05-02-jarvis-note-v1-implementation.md` for the phase-by-phase plan.
 
-**Features added (latest session — 2026-06-13):**
+**Features removed (2026-07-16 — see design doc §15 D23):**
+- **Voice Note Mode removed.** The third capture mode (hotkey ⌘⇧N; `freeform`/`task`/`journal`/`checklist` templates) is gone. Capture modes are now Meeting + Dictation only. `SessionMode` drops the `voiceNote` case. **Data compatibility:** old recordings persisted with `mode="voiceNote"` still load — both the DB-row decoder (`Database.swift`) and the `session.json` decoder map the unknown raw value to `.meeting` (neutral fallback), so nothing is orphaned.
+- **Autonomous Agent feature removed.** The Agent Console panel, `AgentRunner`, external-CLI backends, the dedicated agent hotkey, and the Chat "Run as agent" hand-off are gone, along with agent settings/prompts/backend enums and the one-time agent-workspace migration. **Chat keeps full tool-calling** — the provider-agnostic `ToolLoopEngine`, the `AgentTool` protocol, and the transcript/screen/knowledge/code search tools are shared with Chat and stay. `BashTool` statics remain because `SearchCodeTool` depends on them.
+
+**Features added (2026-06-13):**
 - **Dual-source live transcript (You / Them).** Live transcription runs two window engines — mic tagged "You", system/app audio tagged "Them" — merged into one speaker-labeled timeline via `LiveTranscriptState.merging(you:them:)`. Each source has its own `RecorderLiveTee` (single-format CAF), routed by per-sink `SourceFilteredPCMSink` behind a `FanOutPCMSink` in `RecorderState.start`. UI/chat render `You:`/`Them:` via `labeledStableText`. Deepgram streaming stays mic-only pending a dual-stream follow-up. Runtime needs on-device verification (no mic/system audio in CI).
 - **Echo cancellation FORCED OFF + toggle disabled (reverses the 2026-06-12 D21 default).** VoiceProcessingIO is a duplex unit that only feeds the input tap while an output render path is rendering; this input-tap-only engine has none, so AEC-on makes the mic tap never fire → zero captured audio. **Confirmed on-device 2026-06-13:** AEC-on → empty `segments/`, no `audio.m4a`; AEC-off → full `audio.m4a` + segments + transcript + summary. Adding the output path (`connect(input→mainMixer)`) throws an uncatchable CoreAudio `-10868` on real AUHAL/aggregate formats. `AppSettings.init` now forces `echoCancellationEnabled = false` regardless of stored value (keeps capture / `MicPathPlan` / warnings consistent) and the Settings toggle is `.disabled(true)`. Re-enable in `AppSettings` **and** `SettingsView` once a real VPIO fix is verified on a device. See the `NOTE` in `AudioEngine.applyVoiceProcessingIfNeeded`.
 
@@ -158,7 +162,7 @@ The `Makefile` at repo root handles the full pipeline. `make install` signs the 
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ```
 
-375 tests in 78 suites pass in ~60 s. FTS5 perf benchmark is gated behind `JN_RUN_PERF=1`.
+397 tests in 83 suites pass in ~60 s. FTS5 perf benchmark is gated behind `JN_RUN_PERF=1`.
 
 **`make test` scope caveat:** `make test` (= `swift test`) only runs the SwiftPM `Tests/`
 targets (the kit libraries). It does **not** compile the App target or run `AppTests/` (e.g.
@@ -174,6 +178,17 @@ Other commands:
 **Code signing note:** Builds are signed post-build (not via xcodebuild `CODE_SIGN_IDENTITY`) because SPM package dependencies use `CODE_SIGN_STYLE=Automatic` which conflicts with manual signing flags. The Makefile builds with `CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO`, then calls `codesign --force --deep` afterward.
 
 **Permission check on startup:** `checkPermissionsOnStartup()` in `KosmoNotesApp.swift` runs on every launch. It uses `CGPreflightScreenCaptureAccess()` (reliable on macOS 15+/26) to check screen recording — shows an alert only when genuinely denied. Microphone access is requested at first record. **Do NOT use `SCShareableContent.excludingDesktopWindows` as a TCC probe** — on macOS 15+/26 it throws `-3801 userDeclined` even when permission IS granted (false positive confirmed).
+
+## Branching strategy
+
+**Trunk-based development.** `main` is the single long-lived trunk and is always
+releasable; all work integrates there via short-lived `feat/` · `fix/` · `chore/`
+(etc.) branches merged through PRs with green CI, squash/rebase to keep history
+linear. There is **no** `develop` / `master` / release branch — `develop` was
+fast-forward-merged into `main` and retired, along with all merged feature
+branches, on 2026-07-13. Releases are cut by tagging `main`, not by a release
+branch. Branch off `main` with short-lived `feat/`·`fix/`·`chore/` branches and
+merge back through PRs — don't push directly to `main`.
 
 ## Editing the design doc
 

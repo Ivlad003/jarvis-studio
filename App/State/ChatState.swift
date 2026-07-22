@@ -72,9 +72,6 @@ final class ChatState {
     var isSnapshotting: Bool = false
     var liveTranscriptPreview: LiveTranscriptState?
 
-    // Agent hand-off
-    var isLaunchingAgent: Bool = false
-
     // MARK: - Dependencies
     // `database` is internal (not private) so ChatView can pass it to SessionPickerSheet.
 
@@ -85,10 +82,6 @@ final class ChatState {
     private let knowledgeBaseStore: KnowledgeBaseStore?
     // Injectable factory so unit tests can swap WhisperProvider without network.
     private let whisperProviderFactory: @Sendable (String) -> WhisperProvider
-    // Optional autonomous-agent hand-off. nil keeps the chat working stand-alone
-    // (preview / unit tests) — the "Run as agent" button is hidden when unset.
-    private let agentSession: AgentSessionState?
-    private let onOpenAgentConsole: (@MainActor () -> Void)?
     private let liveContextProvider: LiveContextProvider?
     private let providerResolver: ProviderResolver
 
@@ -113,8 +106,6 @@ final class ChatState {
         recorder: RecorderState,
         knowledgeBaseStore: KnowledgeBaseStore? = nil,
         whisperProviderFactory: (@Sendable (String) -> WhisperProvider)? = nil,
-        agentSession: AgentSessionState? = nil,
-        onOpenAgentConsole: (@MainActor () -> Void)? = nil,
         liveContextProvider: LiveContextProvider? = nil,
         providerResolver: @escaping ProviderResolver = { AIProviderResolver.resolve($0) }
     ) {
@@ -123,8 +114,6 @@ final class ChatState {
         self.sessionStore = sessionStore
         self.recorder = recorder
         self.knowledgeBaseStore = knowledgeBaseStore
-        self.agentSession = agentSession
-        self.onOpenAgentConsole = onOpenAgentConsole
         self.liveContextProvider = liveContextProvider
         self.providerResolver = providerResolver
         // Default factory captures the user-selected OpenAI model
@@ -136,123 +125,6 @@ final class ChatState {
         self.whisperProviderFactory = whisperProviderFactory ?? { apiKey in
             WhisperProvider(apiKey: apiKey, model: modelName)
         }
-    }
-
-    // MARK: - Agent hand-off
-
-    /// Why `runAsAgent()` would refuse, or nil if the action is available.
-    /// Drives the button's tooltip + enabled state.
-    var runAsAgentDisabledReason: String? {
-        guard let agent = agentSession else { return nil /* button hidden */ }
-        if isSending { return "Sending a chat message — wait for it to finish" }
-        if isLaunchingAgent { return "Launching agent…" }
-        if case .running = agent.status { return "Agent is already running — stop it first" }
-        // Built-in backend needs Anthropic key; CLI backends bring their own
-        // auth (Claude Code, Codex, Copilot login).
-        if settings.agentBackend == .builtin {
-            let key = settings.anthropicApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-            if key.isEmpty { return "Built-in agent needs Anthropic API key (Settings → AI Providers)" }
-        }
-        let hasDraft = !inputDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let hasPriorUserTurn = messages.contains { $0.role == .user }
-        if !hasDraft && !hasPriorUserTurn { return "Type a message or send something first" }
-        return nil
-    }
-
-    /// True when the chat is wired to an autonomous agent and there's enough
-    /// material (a draft or any prior user turn) to seed an agent run.
-    var canRunAsAgent: Bool { runAsAgentDisabledReason == nil }
-
-    /// Bundle the current chat context (current draft if non-empty, else last
-    /// user turn; plus any prior conversation and attached-session transcripts)
-    /// and hand it off to the autonomous agent. Opens the Agent Console so the
-    /// user can watch the run.
-    ///
-    /// `isLaunchingAgent` stays true for the duration of the agent run so the
-    /// button can't be re-pressed before status flips to .running. We also
-    /// gate via `agent.status == .running` in `canRunAsAgent` for symmetry.
-    func runAsAgent() async {
-        guard canRunAsAgent, let agent = agentSession else { return }
-
-        let instruction = await buildAgentInstruction()
-        guard !instruction.isEmpty else {
-            lastError = "Type a message or send something first — the agent needs a goal."
-            return
-        }
-
-        isLaunchingAgent = true
-        lastError = nil
-
-        onOpenAgentConsole?()
-        // Background the run; flip the launching flag back only after the
-        // session has actually finished (or failed). canRunAsAgent's
-        // `agent.status == .running` check prevents dual-fire in the meantime.
-        Task { @MainActor [weak self, weak agent] in
-            guard let agent else { return }
-            await agent.start(initialInstruction: instruction)
-            self?.isLaunchingAgent = false
-        }
-    }
-
-    /// Compose the seed instruction for the agent. Prefers the current draft
-    /// (and consumes it) so the user's most recent intent wins; falls back to
-    /// the last user turn. Always appends the attached-session transcripts so
-    /// the agent has the same context the chat was using.
-    private func buildAgentInstruction() async -> String {
-        let trimmedDraft = inputDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let primaryGoal: String
-        if !trimmedDraft.isEmpty {
-            primaryGoal = trimmedDraft
-            inputDraft = ""
-        } else if let last = messages.reversed().first(where: { $0.role == .user })?.text,
-                  !last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            primaryGoal = last
-        } else {
-            return ""
-        }
-
-        var sections: [String] = ["== User goal ==\n\(primaryGoal)"]
-
-        // Prior conversation, if any. Skips system messages (those are
-        // already-injected context, not dialogue) and the most recent user
-        // turn when it was the source of `primaryGoal` (to avoid dupes).
-        let priorTurns: [ChatMessage] = {
-            let visible = messages.filter { $0.role != .system }
-            guard trimmedDraft.isEmpty,
-                  let lastUserIdx = visible.lastIndex(where: { $0.role == .user }) else {
-                return visible
-            }
-            return Array(visible[..<lastUserIdx])
-        }()
-        if !priorTurns.isEmpty {
-            var lines: [String] = ["== Prior chat history =="]
-            for m in priorTurns {
-                let role = m.role == .user ? "User" : "Assistant"
-                let text = m.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty else { continue }
-                lines.append("\(role): \(text)")
-            }
-            if lines.count > 1 { sections.append(lines.joined(separator: "\n")) }
-        }
-
-        if !attachedSessions.isEmpty {
-            var lines: [String] = ["== Attached session transcripts =="]
-            let isoFormatter = ISO8601DateFormatter()
-            for attachment in attachedSessions {
-                let record = attachment.record
-                let transcriptText = Self.cappedAttachedTranscript(await loadTranscript(for: record))
-                guard !transcriptText.isEmpty else { continue }
-                let dateStr = isoFormatter.string(from: record.recordedAt)
-                let durStr = String(format: "%.0f", record.durationSecs)
-                let langStr = record.language ?? "auto"
-                lines.append("[\(dateStr) · \(record.mode.rawValue) · \(durStr)s · \(langStr)]")
-                lines.append(transcriptText)
-            }
-            if lines.count > 1 { sections.append(lines.joined(separator: "\n")) }
-        }
-
-        return sections.joined(separator: "\n\n")
     }
 
     // MARK: - Actions
